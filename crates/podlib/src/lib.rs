@@ -10,9 +10,11 @@
 pub mod backend;
 pub mod domain;
 pub mod fixture;
+pub mod open;
 
 pub use backend::{BackendError, ItunesdbBackend, LibopodBackend, LibraryBackend};
 pub use domain::{
     DomainError, Playlist, PlaylistDraft, PlaylistId, Track, TrackChanges, TrackDraft, TrackId,
 };
 pub use fixture::{build_nano2g_fixture, FixturePlaylist, FixtureTrack};
+pub use open::{open_library, OpenError};

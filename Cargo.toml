@@ -1,15 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["crates/podlib", "crates/podlib-cli"]
+members = ["crates/podlib", "crates/podlib-cli", "crates/podlib-gui"]
 
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
 license = "MIT"
-# 1.88 is the MSRV gate: slice::as_chunks::<N> stabilized in 1.88 and is
-# the plan for the round-2/3 write path; older toolchains must fail at
-# build time with a clear message instead of a missing-API error.
-rust-version = "1.88"
+# 1.95 is the MSRV gate: eframe/egui 0.37 requires 1.95 (edition 2024
+# toolchain features), and slice::as_chunks::<N> (1.88) stays covered.
+# Older toolchains must fail at build time with a clear message instead
+# of a missing-API error.
+rust-version = "1.95"
 
 [workspace.dependencies]
 # Git main is required: crates.io 0.1.0 lacks playlist mutations and
@@ -23,6 +24,9 @@ libopod = { package = "libopod-rs", path = "crates/vendor/libopod" }
 thiserror = "2"
 tempfile = "3"
 plist = "1.7"
+# eframe/egui ecosystem releases in lockstep — keep all egui-family deps
+# on the same 0.37 line. wgpu is the default renderer since 0.34.
+eframe = "0.37"
 
 [profile.dev]
 # Bundled SQLite (via libopod) optimizes poorly at O0 and slows test loops.

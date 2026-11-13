@@ -1,0 +1,18 @@
+[package]
+name = "podlib-gui"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "podlib-gui"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { workspace = true }
+podlib = { path = "../podlib" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

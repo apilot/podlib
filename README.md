@@ -22,7 +22,7 @@ podlib is built on [libopod](https://github.com/koriwi/libopod) (vendored, see b
 
 Requirements:
 
-- Rust 1.88 or newer (via [rustup](https://rustup.rs) recommended)
+- Rust 1.95 or newer (via [rustup](https://rustup.rs) recommended)
 - No system libraries required — SQLite is bundled via libopod
 
 ```sh
@@ -42,7 +42,7 @@ podlib needs only the Rust toolchain — SQLite is bundled, no system libraries 
 | Arch | `pacman -S rust` | current enough |
 | Fedora | `dnf install rust cargo` | current enough |
 | Gentoo | `emerge --ask dev-lang/rust` | current enough |
-| Debian / Ubuntu | use [rustup](https://rustup.rs) | distro packages are often older than the required 1.88 |
+| Debian / Ubuntu | use [rustup](https://rustup.rs) | distro packages are often older than the required 1.95 |
 
 A GUI is planned for phase 4 and may add system dependencies (see the roadmap); packaging per distro will follow that.
 
