@@ -1,0 +1,9 @@
+[package]
+name = "podlib"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+libopod = { workspace = true }
+thiserror = { workspace = true }
+tempfile = { workspace = true }

@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/podlib", "crates/podlib-cli"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[workspace.dependencies]
+# Git main is required: crates.io 0.1.0 lacks playlist mutations and
+# classic-device support that the adapter depends on. The rev pin keeps
+# builds reproducible; bump deliberately when the upstream moves.
+libopod = { package = "libopod-rs", git = "https://github.com/koriwi/libopod", rev = "0eef69a2730aea6e9b8eb6a9b39c95deac05163d" }
+thiserror = "2"
+tempfile = "3"
+
+[profile.dev]
+# Bundled SQLite (via libopod) optimizes poorly at O0 and slows test loops.
+opt-level = 1

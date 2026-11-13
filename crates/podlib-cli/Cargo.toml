@@ -1,0 +1,12 @@
+[package]
+name = "podlib-cli"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "podlib"
+path = "src/main.rs"
+
+[dependencies]
+podlib = { path = "../podlib" }
+clap = { version = "4", features = ["derive"] }
