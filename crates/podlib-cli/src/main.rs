@@ -9,7 +9,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use podlib::{
-    LibopodBackend, LibraryBackend, PlaylistDraft, PlaylistId, TrackChanges, TrackDraft, TrackId,
+    ItunesdbBackend, LibopodBackend, LibraryBackend, PlaylistDraft, PlaylistId, TrackChanges,
+    TrackDraft, TrackId,
 };
 
 /// Manage an iPod music library from its mount point.
@@ -162,12 +163,35 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli) -> Result<(), Box<dyn Error>> {
-    let mut backend = LibopodBackend::open(&cli.mount)?;
+    let mut backend = open_backend(&cli.mount)?;
+    let backend: &mut dyn LibraryBackend = backend.as_mut();
     match &cli.command {
-        Command::List { what } => run_list(&backend, what),
-        Command::Playlist { command } => run_playlist(&mut backend, command),
-        Command::Track { command } => run_track(&mut backend, command),
+        Command::List { what } => run_list(backend, what),
+        Command::Playlist { command } => run_playlist(backend, command),
+        Command::Track { command } => run_track(backend, command),
     }
+}
+
+/// Detects the library kind at the mount point and opens the matching
+/// backend: a `iTunes Library.itlp` directory means a SQLite-era device
+/// (7G, via libopod); a bare `iTunesDB` file means a classic device.
+/// Anything else is reported with both probed paths.
+fn open_backend(mount: &std::path::Path) -> Result<Box<dyn LibraryBackend>, Box<dyn Error>> {
+    let itunes = mount.join("iPod_Control/iTunes");
+    let itlp = itunes.join("iTunes Library.itlp");
+    let classic = itunes.join("iTunesDB");
+    if itlp.is_dir() {
+        return Ok(Box::new(LibopodBackend::open(mount)?));
+    }
+    if classic.is_file() {
+        return Ok(Box::new(ItunesdbBackend::open(mount)?));
+    }
+    Err(format!(
+        "{} does not look like an iPod music library: \
+         no {:?} (SQLite-era device) and no {:?} (classic device)",
+        mount.display(), itlp, classic
+    )
+    .into())
 }
 
 fn run_list(backend: &dyn LibraryBackend, what: &ListTarget) -> Result<(), Box<dyn Error>> {

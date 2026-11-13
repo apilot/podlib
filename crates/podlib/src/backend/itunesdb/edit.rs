@@ -118,8 +118,8 @@ pub enum EditError {
     PlaylistNotFound(PlaylistId),
     #[error("playlist id {0} already exists")]
     PlaylistAlreadyExists(PlaylistId),
-    #[error("the master playlist mirrors the track list and cannot be edited directly")]
-    MasterPlaylistImmutable,
+    #[error("the master playlist {0} mirrors the track list and cannot be edited directly")]
+    MasterPlaylistImmutable(PlaylistId),
     #[error("playlist {0} is the system podcast list and stays device-managed")]
     PodcastPlaylistImmutable(PlaylistId),
     #[error("smart playlist {0} cannot be edited: its rules mhods would go stale")]
@@ -325,8 +325,14 @@ impl ItunesDb {
                 }
                 let before = mhyp.items.len();
                 mhyp.items.retain(|mhip| mhip.track_id != track);
-                removed |= mhyp.items.len() != before;
-                renumber_mhip_positions(mhyp);
+                let changed = mhyp.items.len() != before;
+                removed |= changed;
+                // Per-copy guard (same policy as strip_track_references):
+                // renumber only copies whose membership actually changed,
+                // leaving untouched copies byte-identical.
+                if changed {
+                    renumber_mhip_positions(mhyp);
+                }
             }
         }
         if !removed {
@@ -509,7 +515,7 @@ impl ItunesDb {
                 continue;
             }
             refusal = if mhyp.is_master {
-                Some(EditError::MasterPlaylistImmutable)
+                Some(EditError::MasterPlaylistImmutable(id))
             } else if mhyp.raw.get(0x14).is_some_and(|kind| *kind != 0) {
                 // Vendor parity (`classic_edit.rs::require_editable_playlist`):
                 // only the kind byte 0 marks an editable list — 1 is the
@@ -667,6 +673,10 @@ impl ItunesDb {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or(EditError::TooLarge)?;
+        // The vendor library assigns sql_id with a pseudo-random
+        // generator; we deliberately deviate and use max+1. The field is
+        // opaque to the firmware (only used for its own SQLite bookkeeping),
+        // and a deterministic counter keeps round-trip tests reproducible.
         let sql_id = albums
             .iter()
             .map(|album| album.sql_id)
@@ -1037,8 +1047,9 @@ fn rewrite_mhod53(raw: &mut Vec<u8>, removed_slots: &[u32]) -> Result<(), EditEr
     let mut kept = 0u32;
     for slot in 0..count {
         let at = body + 16 + slot * 12;
-        let (Some(letter), Some(start), Some(items)) = (
+        let (Some(letter), Some(pad), Some(start), Some(items)) = (
             read_u16_at(raw, at),
+            read_u16_at(raw, at + 2),
             read_u32_at(raw, at + 4),
             read_u32_at(raw, at + 8),
         ) else {
@@ -1056,7 +1067,10 @@ fn rewrite_mhod53(raw: &mut Vec<u8>, removed_slots: &[u32]) -> Result<(), EditEr
             continue;
         }
         out.extend_from_slice(&letter.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes()); // padding
+        // Copy the pad word verbatim from the source entry (vendor
+        // parity): the firmware never interprets it, so rewriting must
+        // not invent a different value.
+        out.extend_from_slice(&pad.to_le_bytes());
         out.extend_from_slice(&start.saturating_sub(below).to_le_bytes());
         out.extend_from_slice(&remaining.to_le_bytes());
         kept += 1;
@@ -1251,7 +1265,10 @@ fn build_mhyp(
     )?;
     // Parsed templates carry headers >= 0x24 (parser minimum), so the
     // direct byte writes below are in bounds.
-    raw[0x14] = 0; // not master — templates may be the master's header
+    // Vendor parity (`classic_edit.rs::build_standard_playlist`): the
+    // whole kind field at 0x14 is a 4-byte value — zero it entirely so
+    // inherited template bytes (master/smart flags) cannot leak through.
+    raw[0x14..0x18].fill(0);
     // Vendor parity (`classic_edit.rs::build_standard_playlist`):
     // Mac-epoch creation timestamp at 0x18.
     patch_u32(&mut raw, 0x18, mac_timestamp())?;
@@ -1482,6 +1499,7 @@ fn utf16le_string(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::itunesdb::RawChunk;
     use crate::backend::itunesdb::parse::builders::*;
     use crate::backend::itunesdb::parse::{MHLP, MHLT};
     use crate::backend::itunesdb::WriteError;
@@ -1894,7 +1912,9 @@ mod tests {
 
     /// F2: removing a member from one playlist renumbers that
     /// playlist's positions without touching other playlists'
-    /// membership.
+    /// membership. The untouched master playlist must survive
+    /// byte-identical (verbatim, ignoring absolute offsets which the
+    /// re-tiler legitimately moves).
     #[test]
     fn playlist_remove_track_renumbers_positions_in_both_copies() {
         let mut db = ItunesDb::parse(&base_tree()).unwrap();
@@ -1905,6 +1925,10 @@ mod tests {
             &[TrackId::from_bits(7), TrackId::from_bits(8), late],
         )
         .unwrap();
+        let masters_before: Vec<Mhyp> = [2, 3]
+            .iter()
+            .map(|&kind| playlist_by_id(&db, kind, 16).clone())
+            .collect();
         db.playlist_remove_track(PlaylistId::from_bits(200), TrackId::from_bits(7))
             .unwrap();
 
@@ -1916,11 +1940,57 @@ mod tests {
                 vec![8, 9]
             );
             assert_eq!(positions_of(trip), vec![0, 1]);
-            // Other playlists keep their full membership (positions of
-            // unchanged fixture-style members stay byte-preserved).
-            let master = playlist_by_id(&db, kind, 16);
-            assert_eq!(master.items.len(), 3);
         }
+        // Byte-preservation: the master copy is not a member of the
+        // mutation, so its header, mhods, mhip entries and unknown
+        // children must come back verbatim after retile + re-parse.
+        for (kind, before) in [2, 3].iter().zip(&masters_before) {
+            let master = playlist_by_id(&db, *kind, 16);
+            assert_mhyp_verbatim(before, master);
+        }
+    }
+
+    /// Compares two parsed playlists byte-for-byte, ignoring absolute
+    /// offsets (retile shifts them) — raw chunk bytes, decoded text and
+    /// child structure must match exactly.
+    fn assert_mhyp_verbatim(expected: &Mhyp, actual: &Mhyp) {
+        assert_eq!(expected.raw, actual.raw, "mhyp header bytes");
+        assert_eq!(
+            mhod_keys(&expected.mhods),
+            mhod_keys(&actual.mhods),
+            "mhod bytes"
+        );
+        assert_eq!(
+            expected.items.len(),
+            actual.items.len(),
+            "mhip entry count"
+        );
+        for (e, a) in expected.items.iter().zip(&actual.items) {
+            assert_eq!(e.raw, a.raw, "mhip raw bytes");
+            assert_eq!(e.track_id, a.track_id);
+            assert_eq!(mhod_keys(&e.mhods), mhod_keys(&a.mhods), "mhip mhod bytes");
+            assert_eq!(
+                raw_bytes(&e.unknown_children),
+                raw_bytes(&a.unknown_children)
+            );
+        }
+        assert_eq!(
+            raw_bytes(&expected.unknown_children),
+            raw_bytes(&actual.unknown_children),
+            "unknown children bytes"
+        );
+    }
+
+    /// mhod comparison key: raw bytes, type, decoded text (no offsets).
+    fn mhod_keys(mh: &[Mhod]) -> Vec<(&[u8], u32, Option<&str>)> {
+        mh.iter()
+            .map(|m| (m.raw.as_slice(), m.mhod_type, m.text.as_deref()))
+            .collect()
+    }
+
+    /// Opaque-children bytes without offsets (verbatim comparison key).
+    fn raw_bytes(chunks: &[RawChunk]) -> Vec<&[u8]> {
+        chunks.iter().map(|c| c.bytes.as_slice()).collect()
     }
 
     // -- type-52/53 library index rewrite (F4) -----------------------------
@@ -2035,6 +2105,47 @@ mod tests {
             master.items.iter().map(|m| m.track_id).collect::<Vec<_>>(),
             vec![7, 9]
         );
+    }
+
+    /// Nano-2: the pad word of a surviving type-53 entry is copied
+    /// verbatim from the source record, not zeroed by the rewrite.
+    #[test]
+    fn rewrite_mhod53_preserves_entry_pad_word() {
+        let mut jump = jump_mhod53(4, &[(b'A' as u16, 0, 1), (b'B' as u16, 1, 1)]);
+        // Non-zero pad in the first entry: the firmware never interprets
+        // it, so a rewrite must not invent a different value.
+        jump[56 + 2..56 + 4].copy_from_slice(&0xBEEF_u16.to_le_bytes());
+        let bytes = assemble_mhbd(&[
+            dataset(
+                1,
+                &list(&MHLT, &[mhit(7, &[]), mhit(8, &[]), mhit(9, &[])]),
+            ),
+            dataset(
+                2,
+                &list(
+                    &MHLP,
+                    &[mhyp(
+                        16,
+                        true,
+                        &[modern_string_mhod(1, "Master"), jump],
+                        &[7, 8, 9],
+                    )],
+                ),
+            ),
+            dataset(3, &list(&MHLP, &[])),
+        ]);
+        let mut db = ItunesDb::parse(&bytes).unwrap();
+        db.remove_track(TrackId::from_bits(8)).unwrap();
+
+        let db = reparse(&db);
+        let jump53 = playlist_by_id(&db, 2, 16)
+            .mhods
+            .iter()
+            .find(|m| m.mhod_type == MHOD_LETTER_JUMP)
+            .expect("type-53 jump kept");
+        // The surviving "A" entry (letter @56, pad @58, start @60,
+        // count @64) keeps its original pad word.
+        assert_eq!(u16::from_le_bytes(jump53.raw[58..60].try_into().unwrap()), 0xBEEF);
     }
 
     // -- create_playlist ---------------------------------------------------
@@ -2195,7 +2306,7 @@ mod tests {
         let mut db = ItunesDb::parse(&bytes).unwrap();
         assert_eq!(
             db.delete_playlist(PlaylistId::from_bits(16)),
-            Err(EditError::MasterPlaylistImmutable)
+            Err(EditError::MasterPlaylistImmutable(PlaylistId::from_bits(16)))
         );
         assert_eq!(
             db.delete_playlist(PlaylistId::from_bits(7)),
@@ -2269,7 +2380,7 @@ mod tests {
         );
         assert_eq!(
             db.playlist_add_track(PlaylistId::from_bits(16), TrackId::from_bits(7)),
-            Err(EditError::MasterPlaylistImmutable)
+            Err(EditError::MasterPlaylistImmutable(PlaylistId::from_bits(16)))
         );
         assert_eq!(
             db.playlist_add_track(PlaylistId::from_bits(7), TrackId::from_bits(7)),

@@ -27,15 +27,19 @@
 //! fails loudly with [`WriteError`] instead of silently scrambling byte
 //! order (round-3 review, Major 1).
 //!
-//! Scope (round 3б, next): HASH58 signing, the `LibraryBackend` adapter
-//! and CLI library-type detection.
+//! Round 3б (implemented): HASH58 signing, the `LibraryBackend`
+//! adapter and CLI library-type detection.
 
-mod edit;
+pub(crate) mod device_info;
+pub(crate) mod edit;
 mod parse;
 mod project;
+pub(crate) mod sign;
 mod write;
 
+pub use device_info::{get_firewire_guid, DeviceInfo, DeviceInfoError};
 pub use edit::{EditError, TrackAddition};
+pub use sign::{resolve_requirement, sign, GuidRequired, Signing, UnsupportedScheme, VerifyFailed};
 pub use write::WriteError;
 
 /// Error raised when the byte stream violates the iTunesDB chunk format.

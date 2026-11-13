@@ -537,6 +537,7 @@ name = "podlib"
 version = "0.1.0"
 dependencies = [
  "libopod-rs",
+ "plist",
  "tempfile",
  "thiserror",
 ]

@@ -22,6 +22,7 @@ rust-version = "1.88"
 libopod = { package = "libopod-rs", path = "crates/vendor/libopod" }
 thiserror = "2"
 tempfile = "3"
+plist = "1.7"
 
 [profile.dev]
 # Bundled SQLite (via libopod) optimizes poorly at O0 and slows test loops.
