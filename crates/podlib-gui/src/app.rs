@@ -15,7 +15,7 @@ use podlib::{Playlist, PlaylistId, Track, TrackId};
 
 use crate::device::{self, DeviceCandidate, MountError, MountSpec};
 use crate::library::{
-    changes_from_track, drafts_from_paths, guard_playlist_mutation, panic_message,
+    changes_from_track, drafts_from_paths, guard_playlist_mutation, panic_message, plural,
     EditDialogFields, DraggedTracks, LibraryCommand, LibraryOutcome, LibrarySnapshot,
     LibraryWorker,
 };
@@ -111,6 +111,45 @@ struct EditDialogState {
     id: TrackId,
     fields: EditDialogFields,
     error: Option<String>,
+}
+
+/// Track-table choices collected during one frame, applied afterwards
+/// (the render loop borrows the snapshot immutably; mutating actions
+/// need the unique borrow back). Last menu click wins, as before.
+#[derive(Default)]
+struct TrackRowActions {
+    edit: Option<TrackId>,
+    add_to_playlist: Option<Vec<TrackId>>,
+    delete: Option<TrackId>,
+}
+
+impl TrackRowActions {
+    fn merge(&mut self, other: Self) {
+        self.edit = other.edit.or(self.edit.take());
+        self.add_to_playlist = other.add_to_playlist.or(self.add_to_playlist.take());
+        self.delete = other.delete.or(self.delete.take());
+    }
+}
+
+/// Playlist-panel choices collected during one frame, applied after the
+/// render loop (same borrow discipline as [`TrackRowActions`]).
+#[derive(Default)]
+struct PlaylistPanelActions {
+    /// Tracks dropped onto a user playlist.
+    add_drop: Option<(PlaylistId, Vec<TrackId>)>,
+    /// Tracks dropped onto the master playlist: refused with a hint.
+    master_drop: Option<String>,
+    delete_playlist: Option<PlaylistId>,
+    remove_member: Option<(PlaylistId, TrackId)>,
+}
+
+impl PlaylistPanelActions {
+    fn merge(&mut self, other: Self) {
+        self.add_drop = other.add_drop.or(self.add_drop.take());
+        self.master_drop = other.master_drop.or(self.master_drop.take());
+        self.delete_playlist = other.delete_playlist.or(self.delete_playlist.take());
+        self.remove_member = other.remove_member.or(self.remove_member.take());
+    }
 }
 
 /// Live library UI state: the worker handle plus a local snapshot that is
@@ -331,10 +370,15 @@ impl PodlibApp {
                 Ok(LibraryOutcome::Loaded(snapshot)) => {
                     if let Some(library) = self.library.as_mut() {
                         library.snapshot = snapshot;
+                        // Russian plural forms: «1 трек», «2 трека», «5 треков».
+                        let tracks = library.snapshot.tracks.len();
+                        let playlists = library.snapshot.playlists.len();
                         self.status = format!(
-                            "Подключено: {} треков, {} плейлистов",
-                            library.snapshot.tracks.len(),
-                            library.snapshot.playlists.len()
+                            "Подключено: {} {}, {} {}",
+                            tracks,
+                            plural(tracks, "трек", "трека", "треков"),
+                            playlists,
+                            plural(playlists, "плейлист", "плейлиста", "плейлистов"),
                         );
                     }
                 }
@@ -426,12 +470,20 @@ impl PodlibApp {
     /// Sends one library command and remembers to drain its reply. One
     /// operation at a time; failures to send are surfaced as UI errors.
     fn library_request(&mut self, command: LibraryCommand, kind: PendingKind, status: &str) {
-        if !self.library_idle() {
+        // No library at all is not "busy" — the honest refusal points at
+        // connecting a device instead of a wait that would never end.
+        let Some(library) = self.library.as_ref() else {
+            self.error = Some(UiError {
+                message: "Сначала подключите устройство".to_owned(),
+                hint: None,
+                stderr: None,
+            });
+            return;
+        };
+        if library.pending.is_some() || library.opening.is_some() {
             // Never drop an action silently: buttons inside modals and
             // context-menu choices are not gated on idleness, so a busy
             // worker must refuse visibly instead of ignoring the request.
-            // (With no library at all the status area already shows the
-            // dead-worker notice, so the exact wording matters less there.)
             self.error = Some(UiError {
                 message: "Дождитесь завершения текущей операции".to_owned(),
                 hint: None,
@@ -439,11 +491,7 @@ impl PodlibApp {
             });
             return;
         }
-        let request = match self.library.as_ref() {
-            Some(library) => library.worker.request(command),
-            None => Err("библиотека не открыта".to_owned()),
-        };
-        match request {
+        match library.worker.request(command) {
             Ok(rx) => {
                 if let Some(library) = self.library.as_mut() {
                     library.pending = Some((kind, rx));
@@ -646,38 +694,11 @@ impl PodlibApp {
 
     /// Central panel: toolbar + track table with drag-and-drop rows.
     fn library_view(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let idle = self.library_idle();
-            if ui
-                .add_enabled(idle, egui::Button::new("Обновить"))
-                .clicked()
-            {
-                self.library_request(
-                    LibraryCommand::Refresh,
-                    PendingKind::Refresh,
-                    "Обновляю список…",
-                );
-            }
-            if ui
-                .add_enabled(idle, egui::Button::new("+ Плейлист"))
-                .clicked()
-            {
-                if let Some(library) = self.library.as_mut() {
-                    library.create_open = true;
-                    library.new_playlist_name.clear();
-                }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    egui::RichText::new("Перетащите аудиофайлы в окно, чтобы добавить")
-                        .weak(),
-                );
-            });
-        });
+        library_toolbar(self, ui);
         ui.separator();
 
-        // Immutable borrow for rendering; context-menu choices are
-        // collected into locals and applied after the loop.
+        // Immutable borrow for rendering; mutating choices are applied
+        // after the loop, when the unique borrow is free again.
         let Some(library) = self.library.as_ref() else {
             return;
         };
@@ -686,64 +707,16 @@ impl PodlibApp {
             return;
         }
 
-        let mut edit_id: Option<TrackId> = None;
-        let mut add_ids: Option<Vec<TrackId>> = None;
-        let mut delete_id: Option<TrackId> = None;
         // Menus stay closed while an operation is in flight: their
         // choices fire library requests a busy worker would refuse.
         let menus_allowed = context_menu_allowed(self);
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            // Header row, same column geometry as the data rows.
-            ui.horizontal(|ui| {
-                for (width, name) in COLUMN_WIDTHS {
-                    ui.add_sized(
-                        [width, ROW_HEIGHT],
-                        egui::Label::new(egui::RichText::new(name).strong()),
-                    );
-                }
-            });
-            ui.separator();
-            for track in &library.snapshot.tracks {
-                let row_id = egui::Id::unique(("track_row", track.id.to_bits()));
-                let response = ui
-                    .dnd_drag_source(row_id, DraggedTracks(vec![track.id]), |ui| {
-                        track_row(ui, track);
-                    })
-                    .response;
-                let mut open_edit = false;
-                let mut open_add = false;
-                let mut open_delete = false;
-                if menus_allowed {
-                    response.context_menu(|ui| {
-                        if ui.button("Изменить…").clicked() {
-                            open_edit = true;
-                            ui.close();
-                        }
-                        if ui.button("Добавить в плейлист…").clicked() {
-                            open_add = true;
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui.button("Удалить…").clicked() {
-                            open_delete = true;
-                            ui.close();
-                        }
-                    });
-                }
-                if open_edit {
-                    edit_id = Some(track.id);
-                }
-                if open_add {
-                    add_ids = Some(vec![track.id]);
-                }
-                if open_delete {
-                    delete_id = Some(track.id);
-                }
-            }
-        });
+        let actions = track_table(ui, &library.snapshot, menus_allowed);
+        self.apply_track_actions(actions);
+    }
 
-        // Apply the collected actions (unique borrow again).
-        if let Some(id) = edit_id {
+    /// Applies the row choices collected by [`track_table`].
+    fn apply_track_actions(&mut self, actions: TrackRowActions) {
+        if let Some(id) = actions.edit {
             if let Some(library) = self.library.as_mut() {
                 if let Some(track) = library.snapshot.track(id) {
                     library.edit_dialog = Some(EditDialogState {
@@ -754,12 +727,12 @@ impl PodlibApp {
                 }
             }
         }
-        if let Some(track_ids) = add_ids {
+        if let Some(track_ids) = actions.add_to_playlist {
             if let Some(library) = self.library.as_mut() {
                 library.picker_tracks = Some(track_ids);
             }
         }
-        if let Some(id) = delete_id {
+        if let Some(id) = actions.delete {
             if let Some(library) = self.library.as_mut() {
                 library.confirm_delete_track = Some(id);
                 library.purge_media = false;
@@ -773,94 +746,24 @@ impl PodlibApp {
         let Some(library) = self.library.as_ref() else {
             return;
         };
-        let mut add_drop: Option<(PlaylistId, Vec<TrackId>)> = None;
-        let mut master_drop: Option<String> = None;
-        let mut delete_playlist: Option<PlaylistId> = None;
-        let mut remove_member: Option<(PlaylistId, TrackId)> = None;
         // Menus stay closed while an operation is in flight: their
         // choices fire library requests a busy worker would refuse.
         let menus_allowed = context_menu_allowed(self);
+        let mut actions = PlaylistPanelActions::default();
         for playlist in &library.snapshot.playlists {
-            let is_master = playlist.is_master;
-            let header_text = if is_master {
-                format!("{} (мастер)", playlist.name)
-            } else {
-                playlist.name.clone()
-            };
-            let header_id = egui::Id::unique(("playlist_header", playlist.id.to_bits()));
-            let (_, dropped) = ui.dnd_drop_zone::<DraggedTracks, _>(
-                egui::Frame::default().inner_margin(egui::Margin::same(2)),
-                |ui| {
-                    let collapsing = egui::CollapsingHeader::new(header_text.as_str())
-                        .id_salt(header_id)
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            for member_id in playlist.unique_track_ids() {
-                                let title = library
-                                    .snapshot
-                                    .track(member_id)
-                                    .map(|track| track.title.as_str())
-                                    .unwrap_or("<нет в библиотеке>");
-                                let mut remove = false;
-                                let row = ui
-                                    .horizontal(|ui| {
-                                        ui.add_sized(
-                                            [ui.available_width() - 8.0, ROW_HEIGHT - 4.0],
-                                            egui::Label::new(
-                                                egui::RichText::new(title).weak(),
-                                            ),
-                                        );
-                                    })
-                                    .response;
-                                if !is_master && menus_allowed {
-                                    row.context_menu(|ui| {
-                                        if ui.button("Убрать из плейлиста").clicked() {
-                                            remove = true;
-                                            ui.close();
-                                        }
-                                    });
-                                }
-                                if remove {
-                                    remove_member = Some((playlist.id, member_id));
-                                }
-                            }
-                            if playlist.track_ids.is_empty() {
-                                ui.label(egui::RichText::new("— пусто —").weak());
-                            }
-                        });
-                    if !is_master {
-                        let mut delete = false;
-                        if menus_allowed {
-                            collapsing.header_response.context_menu(|ui| {
-                                if ui.button("Удалить плейлист…").clicked() {
-                                    delete = true;
-                                    ui.close();
-                                }
-                            });
-                        }
-                        if delete {
-                            delete_playlist = Some(playlist.id);
-                        }
-                    }
-                },
-            );
-            if let Some(dragged) = dropped {
-                // WHY the UI refuses master drops instead of trusting the
-                // backend: the 7G adapter rejects master-member mutations,
-                // but the classic backend allows them on purpose (firmware
-                // parity) — where they are pointless anyway: the master is
-                // the mirror of the whole library and duplicates are
-                // ignored. One consistent rule, explained without a round
-                // trip to the device.
-                if is_master {
-                    master_drop = Some(playlist.name.clone());
-                } else {
-                    add_drop = Some((playlist.id, dragged.0.clone()));
-                }
-            }
+            actions.merge(playlist_block(
+                ui,
+                &library.snapshot,
+                playlist,
+                menus_allowed,
+            ));
         }
+        self.apply_playlist_actions(actions);
+    }
 
-        if let Some(name) = master_drop {
+    /// Applies the panel choices collected during the frame.
+    fn apply_playlist_actions(&mut self, actions: PlaylistPanelActions) {
+        if let Some(name) = actions.master_drop {
             self.error = Some(UiError {
                 message: format!("«{name}» — мастер-плейлист: добавлять в него нельзя"),
                 hint: Some(
@@ -870,7 +773,7 @@ impl PodlibApp {
                 stderr: None,
             });
         }
-        if let Some((playlist, track_ids)) = add_drop {
+        if let Some((playlist, track_ids)) = actions.add_drop {
             self.library_request(
                 LibraryCommand::AddToPlaylist {
                     playlist,
@@ -880,12 +783,12 @@ impl PodlibApp {
                 "Добавляю в плейлист…",
             );
         }
-        if let Some(id) = delete_playlist {
+        if let Some(id) = actions.delete_playlist {
             if let Some(library) = self.library.as_mut() {
                 library.confirm_delete_playlist = Some(id);
             }
         }
-        if let Some((playlist, member)) = remove_member {
+        if let Some((playlist, member)) = actions.remove_member {
             self.library_request(
                 LibraryCommand::RemoveFromPlaylist {
                     playlist,
@@ -921,10 +824,7 @@ impl PodlibApp {
             }
             return;
         }
-        let mut status = format!("Добавляю файлы: {} шт.", drafts.len());
-        if !skipped.is_empty() {
-            status.push_str(&format!("; пропущены: {}", skipped.join(", ")));
-        }
+        let status = batch_add_status(drafts.len(), &skipped);
         self.library_request(
             LibraryCommand::AddTracks(drafts),
             PendingKind::AddTracks,
@@ -1243,62 +1143,18 @@ impl PodlibApp {
             let Some(dialog) = library.edit_dialog.as_mut() else {
                 return;
             };
-            let mut fields = dialog.fields.clone();
-            ui.horizontal(|ui| {
-                ui.label("Название:      ");
-                ui.add(
-                    egui::TextEdit::singleline(&mut fields.title).desired_width(320.0),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label("Исполнитель:  ");
-                ui.add(
-                    egui::TextEdit::singleline(&mut fields.artist).desired_width(320.0),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label("Альбом:       ");
-                ui.add(
-                    egui::TextEdit::singleline(&mut fields.album).desired_width(320.0),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label("Альбом-артист:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut fields.album_artist)
-                        .desired_width(320.0),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label("Трек №:       ");
-                ui.add(
-                    egui::TextEdit::singleline(&mut fields.track_number)
-                        .desired_width(60.0),
-                );
-                ui.label("Диск №:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut fields.disc_number)
-                        .desired_width(60.0),
-                );
-            });
-            dialog.fields = fields;
-            if let Some(error) = &dialog.error {
-                ui.colored_label(egui::Color32::LIGHT_RED, error);
-            }
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui.button("Отмена").clicked() {
-                    ui.close();
-                }
-                if ui.button("Сохранить").clicked() {
-                    save = true;
-                    ui.close();
-                }
-            });
+            save = edit_track_dialog_fields(ui, dialog);
         });
         if !(save || response.should_close()) {
             return; // still open, nothing to apply
         }
+        self.apply_edit_track_dialog(save);
+    }
+
+    /// Closes/commits the edit dialog: takes it out (the id survives by
+    /// contract while the dialog stays open), diffs the fields and then
+    /// sends EditTrack — or reopens with the validation error.
+    fn apply_edit_track_dialog(&mut self, save: bool) {
         // Take the dialog out to work without nested borrows.
         let Some(library) = self.library.as_mut() else {
             return;
@@ -1383,17 +1239,15 @@ impl PodlibApp {
                 }
             });
         });
-        if chosen.is_some() || response.should_close() {
-            if let Some(library) = self.library.as_mut() {
-                library.picker_tracks = None;
-            }
+        let (picker_after_close, add_request) = picker_close(
+            chosen,
+            response.should_close(),
+            self.library.as_ref().and_then(|l| l.picker_tracks.clone()),
+        );
+        if let Some(library) = self.library.as_mut() {
+            library.picker_tracks = picker_after_close;
         }
-        if let Some(playlist) = chosen {
-            let track_ids = self
-                .library
-                .as_ref()
-                .and_then(|library| library.picker_tracks.clone())
-                .unwrap_or_default();
+        if let Some((playlist, track_ids)) = add_request {
             self.library_request(
                 LibraryCommand::AddToPlaylist {
                     playlist,
@@ -1404,6 +1258,292 @@ impl PodlibApp {
             );
         }
     }
+}
+
+/// Snapshot of picker state after a close attempt: the new picker contents
+/// (None = cleared) and, if a playlist was chosen, the (playlist, ids)
+/// request payload. Ids are captured BEFORE the clear — see picker_close.
+type PickerCloseResult = (
+    Option<Vec<TrackId>>,
+    Option<(PlaylistId, Vec<TrackId>)>,
+);
+
+/// Pure close-handling for the add-to-playlist picker. Track ids are
+/// captured from the snapshot BEFORE the picker state clears: the previous
+/// inline order cleared first and read after, so the worker received an
+/// empty Vec and the UI claimed «Добавлено 0 треков» for a real request.
+fn picker_close(
+    chosen: Option<PlaylistId>,
+    should_close: bool,
+    picker_tracks: Option<Vec<TrackId>>,
+) -> PickerCloseResult {
+    let track_ids = picker_tracks.clone().unwrap_or_default();
+    let cleared = chosen.is_some() || should_close;
+    let state = if cleared { None } else { picker_tracks };
+    let request = chosen.map(|playlist| (playlist, track_ids));
+    (state, request)
+}
+
+/// Status line shown while a batch add runs (P4). The worker protocol
+/// is one command → one reply, so per-file progress («Добавление i/N…»)
+/// would require extending `LibraryCommand`/`LibraryOutcome` — and the
+/// backend trait contract is out of bounds. Instead the wait is
+/// announced honestly up front; meanwhile every button/menu is disabled
+/// by the idle gates and the spinner shows in the status area.
+fn batch_add_status(count: usize, skipped: &[String]) -> String {
+    let mut status = format!(
+        "Добавляется {} {}, это может занять время…",
+        count,
+        plural(count, "файл", "файла", "файлов")
+    );
+    if !skipped.is_empty() {
+        status.push_str(&format!("; пропущены: {}", skipped.join(", ")));
+    }
+    status
+}
+
+/// Toolbar above the track table: refresh, new playlist, DnD hint.
+fn library_toolbar(app: &mut PodlibApp, ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        let idle = app.library_idle();
+        if ui
+            .add_enabled(idle, egui::Button::new("Обновить"))
+            .clicked()
+        {
+            app.library_request(
+                LibraryCommand::Refresh,
+                PendingKind::Refresh,
+                "Обновляю список…",
+            );
+        }
+        if ui
+            .add_enabled(idle, egui::Button::new("+ Плейлист"))
+            .clicked()
+        {
+            if let Some(library) = app.library.as_mut() {
+                library.create_open = true;
+                library.new_playlist_name.clear();
+            }
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                egui::RichText::new("Перетащите аудиофайлы в окно, чтобы добавить")
+                    .weak(),
+            );
+        });
+    });
+}
+
+/// Renders the track table and collects context-menu choices without
+/// holding a borrow on app state (the caller applies them afterwards).
+fn track_table(
+    ui: &mut egui::Ui,
+    snapshot: &LibrarySnapshot,
+    menus_allowed: bool,
+) -> TrackRowActions {
+    let mut actions = TrackRowActions::default();
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        table_header(ui);
+        ui.separator();
+        for track in &snapshot.tracks {
+            let row_id = egui::Id::unique(("track_row", track.id.to_bits()));
+            let response = ui
+                .dnd_drag_source(row_id, DraggedTracks(vec![track.id]), |ui| {
+                    track_row(ui, track);
+                })
+                .response;
+            let mut choice = TrackRowActions::default();
+            if menus_allowed {
+                response.context_menu(|ui| {
+                    if ui.button("Изменить…").clicked() {
+                        choice.edit = Some(track.id);
+                        ui.close();
+                    }
+                    if ui.button("Добавить в плейлист…").clicked() {
+                        choice.add_to_playlist = Some(vec![track.id]);
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Удалить…").clicked() {
+                        choice.delete = Some(track.id);
+                        ui.close();
+                    }
+                });
+            }
+            actions.merge(choice);
+        }
+    });
+    actions
+}
+
+/// Header row, same column geometry as the data rows.
+fn table_header(ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        for (width, name) in COLUMN_WIDTHS {
+            ui.add_sized(
+                [width, ROW_HEIGHT],
+                egui::Label::new(egui::RichText::new(name).strong()),
+            );
+        }
+    });
+}
+
+/// One playlist block: drop zone, collapsing header, member rows.
+/// Collects this playlist's choices; no app-state borrow held.
+fn playlist_block(
+    ui: &mut egui::Ui,
+    snapshot: &LibrarySnapshot,
+    playlist: &Playlist,
+    menus_allowed: bool,
+) -> PlaylistPanelActions {
+    let mut actions = PlaylistPanelActions::default();
+    let is_master = playlist.is_master;
+    let header_text = if is_master {
+        format!("{} (мастер)", playlist.name)
+    } else {
+        playlist.name.clone()
+    };
+    let header_id = egui::Id::unique(("playlist_header", playlist.id.to_bits()));
+    let (_, dropped) = ui.dnd_drop_zone::<DraggedTracks, _>(
+        egui::Frame::default().inner_margin(egui::Margin::same(2)),
+        |ui| {
+            let collapsing = egui::CollapsingHeader::new(header_text.as_str())
+                .id_salt(header_id)
+                .default_open(true)
+                .show(ui, |ui| {
+                    actions.remove_member =
+                        playlist_members(ui, snapshot, playlist, menus_allowed);
+                });
+            if !is_master && menus_allowed {
+                let mut delete = false;
+                collapsing.header_response.context_menu(|ui| {
+                    if ui.button("Удалить плейлист…").clicked() {
+                        delete = true;
+                        ui.close();
+                    }
+                });
+                if delete {
+                    actions.delete_playlist = Some(playlist.id);
+                }
+            }
+        },
+    );
+    if let Some(dragged) = dropped {
+        // WHY the UI refuses master drops instead of trusting the
+        // backend: the 7G adapter rejects master-member mutations,
+        // but the classic backend allows them on purpose (firmware
+        // parity) — where they are pointless anyway: the master is
+        // the mirror of the whole library and duplicates are
+        // ignored. One consistent rule, explained without a round
+        // trip to the device.
+        if is_master {
+            actions.master_drop = Some(playlist.name.clone());
+        } else {
+            actions.add_drop = Some((playlist.id, dragged.0.clone()));
+        }
+    }
+    actions
+}
+
+/// Member rows inside one playlist header; returns an «Убрать» choice.
+fn playlist_members(
+    ui: &mut egui::Ui,
+    snapshot: &LibrarySnapshot,
+    playlist: &Playlist,
+    menus_allowed: bool,
+) -> Option<(PlaylistId, TrackId)> {
+    let mut remove_member = None;
+    let is_master = playlist.is_master;
+    for member_id in playlist.unique_track_ids() {
+        let title = snapshot
+            .track(member_id)
+            .map(|track| track.title.as_str())
+            .unwrap_or("<нет в библиотеке>");
+        let mut remove = false;
+        let row = ui
+            .horizontal(|ui| {
+                ui.add_sized(
+                    [ui.available_width() - 8.0, ROW_HEIGHT - 4.0],
+                    egui::Label::new(egui::RichText::new(title).weak()),
+                );
+            })
+            .response;
+        if !is_master && menus_allowed {
+            row.context_menu(|ui| {
+                if ui.button("Убрать из плейлиста").clicked() {
+                    remove = true;
+                    ui.close();
+                }
+            });
+        }
+        if remove {
+            remove_member = Some((playlist.id, member_id));
+        }
+    }
+    if playlist.track_ids.is_empty() {
+        ui.label(egui::RichText::new("— пусто —").weak());
+    }
+    remove_member
+}
+
+/// Field editors of the edit-track dialog; returns true on «Сохранить».
+/// Cancel closes via `ui.close()` (surfaces as `should_close`).
+fn edit_track_dialog_fields(ui: &mut egui::Ui, dialog: &mut EditDialogState) -> bool {
+    let mut save = false;
+    // Local copy: egui closures each need their own `&mut` field handle.
+    let mut fields = dialog.fields.clone();
+    ui.horizontal(|ui| {
+        ui.label("Название:      ");
+        ui.add(
+            egui::TextEdit::singleline(&mut fields.title).desired_width(320.0),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label("Исполнитель:  ");
+        ui.add(
+            egui::TextEdit::singleline(&mut fields.artist).desired_width(320.0),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label("Альбом:       ");
+        ui.add(
+            egui::TextEdit::singleline(&mut fields.album).desired_width(320.0),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label("Альбом-артист:");
+        ui.add(
+            egui::TextEdit::singleline(&mut fields.album_artist)
+                .desired_width(320.0),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label("Трек №:       ");
+        ui.add(
+            egui::TextEdit::singleline(&mut fields.track_number)
+                .desired_width(60.0),
+        );
+        ui.label("Диск №:");
+        ui.add(
+            egui::TextEdit::singleline(&mut fields.disc_number)
+                .desired_width(60.0),
+        );
+    });
+    dialog.fields = fields;
+    if let Some(error) = &dialog.error {
+        ui.colored_label(egui::Color32::LIGHT_RED, error);
+    }
+    ui.separator();
+    ui.horizontal(|ui| {
+        if ui.button("Отмена").clicked() {
+            ui.close();
+        }
+        if ui.button("Сохранить").clicked() {
+            save = true;
+            ui.close();
+        }
+    });
+    save
 }
 
 /// Renders one track-table row: four fixed-width cells (drag source body).
@@ -1727,7 +1867,12 @@ mod tests {
         assert_eq!(library.snapshot.tracks.len(), 1);
         assert_eq!(library.snapshot.tracks[0].title, "Alpha");
         assert!(app.status.contains("Подключено"));
-        assert!(app.status.contains("1 треков"));
+        // P1: Russian plural forms — «1 трек», not «1 треков».
+        assert!(
+            app.status.contains("1 трек, 1 плейлист"),
+            "got: {}",
+            app.status
+        );
         let library = app.library.take().unwrap();
         library.worker.close_and_join();
     }
@@ -1773,14 +1918,14 @@ mod tests {
                 tracks: vec![sample_track(1, "A"), sample_track(2, "B")],
                 playlists: Vec::new(),
             },
-            summary: "Добавлено треков: 1".to_owned(),
+            summary: "Добавлено 2 трека".to_owned(),
         })
         .unwrap();
         app.drain_library();
         let library = app.library.as_ref().unwrap();
         assert_eq!(library.snapshot.tracks.len(), 2, "snapshot replaced");
         assert!(library.pending.is_none(), "op must be settled");
-        assert_eq!(app.status, "Добавлено треков: 1");
+        assert_eq!(app.status, "Добавлено 2 трека");
         assert!(app.error.is_none());
     }
 
@@ -1873,7 +2018,56 @@ mod tests {
         assert!(error.hint.unwrap().contains("заново"));
     }
 
-    // ---- busy-worker refusal and menu gate (F2) ----
+    // ---- busy-worker refusal and menu gate (F2 / P2) ----
+
+    #[test]
+    fn request_without_library_asks_to_connect_first() {
+        // P2: with no library at all there is no operation to wait for —
+        // the refusal must point at connecting a device instead.
+        let mut app = test_app();
+        assert!(app.library.is_none());
+        app.library_request(
+            LibraryCommand::Refresh,
+            PendingKind::Refresh,
+            "Обновляю список…",
+        );
+        let error = app
+            .error
+            .expect("request without a library must be refused");
+        assert!(
+            error.message.contains("подключите"),
+            "got: {}",
+            error.message
+        );
+        assert!(
+            !error.message.contains("Дождитесь"),
+            "there is no operation to wait for"
+        );
+    }
+
+    #[test]
+    fn picker_close_captures_ids_before_clearing() {
+        // Regression (release review, round 3): clearing the picker before
+        // reading ids sent an empty AddToPlaylist with a lying
+        // «Добавлено 0 треков» status for a real user action.
+        let ids = vec![TrackId::from_bits(7), TrackId::from_bits(9)];
+        let (state, request) =
+            picker_close(Some(PlaylistId::from_bits(42)), false, Some(ids.clone()));
+        assert_eq!(state, None, "chosen playlist must close the picker");
+        assert_eq!(request, Some((PlaylistId::from_bits(42), ids)));
+    }
+
+    #[test]
+    fn picker_close_without_choice_clears_and_sends_nothing() {
+        let (state, request) = picker_close(None, true, Some(vec![TrackId::from_bits(1)]));
+        assert_eq!(state, None);
+        assert_eq!(request, None);
+
+        // Neither chosen nor closed: picker state survives for the next frame.
+        let (state, request) = picker_close(None, false, Some(vec![TrackId::from_bits(1)]));
+        assert_eq!(state, Some(vec![TrackId::from_bits(1)]));
+        assert_eq!(request, None);
+    }
 
     #[test]
     fn busy_worker_rejects_new_request_visibly() {
@@ -1977,5 +2171,28 @@ mod tests {
         assert_eq!(optional_text(&Some("X".to_owned())), "X");
         assert_eq!(optional_text(&Some("   ".to_owned())), "—");
         assert_eq!(optional_text(&None), "—");
+    }
+
+    // ---- batch-add status (P4) ----
+
+    #[test]
+    fn batch_add_status_announces_the_wait_and_skips() {
+        assert_eq!(
+            batch_add_status(1, &[]),
+            "Добавляется 1 файл, это может занять время…"
+        );
+        assert_eq!(
+            batch_add_status(2, &[]),
+            "Добавляется 2 файла, это может занять время…"
+        );
+        assert_eq!(
+            batch_add_status(30, &[]),
+            "Добавляется 30 файлов, это может занять время…"
+        );
+        assert_eq!(
+            batch_add_status(3, &["notes.txt".to_owned(), "noext".to_owned()]),
+            "Добавляется 3 файла, это может занять время…; \
+             пропущены: notes.txt, noext"
+        );
     }
 }

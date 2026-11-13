@@ -94,17 +94,36 @@ impl LibraryWorker {
     pub fn spawn(mount: PathBuf) -> (Self, Receiver<LibraryOutcome>) {
         let (requests, incoming) = channel::<(LibraryCommand, LibraryReply)>();
         let (opened_tx, opened_rx) = channel();
-        let handle = std::thread::Builder::new()
+        // No `.expect()` here (round-3 rule: none outside tests): a
+        // failed thread spawn surfaces as an honest Failed outcome and
+        // a dead worker whose `request()` reports "не активен".
+        // Clone the open sender: the closure owns one copy, the error
+        // arm below still has the original to report the failure.
+        let spawned = std::thread::Builder::new()
             .name("podlib-library".to_owned())
-            .spawn(move || worker_loop(mount, incoming, opened_tx))
-            .expect("spawn library worker thread");
-        (
-            Self {
-                requests: Some(requests),
-                handle: Some(handle),
-            },
-            opened_rx,
-        )
+            .spawn({
+                let opened = opened_tx.clone();
+                move || worker_loop(mount, incoming, opened)
+            });
+        match spawned {
+            Ok(handle) => (
+                Self {
+                    requests: Some(requests),
+                    handle: Some(handle),
+                },
+                opened_rx,
+            ),
+            Err(error) => {
+                let _ = opened_tx.send(LibraryOutcome::Failed {
+                    message: format!("Не удалось запустить поток библиотеки: {error}"),
+                    hint: Some("Подключите устройство заново.".to_owned()),
+                });
+                (Self {
+                    requests: None,
+                    handle: None,
+                }, opened_rx)
+            }
+        }
     }
 
     /// Test-only twin of [`Self::spawn`]: runs the command loop over a
@@ -287,13 +306,16 @@ fn dispatch(backend: &mut dyn LibraryBackend, command: LibraryCommand) -> Librar
                 }
             }
             match stopped {
-                None => finish(backend, format!("Добавлено треков: {added}")),
+                None => finish(backend, added_tracks_summary(added)),
                 Some(error) if added == 0 => failure_outcome(error),
                 // Partial success: show honestly how far it got.
                 Some(error) => match list_snapshot(backend) {
                     Ok(snapshot) => LibraryOutcome::Applied {
                         snapshot,
-                        summary: format!("Добавлено {added} из {total}; остановлено: {error}"),
+                        summary: format!(
+                            "{} из {total}; остановлено: {error}",
+                            added_tracks_summary(added)
+                        ),
                     },
                     Err(_) => failure_outcome(error),
                 },
@@ -335,7 +357,11 @@ fn dispatch(backend: &mut dyn LibraryBackend, command: LibraryCommand) -> Librar
             // requested rows, not of stored ones.
             Ok(_) => finish(
                 backend,
-                format!("Добавлено в плейлист: {} шт.", track_ids.len()),
+                format!(
+                    "Добавлено в плейлист: {} {}",
+                    track_ids.len(),
+                    plural(track_ids.len(), "трек", "трека", "треков")
+                ),
             ),
             Err(error) => failure_outcome(error),
         },
@@ -387,6 +413,32 @@ fn failure_from(error: BackendError) -> (String, Option<String>) {
 fn failure_outcome(error: BackendError) -> LibraryOutcome {
     let (message, hint) = failure_from(error);
     LibraryOutcome::Failed { message, hint }
+}
+
+/// Russian plural form for `n` items: «1 трек», «2 трека», «5 треков».
+/// Rules: `n % 10 == 1 && n % 100 != 11` → one; `n % 10` in 2..=4 and
+/// `n % 100` not in 12..=14 → few; otherwise (including 0) → many.
+pub(crate) fn plural<'a>(n: usize, one: &'a str, few: &'a str, many: &'a str) -> &'a str {
+    let units = n % 10;
+    let teens = n % 100;
+    if units == 1 && teens != 11 {
+        one
+    } else if (2..=4).contains(&units) && !(12..=14).contains(&teens) {
+        few
+    } else {
+        many
+    }
+}
+
+/// «Добавлен 1 трек» / «Добавлено 2 трека» / «Добавлено 5 треков»: the
+/// passive participle agrees with the count exactly like the noun does.
+fn added_tracks_summary(added: usize) -> String {
+    format!(
+        "{} {} {}",
+        plural(added, "Добавлен", "Добавлено", "Добавлено"),
+        added,
+        plural(added, "трек", "трека", "треков")
+    )
 }
 
 /// Extracts a human-readable message from a panic payload. Takes the box
@@ -592,6 +644,42 @@ mod tests {
             LibraryOutcome::Failed { message, hint } => (message, hint),
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    // ---- Russian plural forms (P1) ----
+
+    #[test]
+    fn plural_picks_one_few_many_on_boundaries() {
+        let cases = [
+            (0, "треков"),   // ноль → родительный множественного
+            (1, "трек"),     // один
+            (2, "трека"),    // два-четыре
+            (5, "треков"),   // пять и больше
+            (11, "треков"),  // 11-14 — всегда «ов»
+            (12, "треков"),
+            (21, "трек"),    // ...1, кроме 11
+            (22, "трека"),   // ...2, кроме 12-14
+            (25, "треков"),
+            (100, "треков"),
+            (101, "трек"),   // круглое число + 1
+            (111, "треков"), // 11 в конце — исключение из правила выше
+        ];
+        for (n, expected) in cases {
+            assert_eq!(
+                plural(n, "трек", "трека", "треков"),
+                expected,
+                "n = {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn added_tracks_summary_agrees_with_the_count() {
+        assert_eq!(added_tracks_summary(1), "Добавлен 1 трек");
+        assert_eq!(added_tracks_summary(2), "Добавлено 2 трека");
+        assert_eq!(added_tracks_summary(5), "Добавлено 5 треков");
+        assert_eq!(added_tracks_summary(11), "Добавлено 11 треков");
+        assert_eq!(added_tracks_summary(21), "Добавлен 21 трек");
     }
 
     // ---- drafts_from_paths ----
