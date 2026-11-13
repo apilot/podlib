@@ -70,7 +70,7 @@ fn fixture_db() -> (TempDir, Vec<u8>) {
 fn serialization_of_the_unmutated_fixture_is_byte_identical() {
     let (_dir, bytes) = fixture_db();
     let db = ItunesDb::parse(&bytes).unwrap();
-    assert_eq!(db.serialize(), bytes);
+    assert_eq!(db.serialize().unwrap(), bytes);
 }
 
 /// Domain invariants survive a parse → write → re-parse round trip.
@@ -79,11 +79,11 @@ fn roundtrip_reparse_preserves_domain_invariants() {
     let (_dir, bytes) = fixture_db();
     let first = ItunesDb::parse(&bytes).unwrap();
 
-    let second = ItunesDb::parse(&first.serialize()).unwrap();
+    let second = ItunesDb::parse(&first.serialize().unwrap()).unwrap();
     assert_eq!(second.tracks(), first.tracks());
     assert_eq!(second.playlists(), first.playlists());
     // And the second write is stable (idempotent) as well.
-    assert_eq!(second.serialize(), bytes);
+    assert_eq!(second.serialize().unwrap(), bytes);
 }
 
 /// The dual playlist-dataset layout (mhsd 2 legacy + mhsd 3 type-100)
@@ -92,7 +92,7 @@ fn roundtrip_reparse_preserves_domain_invariants() {
 #[test]
 fn dual_playlist_datasets_survive_serialization() {
     let (_dir, bytes) = fixture_db();
-    let written = ItunesDb::parse(&bytes).unwrap().serialize();
+    let written = ItunesDb::parse(&bytes).unwrap().serialize().unwrap();
 
     let reparsed = ItunesDb::parse(&written).unwrap();
     let indices: Vec<u32> = reparsed
@@ -124,7 +124,7 @@ fn dual_playlist_datasets_survive_serialization() {
 #[test]
 fn colon_path_format_survives_serialization() {
     let (_dir, bytes) = fixture_db();
-    let reparsed = ItunesDb::parse(&ItunesDb::parse(&bytes).unwrap().serialize()).unwrap();
+    let reparsed = ItunesDb::parse(&ItunesDb::parse(&bytes).unwrap().serialize().unwrap()).unwrap();
 
     let ListItem::Track(beta) = &reparsed
         .children

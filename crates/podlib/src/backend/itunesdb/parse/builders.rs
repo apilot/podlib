@@ -129,11 +129,14 @@ pub(crate) fn mhyp(
 
 pub(crate) fn list(magic: &[u8; 4], children: &[Vec<u8>]) -> Vec<u8> {
     let mut bytes = chunk(magic, 92);
+    // `mhl*` lists carry the child count at +8 and, unlike
+    // mhbd/mhsd/mhit/mhyp, have no total length field (their extent is
+    // bounded by the enclosing dataset) — so do NOT seal a total here;
+    // +8 must keep the count (same layout the fixture generator uses).
     put_u32(&mut bytes, 8, children.len() as u32);
     for child in children {
         bytes.extend_from_slice(child);
     }
-    seal_total(&mut bytes);
     bytes
 }
 

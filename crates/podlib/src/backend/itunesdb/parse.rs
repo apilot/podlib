@@ -752,6 +752,31 @@ mod tests {
     }
 
     #[test]
+    fn playlists_fall_back_to_mhsd3_when_legacy_has_only_the_podcast_list() {
+        // Review fix (M2×M3 combination): mhsd 2 exists but carries
+        // ONLY the podcast playlist; the user playlists must then come
+        // from mhsd 3 instead of vanishing.
+        let mut podcast = mhyp(7, false, &[modern_string_mhod(1, "Podcasts")], &[]);
+        podcast[0x2A] = 1;
+        let bytes = assemble_mhbd(&[
+            dataset(1, &list(&MHLT, &[])),
+            dataset(2, &list(&MHLP, &[podcast])),
+            dataset(
+                3,
+                &list(
+                    &MHLP,
+                    &[mhyp(42, false, &[modern_string_mhod(1, "Only3")], &[])],
+                ),
+            ),
+        ]);
+        let db = parse_tree(&bytes).unwrap();
+        let playlists = db.playlists();
+        assert_eq!(playlists.len(), 1);
+        assert_eq!(playlists[0].name, "Only3");
+        assert_eq!(playlists[0].id, PlaylistId::from_bits(42));
+    }
+
+    #[test]
     fn podcast_playlist_is_skipped_from_the_user_list() {
         let mut podcast = mhyp(7, false, &[modern_string_mhod(1, "Podcasts")], &[]);
         podcast[0x2A] = 1; // podcast flag

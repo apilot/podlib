@@ -1,9 +1,10 @@
-//! Read-path parser for classic (uncompressed) iPod `iTunesDB` files.
+//! Read/write path for classic (uncompressed) iPod `iTunesDB` files.
 //!
 //! Classic iPods (Video 5/5.5G, Classic 1–3G, Nano 1–4G) store the library
 //! in a single raw `mhbd` chunk file: no zlib wrapper, no SQLite, no CBK.
 //! This module parses that chunk tree into a self-contained,
-//! byte-preserving structure and projects it onto the existing domain
+//! byte-preserving structure, serializes it back losslessly
+//! ([`ItunesDb::serialize`]) and projects it onto the existing domain
 //! ([`Track`], [`Playlist`]).
 //!
 //! # Byte preservation
@@ -11,16 +12,31 @@
 //! Every node keeps its verbatim bytes plus its absolute offset in the
 //! source file, so the parsed tree tiles the input exactly (see
 //! [`ItunesDb::raw_segments`]). Unknown chunk magics and non-text `mhod`
-//! types (32, 100+, …) are kept as [`RawChunk`]s so the round-2 writer can
+//! types (32, 100+, …) are kept as [`RawChunk`]s so the writer can
 //! re-emit the file without loss — the golden criterion there is
 //! parse → write → byte-identical output.
 //!
-//! Scope (round 1): parsing only. Serialization, HASH58 signing and the
-//! `LibraryBackend` adapter are rounds 2–3.
+//! # Mutations (round 3а)
+//!
+//! [`edit`] implements add/remove track and playlist CRUD on the raw
+//! tree. Every mutation re-tiles the tree afterwards — recomputing node
+//! offsets and the counters/totals that live verbatim in the raw
+//! headers (`mhbd` total/count, `mhl*` child count, `mhit`/`mhyp`/`mhip`
+//! counts and totals) — and [`ItunesDb::serialize`] verifies tiling
+//! contiguity before emitting, so a mutation that skipped its re-tiling
+//! fails loudly with [`WriteError`] instead of silently scrambling byte
+//! order (round-3 review, Major 1).
+//!
+//! Scope (round 3б, next): HASH58 signing, the `LibraryBackend` adapter
+//! and CLI library-type detection.
 
+mod edit;
 mod parse;
 mod project;
 mod write;
+
+pub use edit::{EditError, TrackAddition};
+pub use write::WriteError;
 
 /// Error raised when the byte stream violates the iTunesDB chunk format.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
