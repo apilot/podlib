@@ -82,5 +82,7 @@ pub trait LibraryBackend {
     ) -> Result<(), BackendError>;
 }
 
+pub mod itunesdb;
 pub mod libopod_adapter;
+pub use itunesdb::{ItunesDb, ParseError};
 pub use libopod_adapter::LibopodBackend;

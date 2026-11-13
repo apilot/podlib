@@ -1,8 +1,9 @@
 //! podlib — domain types and backend abstraction for iPod libraries.
 //!
 //! The crate is split along SOLID lines: [`domain`] holds pure library
-//! types, [`backend`] defines the storage contract and the [`libopod`]
-//! adapter, and [`fixture`] builds synthetic nano-2g devices for tests.
+//! types, [`backend`] defines the storage contract, the [`libopod`]
+//! adapter, and the raw classic-iTunesDB reader, and [`fixture`] builds
+//! synthetic nano-2g devices for tests.
 //!
 //! [`libopod`]: crate::backend::libopod_adapter
 

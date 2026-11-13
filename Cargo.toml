@@ -6,6 +6,10 @@ members = ["crates/podlib", "crates/podlib-cli"]
 edition = "2021"
 version = "0.1.0"
 license = "MIT"
+# 1.88 is the MSRV gate: slice::as_chunks::<N> stabilized in 1.88 and is
+# the plan for the round-2/3 write path; older toolchains must fail at
+# build time with a clear message instead of a missing-API error.
+rust-version = "1.88"
 
 [workspace.dependencies]
 # Git main is required: crates.io 0.1.0 lacks playlist mutations and
