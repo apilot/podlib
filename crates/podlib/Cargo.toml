@@ -2,6 +2,7 @@
 name = "podlib"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 
 [dependencies]
 libopod = { workspace = true }

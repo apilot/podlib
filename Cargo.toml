@@ -5,6 +5,7 @@ members = ["crates/podlib", "crates/podlib-cli"]
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
+license = "MIT"
 
 [workspace.dependencies]
 # Git main is required: crates.io 0.1.0 lacks playlist mutations and
