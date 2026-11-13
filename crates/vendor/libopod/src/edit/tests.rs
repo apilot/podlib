@@ -1,0 +1,2380 @@
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeSet, fs, path::Path};
+
+    use rusqlite::Connection;
+    use tempfile::{tempdir, TempDir};
+
+    use super::{
+        commit::{
+            install_staged_removal, recover_transaction, FailureMode, ADDITION_CONFIRMATION,
+            ARTWORK_REMOVAL_CONFIRMATION, TRANSACTION_PATH,
+        },
+        choose_artwork_format_ids, edit_staged_databases, referenced_artwork_files, TrackToAdd,
+    };
+    use crate::{
+        artwork::parse_artwork_records, ArtworkFormatProfile, ArtworkFormatRef, ArtworkRecord,
+        Device, Error, Library, MediaDeletionPolicy, MediaKind, MountRoot, PersistentId,
+        SqliteLibraryFile,
+        NANO7_NOOP_HARDWARE_TEST_CONFIRMATION,
+        NANO7_REMOVAL_DELETE_HARDWARE_TEST_CONFIRMATION, NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION,
+    };
+    use std::io::Read as _;
+
+    #[test]
+    fn artwork_addition_matches_the_database_format_subset() {
+        let available = BTreeSet::from([1055, 1068, 1071, 1074, 1078, 1084]);
+        let referenced = BTreeSet::from([1055, 1071, 1074, 1078, 1084]);
+        let existing = referenced.clone();
+        assert_eq!(
+            choose_artwork_format_ids(&referenced, &existing, &available),
+            referenced
+        );
+        assert_eq!(
+            choose_artwork_format_ids(&BTreeSet::new(), &BTreeSet::new(), &available),
+            available
+        );
+    }
+
+    #[test]
+    fn artwork_reindex_uses_only_files_referenced_by_the_database() {
+        let records = vec![ArtworkRecord {
+            image_id: 100,
+            track_id: PersistentId::from_bits(1),
+            src_img_size: 123,
+            formats: vec![ArtworkFormatRef {
+                format_id: 1074,
+                ithmb_offset: 0,
+                image_size: 5_000,
+                width: 50,
+                height: 50,
+                filename: ":F1074_1.ithmb".to_owned(),
+            }],
+        }];
+        let profile = vec![
+            ArtworkFormatProfile {
+                format_id: 1061,
+                slot_bytes: 6_160,
+            },
+            ArtworkFormatProfile {
+                format_id: 1074,
+                slot_bytes: 5_000,
+            },
+        ];
+        let files = referenced_artwork_files(&records, &profile).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files["F1074_1.ithmb"], 5_000);
+        assert!(!files.contains_key("F1061_1.ithmb"));
+    }
+
+    #[test]
+    fn removes_direct_references_and_repairs_derived_rows() {
+        let directory = tempdir().unwrap();
+        create_database_set(directory.path());
+        let removals = BTreeSet::from([PersistentId::from_bits(1)]);
+        edit_staged_databases(directory.path(), &removals).unwrap();
+
+        let library = Connection::open(directory.path().join("Library.itdb")).unwrap();
+        assert_eq!(scalar(&library, "SELECT COUNT(*) FROM item"), 1);
+        assert_eq!(scalar(&library, "SELECT physical_order FROM item"), 0);
+        assert_eq!(scalar(&library, "SELECT item_count FROM album"), 1);
+        assert_eq!(scalar(&library, "SELECT artwork_item_pid FROM album"), 2);
+        assert_eq!(scalar(&library, "SELECT size FROM track_size_calc"), 200);
+        assert_eq!(scalar(&library, "SELECT COUNT(*) FROM avformat_info WHERE item_pid=1"), 0);
+        assert_eq!(scalar(&library, "SELECT physical_order FROM item_to_container"), 0);
+        assert_eq!(scalar(&library, "SELECT value FROM unknown_extension"), 99);
+
+        let locations = Connection::open(directory.path().join("Locations.itdb")).unwrap();
+        assert_eq!(scalar(&locations, "SELECT COUNT(*) FROM location"), 1);
+        let dynamic = Connection::open(directory.path().join("Dynamic.itdb")).unwrap();
+        assert_eq!(scalar(&dynamic, "SELECT COUNT(*) FROM item_stats"), 1);
+        let genius = Connection::open(directory.path().join("Genius.itdb")).unwrap();
+        assert_eq!(scalar(&genius, "SELECT COUNT(*) FROM genius_metadata"), 0);
+    }
+
+    #[test]
+    fn installs_and_reads_back_a_virtual_nano_noop() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        if !fixture.is_dir() {
+            return;
+        }
+        let device = Device::open(fixture).unwrap();
+        let bundle = tempdir().unwrap();
+        let staged = device.stage_noop_preview(bundle.path()).unwrap();
+        assert_eq!(staged.removed_tracks(), 0);
+        let virtual_root = bundle.path().join("original");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        assert!(virtual_device
+            .install_noop_hardware_test(&staged, "not confirmed")
+            .is_err());
+        assert!(!virtual_root.join(TRANSACTION_PATH).exists());
+        virtual_device
+            .install_noop_hardware_test(&staged, NANO7_NOOP_HARDWARE_TEST_CONFIRMATION)
+            .unwrap();
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 726);
+    }
+
+    #[test]
+    fn installs_and_reads_back_a_virtual_nano_removal() {
+        let Some((bundle, staged)) = stage_private_no_artwork_removal() else {
+            return;
+        };
+        let virtual_root = bundle.path().join("original");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        assert!(virtual_device
+            .install_single_removal_hardware_test(&staged, "not confirmed")
+            .is_err());
+        virtual_device
+            .install_single_removal_hardware_test(
+                &staged,
+                NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION,
+            )
+            .unwrap();
+
+        assert!(!virtual_root.join(TRANSACTION_PATH).exists());
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 725);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn deletes_media_on_install_and_restores_it_on_rollback() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        if !fixture.is_dir() {
+            return;
+        }
+        let device = Device::open(&fixture).unwrap();
+        let track = device
+            .library()
+            .unwrap()
+            .tracks()
+            .iter()
+            .find(|track| !track.has_artwork)
+            .unwrap()
+            .clone();
+        let mut edit = device.edit().unwrap();
+        edit.remove_track(track.id).unwrap();
+        edit.set_media_policy(MediaDeletionPolicy::Delete);
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        // The staging manifest records the deletion with the live fingerprint.
+        assert_eq!(staged.deletions().len(), 1);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(staged.manifest()).unwrap()).unwrap();
+        let deletions = manifest["deletions"].as_array().unwrap();
+        assert_eq!(deletions.len(), 1);
+        assert_eq!(
+            deletions[0]["target"],
+            serde_json::Value::String(track.location.to_string())
+        );
+
+        let virtual_root = bundle.path().join("original");
+        let media = virtual_root.join(track.location.as_str());
+        fs::create_dir_all(media.parent().unwrap()).unwrap();
+        fs::copy(fixture.join(track.location.as_str()), &media).unwrap();
+        assert!(media.is_file(), "media must exist before install");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        // The keep-media confirmation must not match a delete staging.
+        assert!(virtual_device
+            .install_single_removal_hardware_test(
+                &staged,
+                NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION,
+            )
+            .is_err());
+        virtual_device
+            .install_single_removal_hardware_test(
+                &staged,
+                NANO7_REMOVAL_DELETE_HARDWARE_TEST_CONFIRMATION,
+            )
+            .unwrap();
+        assert!(!media.exists(), "media file must be deleted on install");
+        assert!(!virtual_root.join(TRANSACTION_PATH).exists());
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 725);
+
+        // An interruption before the deletion unlink leaves the media in
+        // place; recovery restores the database from its on-device backup.
+        let device = Device::open(&fixture).unwrap();
+        let track = device
+            .library()
+            .unwrap()
+            .tracks()
+            .iter()
+            .find(|track| !track.has_artwork)
+            .unwrap()
+            .clone();
+        let mut edit = device.edit().unwrap();
+        edit.remove_track(track.id).unwrap();
+        edit.set_media_policy(MediaDeletionPolicy::Delete);
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        let virtual_root = bundle.path().join("original");
+        let media = virtual_root.join(track.location.as_str());
+        fs::create_dir_all(media.parent().unwrap()).unwrap();
+        fs::copy(fixture.join(track.location.as_str()), &media).unwrap();
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        install_staged_removal(
+            &virtual_device,
+            &staged,
+            FailureMode::SimulateInterruptionAfter(3),
+        )
+        .unwrap_err();
+        let mount = MountRoot::open(&virtual_root).unwrap();
+        recover_transaction(&mount).unwrap();
+        assert!(media.is_file(), "media file must be restored on rollback");
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 726);
+
+        // An interruption after the unlink keeps the media gone: fast
+        // deletion never restores media, only the database rolls back.
+        let device = Device::open(&fixture).unwrap();
+        let track = device
+            .library()
+            .unwrap()
+            .tracks()
+            .iter()
+            .find(|track| !track.has_artwork)
+            .unwrap()
+            .clone();
+        let mut edit = device.edit().unwrap();
+        edit.remove_track(track.id).unwrap();
+        edit.set_media_policy(MediaDeletionPolicy::Delete);
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        let virtual_root = bundle.path().join("original");
+        let media = virtual_root.join(track.location.as_str());
+        fs::create_dir_all(media.parent().unwrap()).unwrap();
+        fs::copy(fixture.join(track.location.as_str()), &media).unwrap();
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        install_staged_removal(
+            &virtual_device,
+            &staged,
+            FailureMode::SimulateInterruptionDuringDeletionAfter(0),
+        )
+        .unwrap_err();
+        let mount = MountRoot::open(&virtual_root).unwrap();
+        recover_transaction(&mount).unwrap();
+        assert!(
+            !media.exists(),
+            "fast deletion must not restore unlinked media on rollback"
+        );
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 726);
+    }
+
+    #[test]
+    fn recovers_an_interrupted_virtual_nano_removal() {
+        let Some((bundle, staged)) = stage_private_no_artwork_removal() else {
+            return;
+        };
+        let virtual_root = bundle.path().join("original");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        let error = install_staged_removal(
+            &virtual_device,
+            &staged,
+            FailureMode::SimulateInterruptionAfter(3),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Verification { .. }));
+        assert!(matches!(
+            Device::open(&virtual_root),
+            Err(Error::RecoveryRequired { .. })
+        ));
+
+        let mount = MountRoot::open(&virtual_root).unwrap();
+        recover_transaction(&mount).unwrap();
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 726);
+    }
+
+    #[test]
+    fn recovers_an_interruption_mid_backup() {
+        let Some((bundle, staged)) = stage_private_no_artwork_removal() else {
+            return;
+        };
+        let virtual_root = bundle.path().join("original");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        let error = install_staged_removal(
+            &virtual_device,
+            &staged,
+            FailureMode::SimulateInterruptionDuringBackupAfter(4),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Verification { .. }));
+        assert!(matches!(
+            Device::open(&virtual_root),
+            Err(Error::RecoveryRequired { .. })
+        ));
+
+        let mount = MountRoot::open(&virtual_root).unwrap();
+        recover_transaction(&mount).unwrap();
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 726);
+    }
+
+    #[test]
+    fn recovers_an_interruption_before_any_file_is_installed() {
+        let Some((bundle, staged)) = stage_private_no_artwork_removal() else {
+            return;
+        };
+        let virtual_root = bundle.path().join("original");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        let error = install_staged_removal(
+            &virtual_device,
+            &staged,
+            FailureMode::SimulateInterruptionAfter(0),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Verification { .. }));
+
+        let mount = MountRoot::open(&virtual_root).unwrap();
+        recover_transaction(&mount).unwrap();
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 726);
+    }
+
+    #[test]
+    fn recovers_an_interruption_during_validation() {
+        let Some((bundle, staged)) = stage_private_no_artwork_removal() else {
+            return;
+        };
+        let virtual_root = bundle.path().join("original");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        let error = install_staged_removal(
+            &virtual_device,
+            &staged,
+            FailureMode::SimulateInterruptionDuringValidation,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Verification { .. }));
+
+        let mount = MountRoot::open(&virtual_root).unwrap();
+        recover_transaction(&mount).unwrap();
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 726);
+    }
+
+    #[test]
+    fn keeps_a_committed_transaction_through_recovery() {
+        let Some((bundle, staged)) = stage_private_no_artwork_removal() else {
+            return;
+        };
+        let virtual_root = bundle.path().join("original");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        let error = install_staged_removal(
+            &virtual_device,
+            &staged,
+            FailureMode::SimulateInterruptionAfterCommitted,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Verification { .. }));
+        assert!(matches!(
+            Device::open(&virtual_root),
+            Err(Error::RecoveryRequired { .. })
+        ));
+
+        let mount = MountRoot::open(&virtual_root).unwrap();
+        recover_transaction(&mount).unwrap();
+        assert!(!virtual_root.join(TRANSACTION_PATH).exists());
+        let reopened = Device::open(&virtual_root).unwrap();
+        // A committed transaction must survive recovery without rollback.
+        assert_eq!(reopened.library().unwrap().track_count(), 725);
+    }
+
+    #[test]
+    fn refuses_recovery_with_a_corrupt_journal() {
+        let Some((bundle, staged)) = stage_private_no_artwork_removal() else {
+            return;
+        };
+        let virtual_root = bundle.path().join("original");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        install_staged_removal(
+            &virtual_device,
+            &staged,
+            FailureMode::SimulateInterruptionAfter(1),
+        )
+        .unwrap_err();
+        let transaction = virtual_root.join(TRANSACTION_PATH);
+        fs::write(transaction.join("journal.json"), b"not a journal").unwrap();
+
+        let mount = MountRoot::open(&virtual_root).unwrap();
+        let error = recover_transaction(&mount).unwrap_err();
+        assert!(matches!(error, Error::Malformed { .. }));
+        // A corrupt journal must leave the transaction untouched for manual review.
+        assert!(transaction.exists());
+        assert!(matches!(
+            Device::open(&virtual_root),
+            Err(Error::RecoveryRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn recovery_is_a_noop_without_a_pending_transaction() {
+        let directory = tempdir().unwrap();
+        let mount = MountRoot::open(directory.path()).unwrap();
+        recover_transaction(&mount).unwrap();
+    }
+
+    #[test]
+    fn installs_and_reads_back_a_virtual_nano_addition() {
+        let Some((bundle, staged)) = stage_private_addition() else {
+            return;
+        };
+        assert_eq!(staged.added_tracks(), 1);
+        assert_eq!(staged.removed_tracks(), 0);
+        assert_eq!(staged.remaining_tracks(), 727);
+        assert_eq!(staged.added_media().len(), 1);
+        assert!(staged.added_media()[0].as_str().starts_with("iPod_Control/Music/"));
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(staged.manifest()).unwrap()).unwrap();
+        let targets: Vec<&str> = manifest["outputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|output| output["target"].as_str().unwrap())
+            .collect();
+        assert_eq!(targets[0], staged.added_media()[0].as_str());
+        assert_eq!(
+            targets.last().copied(),
+            Some("iPod_Control/iTunes/iTunes Library.itlp/Library.itdb"),
+            "the authoritative library must be published after its media"
+        );
+        // Regression: the new track's CDB title and location strings must
+        // round-trip through the exact MHOD string layout (8-byte header gap).
+        let cdb = std::fs::read(bundle.path().join("iTunesCDB")).unwrap();
+        let (title, location) = cdb_track_strings(
+            &cdb,
+            staged_pid(&staged, "LibOpod Fixture Addition"),
+        )
+        .expect("new track present in staged CDB");
+        assert_eq!(title, "LibOpod Fixture Addition");
+        assert!(location.starts_with(":iPod_Control:Music:"));
+        verify_staged_addition(&bundle, &staged);
+
+        let virtual_root = bundle.path().join("original");
+        create_virtual_media_dirs(&virtual_root, staged.added_media());
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        assert!(virtual_device
+            .install_single_addition_hardware_test(&staged, "not confirmed")
+            .is_err());
+        virtual_device
+            .install_single_addition_hardware_test(&staged, ADDITION_CONFIRMATION)
+            .unwrap();
+        assert!(!virtual_root.join(TRANSACTION_PATH).exists());
+        let media_target = virtual_root.join(staged.added_media()[0].as_str());
+        assert!(media_target.is_file());
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 727);
+    }
+
+    #[test]
+    fn recovers_an_interrupted_virtual_nano_addition() {
+        let Some((bundle, staged)) = stage_private_addition() else {
+            return;
+        };
+        let virtual_root = bundle.path().join("original");
+        create_virtual_media_dirs(&virtual_root, staged.added_media());
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        install_staged_removal(
+            &virtual_device,
+            &staged,
+            FailureMode::SimulateInterruptionAfter(5),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            Device::open(&virtual_root),
+            Err(Error::RecoveryRequired { .. })
+        ));
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(staged.manifest()).unwrap()).unwrap();
+        let first_target = manifest["outputs"][0]["target"].as_str().unwrap();
+        let first_target = virtual_root.join(first_target);
+        let stale_temporary = first_target.parent().unwrap().join(format!(
+            ".{}.libopod-0.tmp",
+            first_target.file_name().unwrap().to_str().unwrap()
+        ));
+        std::fs::write(&stale_temporary, vec![0_u8; 1024 * 1024]).unwrap();
+
+        let mount = MountRoot::open(&virtual_root).unwrap();
+        recover_transaction(&mount).unwrap();
+        assert!(!stale_temporary.exists());
+        let media_target = virtual_root.join(staged.added_media()[0].as_str());
+        assert!(!media_target.exists());
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 726);
+    }
+
+    /// The host generation backup does not include media directories; the
+    /// virtual device needs the allocated `Music/Fxx` parents to exist.
+    fn create_virtual_media_dirs(virtual_root: &Path, added_media: &[crate::IpodPath]) {
+        for media in added_media {
+            let parent = virtual_root.join(media.as_str()).parent().unwrap().to_path_buf();
+            std::fs::create_dir_all(&parent).unwrap();
+        }
+    }
+
+    #[test]
+    fn stages_an_artwork_bearing_removal_with_artworkdb_output() {
+        let Some((bundle, staged)) = stage_private_artwork_removal() else {
+            return;
+        };
+        assert_eq!(staged.removed_tracks(), 1);
+        assert_eq!(staged.removed_artwork_tracks(), 1);
+        assert_eq!(staged.remaining_tracks(), 725);
+        let artwork = bundle.path().join("ArtworkDB");
+        assert!(artwork.is_file());
+        let bytes = std::fs::read(&artwork).unwrap();
+        let records = parse_artwork_records(&bytes).unwrap();
+        assert_eq!(records.len(), 703);
+        // The manifest must carry the ArtworkDB output.
+        let manifest = std::fs::read_to_string(staged.manifest()).unwrap();
+        assert!(manifest.contains("iPod_Control/Artwork/ArtworkDB"));
+        let library = rusqlite::Connection::open(
+            bundle.path().join(SqliteLibraryFile::Library.file_name()),
+        )
+        .unwrap();
+        let tracks: i64 = library
+            .query_row("SELECT COUNT(*) FROM item", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(tracks, 725);
+    }
+
+    #[test]
+    fn installs_and_recovers_a_virtual_nano_artwork_removal() {
+        let Some((bundle, staged)) = stage_private_artwork_removal() else {
+            return;
+        };
+        let virtual_root = bundle.path().join("original");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        // The artwork-bearing gate refuses the wrong confirmation.
+        assert!(virtual_device
+            .install_single_artwork_removal_hardware_test(&staged, "not confirmed")
+            .is_err());
+        virtual_device
+            .install_single_artwork_removal_hardware_test(&staged, ARTWORK_REMOVAL_CONFIRMATION)
+            .unwrap();
+        assert!(!virtual_root.join(TRANSACTION_PATH).exists());
+        let installed = std::fs::read(
+            virtual_root.join("iPod_Control/Artwork/ArtworkDB"),
+        )
+        .unwrap();
+        assert_eq!(parse_artwork_records(&installed).unwrap().len(), 703);
+        // The ithmb files were reindexed: no growth, whole slots, and the
+        // installed ArtworkDB record offsets stay in range.
+        for name in [
+            "F1010_1.ithmb",
+            "F1013_1.ithmb",
+            "F1015_1.ithmb",
+            "F1016_1.ithmb",
+        ] {
+            let path = virtual_root.join("iPod_Control/Artwork").join(name);
+            let bytes = std::fs::read(&path).unwrap();
+            let original = bundle
+                .path()
+                .join("original/iPod_Control/Artwork")
+                .join(name);
+            let before = std::fs::metadata(original).unwrap().len();
+            assert!(
+                (bytes.len() as u64) <= before,
+                "{name} grew during reindex"
+            );
+            let slot = match name {
+                "F1010_1.ithmb" => 115_200u64,
+                "F1013_1.ithmb" => 5_000,
+                "F1015_1.ithmb" => 6_728,
+                _ => 6_612,
+            };
+            assert_eq!(bytes.len() as u64 % slot, 0, "{name} is not whole slots");
+        }
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 725);
+
+        // Interrupted installation must roll the ArtworkDB back to 704 records.
+        let (bundle, staged) = stage_private_artwork_removal().unwrap();
+        let virtual_root = bundle.path().join("original");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        install_staged_removal(
+            &virtual_device,
+            &staged,
+            FailureMode::SimulateInterruptionAfter(3),
+        )
+        .unwrap_err();
+        let mount = MountRoot::open(&virtual_root).unwrap();
+        recover_transaction(&mount).unwrap();
+        let rolled_back =
+            std::fs::read(virtual_root.join("iPod_Control/Artwork/ArtworkDB")).unwrap();
+        assert_eq!(parse_artwork_records(&rolled_back).unwrap().len(), 704);
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 726);
+    }
+
+    #[test]
+    fn stages_and_installs_an_addition_with_reused_album_art() {
+        let Some((bundle, staged)) = stage_private_artwork_addition() else {
+            return;
+        };
+        assert_eq!(staged.added_tracks(), 1);
+        assert_eq!(staged.added_artwork_tracks(), 1);
+        assert_eq!(staged.remaining_tracks(), 727);
+        let directory = bundle.path();
+        let library = rusqlite::Connection::open(
+            directory.join(SqliteLibraryFile::Library.file_name()),
+        )
+        .unwrap();
+        let (status, cache_id): (i64, i64) = library
+            .query_row(
+                "SELECT artwork_status, artwork_cache_id FROM item \
+                 WHERE title = 'LibOpod Artwork Reuse'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, 1);
+        assert_eq!(cache_id, 804);
+        let artwork_bytes = std::fs::read(directory.join("ArtworkDB")).unwrap();
+        let records = crate::artwork::parse_artwork_records(&artwork_bytes).unwrap();
+        assert_eq!(records.len(), 705);
+        let added = records
+            .iter()
+            .find(|record| record.track_id == staged_pid(&staged, "LibOpod Artwork Reuse"))
+            .unwrap();
+        assert_eq!(added.image_id, 804);
+        assert_eq!(added.formats.len(), 4);
+
+        let virtual_root = bundle.path().join("original");
+        create_virtual_media_dirs(&virtual_root, staged.added_media());
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        assert!(virtual_device
+            .install_artwork_addition_hardware_test(&staged, "not confirmed", false)
+            .is_err());
+        virtual_device
+            .install_artwork_addition_hardware_test(
+                &staged,
+                "I HAVE A VERIFIED BACKUP; ADD ONE TRACK WITH REUSED ALBUM ART",
+                false,
+            )
+            .unwrap();
+        let installed =
+            std::fs::read(virtual_root.join("iPod_Control/Artwork/ArtworkDB")).unwrap();
+        assert_eq!(crate::artwork::parse_artwork_records(&installed).unwrap().len(), 705);
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 727);
+    }
+
+    /// Decodes the CDB and returns (title, location) for the track with the
+    /// given persistent ID, using the exact MHOD string layout.
+    fn cdb_track_strings(cdb: &[u8], pid: PersistentId) -> Option<(String, String)> {
+        let header_length = u32::from_le_bytes(cdb[4..8].try_into().unwrap()) as usize;
+        let mut decoder = flate2::read::ZlibDecoder::new(&cdb[header_length..]);
+        let mut payload = Vec::new();
+        decoder.read_to_end(&mut payload).unwrap();
+        let datasets = u32::from_le_bytes(cdb[0x14..0x18].try_into().unwrap());
+        let mut offset = 0;
+        for _ in 0..datasets {
+            let hdr = u32::from_le_bytes(payload[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            let total = u32::from_le_bytes(payload[offset + 8..offset + 12].try_into().unwrap()) as usize;
+            let kind = u32::from_le_bytes(payload[offset + 12..offset + 16].try_into().unwrap());
+            if kind == 1 {
+                let list = offset + hdr;
+                let lh = u32::from_le_bytes(payload[list + 4..list + 8].try_into().unwrap()) as usize;
+                let count = u32::from_le_bytes(payload[list + 8..list + 12].try_into().unwrap());
+                let mut toff = list + lh;
+                for _ in 0..count {
+                    let hh = u32::from_le_bytes(payload[toff + 4..toff + 8].try_into().unwrap()) as usize;
+                    let tt = u32::from_le_bytes(payload[toff + 8..toff + 12].try_into().unwrap()) as usize;
+                    let track_pid =
+                        u64::from_le_bytes(payload[toff + 0x70..toff + 0x78].try_into().unwrap());
+                    if PersistentId::from_bits(track_pid) == pid {
+                        let mut title = String::new();
+                        let mut location = String::new();
+                        let cc =
+                            u32::from_le_bytes(payload[toff + 0x0c..toff + 0x10].try_into().unwrap());
+                        let mut coff = toff + hh;
+                        for _ in 0..cc {
+                            let _ch = u32::from_le_bytes(payload[coff + 4..coff + 8].try_into().unwrap()) as usize;
+                            let ct = u32::from_le_bytes(payload[coff + 8..coff + 12].try_into().unwrap()) as usize;
+                            let mhod_type =
+                                u32::from_le_bytes(payload[coff + 12..coff + 16].try_into().unwrap());
+                            if mhod_type == 1 || mhod_type == 2 {
+                                let body = coff + 24;
+                                let byte_len = u32::from_le_bytes(
+                                    payload[body + 4..body + 8].try_into().unwrap(),
+                                ) as usize;
+                                let mut units = Vec::new();
+                                for pair in payload[body + 16..body + 16 + byte_len].chunks_exact(2)
+                                {
+                                    units.push(u16::from_le_bytes([pair[0], pair[1]]));
+                                }
+                                let text = String::from_utf16_lossy(&units);
+                                if mhod_type == 1 {
+                                    title = text;
+                                } else {
+                                    location = text;
+                                }
+                            }
+                            coff += ct;
+                        }
+                        return Some((title, location));
+                    }
+                    toff += tt;
+                }
+            }
+            offset += total;
+        }
+        None
+    }
+
+    fn staged_pid(staged: &super::StagedSqliteEdit, title: &str) -> PersistentId {
+        let library = rusqlite::Connection::open(
+            staged.directory().join(SqliteLibraryFile::Library.file_name()),
+        )
+        .unwrap();
+        let pid: i64 = library
+            .query_row(
+                "SELECT pid FROM item WHERE title = ?1",
+                [title],
+                |row| row.get(0),
+            )
+            .unwrap();
+        PersistentId::from_bits(u64::from_ne_bytes(pid.to_ne_bytes()))
+    }
+
+    fn stage_private_artwork_addition() -> Option<(TempDir, super::StagedSqliteEdit)> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        if !fixture.is_dir() {
+            return None;
+        }
+        let device = Device::open(&fixture).unwrap();
+        let source = fixture.join("iPod_Control/Music/F11/BMJO.mp3");
+        if !source.is_file() {
+            return None;
+        }
+        let mut edit = device.edit().unwrap();
+        edit.add_track(TrackToAdd {
+            source_path: source,
+            title: "LibOpod Artwork Reuse".to_owned(),
+            artist: Some("Linkin Park".to_owned()),
+            album: Some("Hybrid Theory".to_owned()),
+            album_artist: None,
+            genre: None,
+            composer: None,
+            year: 2000,
+            track_number: 13,
+            total_tracks: 13,
+            disc_number: 1,
+            total_discs: 1,
+            bitrate: 192,
+            sample_rate: 44100,
+            length_ms: 155_742,
+            compilation: false,
+            media_kind: crate::MediaKind::Song,
+            reuse_album_art: true,
+            artwork_source: None,
+        })
+        .unwrap();
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        Some((bundle, staged))
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn stages_a_nano7_podcast_with_its_special_container() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        if !fixture.is_dir() {
+            return;
+        }
+        let source = fixture.join("iPod_Control/Music/F11/BMJO.mp3");
+        if !source.is_file() {
+            return;
+        }
+        let device = Device::open(&fixture).unwrap();
+        let mut edit = device.edit().unwrap();
+        edit.add_track(TrackToAdd {
+            source_path: source,
+            title: "LibOpod Podcast Episode".to_owned(),
+            artist: Some("LibOpod Podcast".to_owned()),
+            album: Some("LibOpod Podcast".to_owned()),
+            album_artist: None,
+            genre: None,
+            composer: None,
+            year: 2025,
+            track_number: 1,
+            total_tracks: 1,
+            disc_number: 1,
+            total_discs: 1,
+            bitrate: 192,
+            sample_rate: 44_100,
+            length_ms: 155_742,
+            compilation: false,
+            media_kind: MediaKind::Podcast,
+            reuse_album_art: false,
+            artwork_source: None,
+        })
+        .unwrap();
+        let bundle = tempdir().unwrap();
+        let mut operations = Vec::new();
+        let staged = edit.stage_sqlite_preview_with_progress(bundle.path(), |event| {
+            if let crate::ProgressEvent::Item { operation, current, total, name } = event {
+                if name == "LibOpod Podcast Episode" {
+                    assert_eq!((current, total), (1, 1));
+                    operations.push(operation);
+                }
+            }
+        }).unwrap();
+        assert_eq!(staged.added_tracks(), 1);
+        assert_eq!(operations, [
+            "Staging audio and artwork", "Updating SQLite library", "Updating binary companion",
+        ]);
+
+        let library = Connection::open(bundle.path().join("Library.itdb")).unwrap();
+        let pid: i64 = library
+            .query_row(
+                "SELECT pid FROM item WHERE title='LibOpod Podcast Episode' AND media_kind=4 \
+                 AND is_song=0 AND is_podcast=1 AND remember_bookmark=1 \
+                 AND exclude_from_shuffle=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            library
+                .query_row(
+                    "SELECT COUNT(*) FROM podcast_info WHERE item_pid=?1",
+                    [pid],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let podcast_container: i64 = library
+            .query_row(
+                "SELECT pid FROM container WHERE distinguished_kind=11 AND name='Podcasts' \
+                 AND media_kinds=4 AND is_hidden=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            library
+                .query_row(
+                    "SELECT COUNT(*) FROM item_to_container WHERE item_pid=?1 \
+                     AND container_pid=?2",
+                    rusqlite::params![pid, podcast_container],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let dynamic = Connection::open(bundle.path().join("Dynamic.itdb")).unwrap();
+        assert_eq!(
+            dynamic
+                .query_row(
+                    "SELECT has_been_played FROM item_stats WHERE item_pid=?1",
+                    [pid],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        drop(dynamic);
+        drop(library);
+
+        let virtual_root = bundle.path().join("original");
+        create_virtual_media_dirs(&virtual_root, staged.added_media());
+        staged.install(&Device::open(&virtual_root).unwrap()).unwrap();
+        let reopened = Device::open(&virtual_root).unwrap();
+        let podcast = reopened
+            .library()
+            .unwrap()
+            .tracks()
+            .iter()
+            .find(|track| track.title == "LibOpod Podcast Episode")
+            .unwrap();
+        assert_eq!(podcast.media_kind, MediaKind::Podcast);
+        let container = reopened
+            .library()
+            .unwrap()
+            .playlists()
+            .iter()
+            .find(|playlist| playlist.distinguished_kind == 11)
+            .unwrap();
+        assert!(container.is_hidden);
+        assert_eq!(container.track_ids(), [podcast.id]);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn stages_and_installs_an_addition_with_new_encoded_artwork() {
+        let Some((bundle, staged)) = stage_private_new_art_addition() else {
+            return;
+        };
+        assert_eq!(staged.added_tracks(), 1);
+        assert_eq!(staged.added_artwork_tracks(), 1);
+        assert_eq!(staged.added_ithmb().len(), 4);
+        assert_eq!(staged.remaining_tracks(), 727);
+        let directory = bundle.path();
+        let library = rusqlite::Connection::open(
+            directory.join(SqliteLibraryFile::Library.file_name()),
+        )
+        .unwrap();
+        let (status, cache_id): (i64, i64) = library
+            .query_row(
+                "SELECT artwork_status, artwork_cache_id FROM item \
+                 WHERE title = 'LibOpod New Art'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, 1);
+        assert_eq!(cache_id, 804);
+        let (item_pid, album_pid, artist_pid): (i64, i64, i64) = library
+            .query_row(
+                "SELECT item.pid, album.pid, artist.pid FROM item \
+                 JOIN album ON album.pid = item.album_pid \
+                 JOIN artist ON artist.pid = album.artist_pid \
+                 WHERE item.title = 'LibOpod New Art'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        // Apple's browse-level artwork linkage: the album names a
+        // representative item and the artist names a representative album (the
+        // artist row has no item fallback, so it stays blank without this).
+        let (album_status, album_item_pid): (i64, i64) = library
+            .query_row(
+                "SELECT artwork_status, artwork_item_pid FROM album WHERE pid = ?1",
+                [album_pid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(album_status, 1);
+        assert_eq!(album_item_pid, item_pid);
+        let (artist_status, artist_album_pid): (i64, i64) = library
+            .query_row(
+                "SELECT artwork_status, artwork_album_pid FROM artist WHERE pid = ?1",
+                [artist_pid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(artist_status, 1);
+        assert_eq!(artist_album_pid, album_pid);
+        // Browse-order columns use the (1-based rank) * 100 scale; a new
+        // entity must never sort ahead of existing ones.
+        let album_order: i64 = library
+            .query_row(
+                "SELECT name_order FROM album WHERE pid = ?1",
+                [album_pid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            album_order >= 100 && album_order % 100 == 0,
+            "album name_order must use the *100 scale, got {album_order}"
+        );
+        let artist_order: i64 = library
+            .query_row(
+                "SELECT name_order FROM artist WHERE pid = ?1",
+                [artist_pid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            artist_order >= 100 && artist_order % 100 == 0,
+            "artist name_order must use the *100 scale, got {artist_order}"
+        );
+        let artwork_bytes = std::fs::read(directory.join("ArtworkDB")).unwrap();
+        let records = crate::artwork::parse_artwork_records(&artwork_bytes).unwrap();
+        assert_eq!(records.len(), 705);
+        let added = records
+            .iter()
+            .find(|record| record.track_id == staged_pid(&staged, "LibOpod New Art"))
+            .unwrap();
+        assert_eq!(added.image_id, 804);
+        // Each ithmb file grew by exactly one slot.
+        for ithmb in staged.added_ithmb() {
+            let staged_file = directory.join(ithmb.as_str());
+            let original = bundle.path().join("original").join(ithmb.as_str());
+            let grown = std::fs::metadata(&staged_file).unwrap().len();
+            let before = std::fs::metadata(&original).unwrap().len();
+            assert_eq!(grown, before + (grown - before));
+            assert!(grown > before, "{} did not grow", ithmb.as_str());
+        }
+
+        let virtual_root = bundle.path().join("original");
+        create_virtual_media_dirs(&virtual_root, staged.added_media());
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        assert!(virtual_device
+            .install_artwork_addition_hardware_test(&staged, "not confirmed", true)
+            .is_err());
+        virtual_device
+            .install_artwork_addition_hardware_test(
+                &staged,
+                "I HAVE A VERIFIED BACKUP; ADD ONE TRACK WITH NEW COVER ART",
+                true,
+            )
+            .unwrap();
+        for ithmb in staged.added_ithmb() {
+            assert!(virtual_root.join(ithmb.as_str()).is_file());
+        }
+        let installed =
+            std::fs::read(virtual_root.join("iPod_Control/Artwork/ArtworkDB")).unwrap();
+        assert_eq!(crate::artwork::parse_artwork_records(&installed).unwrap().len(), 705);
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 727);
+    }
+
+    #[test]
+    fn recovers_an_interrupted_new_art_install_across_ithmb_outputs() {
+        let Some((bundle, staged)) = stage_private_new_art_addition() else {
+            return;
+        };
+        let virtual_root = bundle.path().join("original");
+        create_virtual_media_dirs(&virtual_root, staged.added_media());
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        // Output order: 5 DBs, CBK, CDB, ArtworkDB, 4 ithmb files, media.
+        install_staged_removal(
+            &virtual_device,
+            &staged,
+            FailureMode::SimulateInterruptionAfter(9),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            Device::open(&virtual_root),
+            Err(Error::RecoveryRequired { .. })
+        ));
+        let mount = MountRoot::open(&virtual_root).unwrap();
+        recover_transaction(&mount).unwrap();
+        let artwork =
+            std::fs::read(virtual_root.join("iPod_Control/Artwork/ArtworkDB")).unwrap();
+        assert_eq!(crate::artwork::parse_artwork_records(&artwork).unwrap().len(), 704);
+        for ithmb in staged.added_ithmb() {
+            let original_size = std::fs::metadata(
+                bundle.path().join("original").join(ithmb.as_str()),
+            )
+            .unwrap()
+            .len();
+            let restored =
+                std::fs::metadata(virtual_root.join(ithmb.as_str())).unwrap().len();
+            assert_eq!(restored, original_size, "{} not restored", ithmb.as_str());
+        }
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 726);
+    }
+
+    #[test]
+    fn stages_two_new_art_additions_into_distinct_slots() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        if !fixture.is_dir() {
+            return;
+        }
+        let device = Device::open(&fixture).unwrap();
+        let source = fixture.join("iPod_Control/Music/F11/BMJO.mp3");
+        if !source.is_file() {
+            return;
+        }
+        let art_dir = tempdir().unwrap();
+        let art_path = art_dir.path().join("cover.png");
+        let mut buffer = Vec::new();
+        let rgba = image::RgbaImage::from_pixel(256, 256, image::Rgba([10, 200, 90, 255]));
+        let encoder = image::codecs::png::PngEncoder::new(&mut buffer);
+        image::ImageEncoder::write_image(
+            encoder,
+            rgba.as_raw(),
+            256,
+            256,
+            image::ExtendedColorType::Rgba8,
+        )
+        .unwrap();
+        std::fs::write(&art_path, &buffer).unwrap();
+        let mut edit = device.edit().unwrap();
+        for (title, artist) in [("Multi Art One", "Multi One"), ("Multi Art Two", "Multi Two")] {
+            edit.add_track(TrackToAdd {
+                source_path: source.clone(),
+                title: title.to_owned(),
+                artist: Some(artist.to_owned()),
+                album: Some(format!("{artist} Album")),
+                album_artist: None,
+                genre: None,
+                composer: None,
+                year: 2024,
+                track_number: 1,
+                total_tracks: 1,
+                disc_number: 1,
+                total_discs: 1,
+                bitrate: 192,
+                sample_rate: 44100,
+                length_ms: 155_742,
+                compilation: false,
+                media_kind: crate::MediaKind::Song,
+                reuse_album_art: false,
+                artwork_source: Some(art_path.clone()),
+            })
+            .unwrap();
+        }
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        assert_eq!(staged.added_tracks(), 2);
+        assert_eq!(staged.added_artwork_tracks(), 2);
+        assert_eq!(staged.added_ithmb().len(), 4);
+        assert_eq!(staged.remaining_tracks(), 728);
+        let artwork_bytes = std::fs::read(bundle.path().join("ArtworkDB")).unwrap();
+        let records = crate::artwork::parse_artwork_records(&artwork_bytes).unwrap();
+        assert_eq!(records.len(), 706);
+        let new_ids: Vec<u32> = records
+            .iter()
+            .filter(|record| record.image_id >= 804)
+            .map(|record| record.image_id)
+            .collect();
+        assert_eq!(new_ids, vec![804, 805]);
+        // Each ithmb file grew by exactly two slots.
+        for ithmb in staged.added_ithmb() {
+            let grown =
+                std::fs::metadata(bundle.path().join(ithmb.as_str())).unwrap().len();
+            let before = std::fs::metadata(
+                bundle.path().join("original").join(ithmb.as_str()),
+            )
+            .unwrap()
+            .len();
+            let slot = (grown - before) / 2;
+            assert!(slot > 0);
+        }
+    }
+
+    fn stage_private_new_art_addition() -> Option<(TempDir, super::StagedSqliteEdit)> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        if !fixture.is_dir() {
+            return None;
+        }
+        let device = Device::open(&fixture).unwrap();
+        let source = fixture.join("iPod_Control/Music/F11/BMJO.mp3");
+        if !source.is_file() {
+            return None;
+        }
+        let art_dir = tempdir().unwrap();
+        let art_path = art_dir.path().join("cover.png");
+        let mut buffer = Vec::new();
+        let rgba = image::RgbaImage::from_pixel(512, 512, image::Rgba([120, 40, 200, 255]));
+        let encoder = image::codecs::png::PngEncoder::new(&mut buffer);
+        image::ImageEncoder::write_image(
+            encoder,
+            rgba.as_raw(),
+            512,
+            512,
+            image::ExtendedColorType::Rgba8,
+        )
+        .unwrap();
+        std::fs::write(&art_path, &buffer).unwrap();
+        let mut edit = device.edit().unwrap();
+        edit.add_track(TrackToAdd {
+            source_path: source,
+            title: "LibOpod New Art".to_owned(),
+            artist: Some("New Art Artist".to_owned()),
+            album: Some("New Art Album".to_owned()),
+            album_artist: None,
+            genre: None,
+            composer: None,
+            year: 2024,
+            track_number: 1,
+            total_tracks: 1,
+            disc_number: 1,
+            total_discs: 1,
+            bitrate: 192,
+            sample_rate: 44100,
+            length_ms: 155_742,
+            compilation: false,
+            media_kind: crate::MediaKind::Song,
+            reuse_album_art: false,
+            artwork_source: Some(art_path),
+        })
+        .unwrap();
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        Some((bundle, staged))
+    }
+
+    fn stage_private_artwork_removal() -> Option<(TempDir, super::StagedSqliteEdit)> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        if !fixture.is_dir() {
+            return None;
+        }
+        let device = Device::open(&fixture).unwrap();
+        let track = device
+            .library()
+            .unwrap()
+            .tracks()
+            .iter()
+            .find(|track| track.has_artwork)
+            .unwrap();
+        let mut edit = device.edit().unwrap();
+        edit.remove_track(track.id).unwrap();
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        assert_eq!(staged.removed_artwork_tracks(), 1);
+        Some((bundle, staged))
+    }
+
+    fn stage_private_addition() -> Option<(TempDir, super::StagedSqliteEdit)> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        if !fixture.is_dir() {
+            return None;
+        }
+        let device = Device::open(&fixture).unwrap();
+        let source = fixture
+            .join("iPod_Control/Music/F11/BMJO.mp3");
+        if !source.is_file() {
+            return None;
+        }
+        let mut edit = device.edit().unwrap();
+        edit.add_track(TrackToAdd {
+            source_path: source,
+            title: "LibOpod Fixture Addition".to_owned(),
+            artist: Some("LibOpod Test Artist".to_owned()),
+            album: Some("LibOpod Test Album".to_owned()),
+            album_artist: None,
+            genre: Some("Test Genre".to_owned()),
+            composer: None,
+            year: 2024,
+            track_number: 1,
+            total_tracks: 1,
+            disc_number: 1,
+            total_discs: 1,
+            bitrate: 192,
+            sample_rate: 44100,
+            length_ms: 155_742,
+            compilation: false,
+            media_kind: crate::MediaKind::Song,
+            reuse_album_art: false,
+            artwork_source: None,
+        })
+        .unwrap();
+        assert_eq!(edit.addition_count(), 1);
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        Some((bundle, staged))
+    }
+
+    fn verify_staged_addition(bundle: &TempDir, staged: &super::StagedSqliteEdit) {
+        let directory = bundle.path();
+        for file in SqliteLibraryFile::ALL {
+            let info =
+                crate::storage::sqlite::inspect_sqlite_database(&directory.join(file.file_name()), file)
+                    .unwrap();
+            assert!(info.integrity_ok, "{} failed integrity", file.file_name());
+        }
+        let media = directory.join(staged.added_media()[0].as_str());
+        assert!(media.is_file());
+        let (media_bytes, _) =
+            crate::edit::generation::fingerprint_host_file(&media).unwrap();
+        let library = rusqlite::Connection::open(
+            directory.join(SqliteLibraryFile::Library.file_name()),
+        )
+        .unwrap();
+        let tracks: i64 = library
+            .query_row("SELECT COUNT(*) FROM item", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(tracks, 727);
+        let locations = rusqlite::Connection::open(
+            directory.join(SqliteLibraryFile::Locations.file_name()),
+        )
+        .unwrap();
+        let pid: i64 = library
+            .query_row(
+                "SELECT pid FROM item WHERE title = 'LibOpod Fixture Addition'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let location: String = locations
+            .query_row(
+                "SELECT location FROM location WHERE item_pid = ?1",
+                [pid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let relative = staged.added_media()[0].as_str().trim_start_matches("iPod_Control/Music/");
+        assert_eq!(location, relative);
+        let cdb = std::fs::read(directory.join("iTunesCDB")).unwrap();
+        let header_length = u32::from_le_bytes(cdb[4..8].try_into().unwrap()) as usize;
+        let mut decoder = flate2::read::ZlibDecoder::new(&cdb[header_length..]);
+        let mut payload = Vec::new();
+        decoder.read_to_end(&mut payload).unwrap();
+        let datasets = u32::from_le_bytes(cdb[0x14..0x18].try_into().unwrap());
+        let mut offset = 0;
+        let mut track_count = None;
+        let mut album_count = None;
+        for _ in 0..datasets {
+            let hdr = u32::from_le_bytes(payload[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            let total = u32::from_le_bytes(payload[offset + 8..offset + 12].try_into().unwrap()) as usize;
+            let kind = u32::from_le_bytes(payload[offset + 12..offset + 16].try_into().unwrap());
+            let list = offset + hdr;
+            if kind == 1 {
+                track_count =
+                    Some(u32::from_le_bytes(payload[list + 8..list + 12].try_into().unwrap()));
+            }
+            if kind == 4 {
+                album_count =
+                    Some(u32::from_le_bytes(payload[list + 8..list + 12].try_into().unwrap()));
+            }
+            offset += total;
+        }
+        assert_eq!(track_count, Some(727));
+        assert_eq!(album_count, Some(144));
+        let cbk = std::fs::read(directory.join("Locations.itdb.cbk")).unwrap();
+        let locations_bytes =
+            std::fs::read(directory.join(SqliteLibraryFile::Locations.file_name())).unwrap();
+        let info = crate::storage::binary::verify_cbk(&locations_bytes, &cbk, None).unwrap();
+        assert!(info.digests_match());
+        assert!(media_bytes > 0);
+    }
+
+    #[test]
+    fn reindex_heals_stale_browse_orders() {
+        // The pre-9ffb669 writer stored unscaled name_orders; those stale
+        // rows kept the Artists tab mis-sorted until a reindex touched the
+        // device. Every staged edit now renumbers the whole browse set.
+        let Some((bundle, _staged)) = stage_private_no_artwork_removal() else {
+            return;
+        };
+        let library_path = bundle.path().join("Library.itdb");
+        let mut connection = Connection::open(&library_path).unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction
+            .execute_batch(
+                "UPDATE artist SET name_order = 3 WHERE name = 'Korn';\
+                 UPDATE artist SET name_order = 1 WHERE name = '3 Doors Down';\
+                 UPDATE artist SET name_order = 5200 WHERE name = 'Ye';\
+                 UPDATE item SET artist_order = 7 WHERE artist = 'Korn';",
+            )
+            .unwrap();
+        super::add::reindex_browse_orders(&transaction, &library_path).unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+        let connection = Connection::open(&library_path).unwrap();
+        let rows: Vec<(String, i64)> = connection
+            .prepare("SELECT name, name_order FROM artist ORDER BY name_order")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let keys: Vec<String> = rows
+            .iter()
+            .map(|(name, _)| super::sort::sort_key(name))
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "artist table must be in sort-key order");
+        let korn: i64 = connection
+            .query_row(
+                "SELECT name_order FROM artist WHERE name = 'Korn'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let korn_rank: i64 = i64::try_from(
+            keys.iter()
+                .position(|key| key == &super::sort::sort_key("Korn"))
+                .unwrap()
+                + 1,
+        )
+        .unwrap();
+        assert_eq!(korn, korn_rank * 100, "Korn healed to its sorted rank");
+        let item_artist_order: i64 = connection
+            .query_row(
+                "SELECT artist_order FROM item WHERE artist = 'Korn' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(item_artist_order, korn, "items follow the artist rank");
+
+        // Albums are ranked per row, not per distinct name: each album row
+        // gets its own consecutive slot, and sort_order mirrors name_order.
+        let albums: Vec<(String, i64, i64)> = connection
+            .prepare("SELECT name, name_order, sort_order FROM album ORDER BY name_order")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let album_keys: Vec<String> = albums
+            .iter()
+            .map(|(name, _, _)| super::sort::sort_key(name))
+            .collect();
+        let mut album_sorted = album_keys.clone();
+        album_sorted.sort();
+        assert_eq!(album_keys, album_sorted, "albums must be in sort-key order");
+        for (index, (_, order, sort_order)) in albums.iter().enumerate() {
+            let expected = i64::try_from(index + 1).unwrap() * 100;
+            assert_eq!(
+                *order, expected,
+                "each album row owns a consecutive slot"
+            );
+            assert_eq!(order, sort_order, "sort_order mirrors name_order");
+        }
+    }
+
+    #[test]
+    fn stages_a_no_artwork_add_without_an_artwork_database() {
+        // A cover-less classic (Nano 1G/2G) has no
+        // iPod_Control/Artwork/ArtworkDB. Simulate that on the attached Nano
+        // 3G files by removing the ArtworkDB: a no-artwork addition must
+        // stage without ever resolving the artwork database (regression for
+        // base_image_id reading it unconditionally).
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("files_nano3");
+        if !source.join("iTunes/iTunesDB").is_file() {
+            return;
+        }
+        let device_dir = tempdir().unwrap();
+        let root = device_dir.path().join("iPod_Control");
+        for folder in ["Device", "iTunes", "Artwork"] {
+            let folder_source = source.join(folder);
+            if !folder_source.is_dir() {
+                continue;
+            }
+            fs::create_dir_all(root.join(folder)).unwrap();
+            for entry in fs::read_dir(&folder_source).unwrap() {
+                let entry = entry.unwrap();
+                fs::copy(entry.path(), root.join(folder).join(entry.file_name())).unwrap();
+            }
+        }
+        fs::create_dir_all(root.join("Music/F00")).unwrap();
+        if root.join("Artwork/ArtworkDB").exists() {
+            fs::remove_file(root.join("Artwork/ArtworkDB")).unwrap();
+        }
+        assert!(!root.join("Artwork/ArtworkDB").exists());
+        let device = Device::open(device_dir.path()).unwrap();
+        let source_mp3 = device_dir.path().join("source.mp3");
+        fs::write(&source_mp3, [0u8; 4096]).unwrap();
+        let mut edit = device.edit().unwrap();
+        edit.add_track(TrackToAdd {
+            source_path: source_mp3,
+            title: "No Art".to_owned(),
+            artist: Some("Test Artist".to_owned()),
+            album: Some("Test Album".to_owned()),
+            album_artist: None,
+            genre: None,
+            composer: None,
+            year: 2024,
+            track_number: 1,
+            total_tracks: 1,
+            disc_number: 1,
+            total_discs: 1,
+            bitrate: 128,
+            sample_rate: 44100,
+            length_ms: 60_000,
+            compilation: false,
+            media_kind: crate::MediaKind::Song,
+            reuse_album_art: false,
+            artwork_source: None,
+        })
+        .unwrap();
+        let staging = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(staging.path()).unwrap();
+        assert_eq!(staged.remaining_tracks(), 725, "724 + 1 added");
+        assert_eq!(staged.added_artwork_tracks(), 0);
+        assert!(!staging.path().join("ArtworkDB").exists());
+    }
+
+    fn stage_private_no_artwork_removal() -> Option<(TempDir, super::StagedSqliteEdit)> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        if !fixture.is_dir() {
+            return None;
+        }
+        let device = Device::open(fixture).unwrap();
+        let track = device
+            .library()
+            .unwrap()
+            .tracks()
+            .iter()
+            .find(|track| !track.has_artwork)
+            .unwrap();
+        let mut edit = device.edit().unwrap();
+        edit.remove_track(track.id).unwrap();
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        assert_eq!(staged.removed_artwork_tracks(), 0);
+        Some((bundle, staged))
+    }
+
+    fn scalar(connection: &Connection, sql: &str) -> i64 {
+        connection.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    fn create_database_set(directory: &std::path::Path) {
+        let library = Connection::open(
+            directory.join(SqliteLibraryFile::Library.file_name()),
+        )
+        .unwrap();
+        library
+            .execute_batch(
+                "CREATE TABLE item(pid INTEGER PRIMARY KEY,physical_order INTEGER,album_pid INTEGER,artist_pid INTEGER,track_artist_pid INTEGER,composer_pid INTEGER,genre_id INTEGER,category_id INTEGER,genius_id INTEGER,media_kind INTEGER,is_song INTEGER,is_music_video INTEGER,is_movie INTEGER,is_compilation INTEGER,artwork_status INTEGER,title TEXT,artist TEXT,album TEXT,album_artist TEXT,composer TEXT,sort_title TEXT,sort_artist TEXT,sort_album TEXT,sort_album_artist TEXT,sort_composer TEXT,title_order INTEGER,artist_order INTEGER,album_order INTEGER,genre_order INTEGER,composer_order INTEGER,album_artist_order INTEGER,album_by_artist_order INTEGER);\
+                 CREATE TABLE album(pid INTEGER PRIMARY KEY,item_count INTEGER,has_songs INTEGER,has_music_videos INTEGER,has_movies INTEGER,has_any_compilations INTEGER,all_compilations INTEGER,artwork_item_pid INTEGER,artwork_status INTEGER,min_volume_normalization_energy INTEGER,artist_pid INTEGER,name_order INTEGER,artist_order INTEGER,name TEXT,sort_name TEXT,sort_order INTEGER);\
+                 CREATE TABLE artist(pid INTEGER PRIMARY KEY,name TEXT,sort_name TEXT,name_order INTEGER,has_songs INTEGER,has_music_videos INTEGER,has_non_compilation_tracks INTEGER,album_count INTEGER,artwork_album_pid INTEGER,artwork_status INTEGER);\
+                 CREATE TABLE track_artist(pid INTEGER PRIMARY KEY,name TEXT,sort_name TEXT,name_order INTEGER,has_songs INTEGER,has_music_videos INTEGER,has_non_compilation_tracks INTEGER);\
+                 CREATE TABLE composer(pid INTEGER PRIMARY KEY,name TEXT,sort_name TEXT,name_order INTEGER,has_music INTEGER);\
+                 CREATE TABLE genre_map(id INTEGER PRIMARY KEY,genre TEXT,genre_order INTEGER,has_music INTEGER,artist_count_calc INTEGER,album_artist_count_calc INTEGER,album_count_calc INTEGER,compilation_count_calc INTEGER);\
+                 CREATE TABLE category_map(id INTEGER PRIMARY KEY);\
+                 CREATE TABLE avformat_info(item_pid INTEGER PRIMARY KEY,volume_normalization_energy INTEGER);\
+                 CREATE TABLE item_to_container(item_pid INTEGER,container_pid INTEGER,physical_order INTEGER,shuffle_order INTEGER);\
+                 CREATE TABLE container_seed(container_pid INTEGER,item_pid INTEGER,seed_order INTEGER);\
+                 CREATE TABLE video_info(item_pid INTEGER);\
+                 CREATE TABLE video_characteristics(item_pid INTEGER);\
+                 CREATE TABLE podcast_info(item_pid INTEGER);\
+                 CREATE TABLE store_info(item_pid INTEGER);\
+                 CREATE TABLE track_size_calc(pid INTEGER PRIMARY KEY,kind TEXT,size INTEGER);\
+                 CREATE TABLE unknown_extension(value INTEGER);\
+                 INSERT INTO item VALUES(1,0,10,20,30,40,50,0,60,1,1,0,0,0,1,'Zed','Artist','Album','','',NULL,'artist','album',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);\
+                 INSERT INTO item VALUES(2,1,10,20,30,40,50,0,0,1,1,0,0,0,1,'Alpha','Artist','Album','','',NULL,'artist','album',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);\
+                 INSERT INTO album VALUES(10,2,1,0,0,0,0,1,1,5,20,100,NULL,'Album',NULL,NULL);\
+                 INSERT INTO artist VALUES(20,'Artist',NULL,NULL,1,0,1,1,10,1);\
+                 INSERT INTO track_artist VALUES(30,'Artist',NULL,NULL,1,0,1);\
+                 INSERT INTO composer VALUES(40,NULL,NULL,NULL,1);\
+                 INSERT INTO genre_map VALUES(50,NULL,NULL,1,1,1,1,0);\
+                 INSERT INTO avformat_info VALUES(1,5);\
+                 INSERT INTO avformat_info VALUES(2,7);\
+                 INSERT INTO item_to_container VALUES(1,100,0,NULL);\
+                 INSERT INTO item_to_container VALUES(2,100,1,NULL);\
+                 INSERT INTO container_seed VALUES(100,1,0);\
+                 INSERT INTO track_size_calc VALUES(1,'audio',300);\
+                 INSERT INTO unknown_extension VALUES(99);",
+            )
+            .unwrap();
+
+        let locations = Connection::open(
+            directory.join(SqliteLibraryFile::Locations.file_name()),
+        )
+        .unwrap();
+        locations
+            .execute_batch(
+                "CREATE TABLE location(item_pid INTEGER,sub_id INTEGER,file_size INTEGER);\
+                 INSERT INTO location VALUES(1,0,100);\
+                 INSERT INTO location VALUES(2,0,200);",
+            )
+            .unwrap();
+
+        let dynamic = Connection::open(
+            directory.join(SqliteLibraryFile::Dynamic.file_name()),
+        )
+        .unwrap();
+        dynamic
+            .execute_batch(
+                "CREATE TABLE item_stats(item_pid INTEGER);\
+                 CREATE TABLE rental_info(item_pid INTEGER);\
+                 INSERT INTO item_stats VALUES(1);\
+                 INSERT INTO item_stats VALUES(2);",
+            )
+            .unwrap();
+
+        let extras = Connection::open(
+            directory.join(SqliteLibraryFile::Extras.file_name()),
+        )
+        .unwrap();
+        extras
+            .execute_batch(
+                "CREATE TABLE chapter(item_pid INTEGER);\
+                 CREATE TABLE lyrics(item_pid INTEGER);\
+                 INSERT INTO chapter VALUES(1);\
+                 INSERT INTO lyrics VALUES(1);",
+            )
+            .unwrap();
+
+        let genius = Connection::open(
+            directory.join(SqliteLibraryFile::Genius.file_name()),
+        )
+        .unwrap();
+        genius
+            .execute_batch(
+                "CREATE TABLE genius_metadata(genius_id INTEGER);\
+                 CREATE TABLE genius_similarities(genius_id INTEGER);\
+                 INSERT INTO genius_metadata VALUES(60);\
+                 INSERT INTO genius_similarities VALUES(60);",
+            )
+            .unwrap();
+    }
+
+    /// Builds a proper `iPod_Control` device tree from the attached Nano 3G
+    /// files (Device/iTunes/Artwork without the wrapper) in a tempdir.
+    fn build_classic_device_from_attachments() -> Option<TempDir> {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("files_nano3");
+        if !source.join("iTunes/iTunesDB").is_file() {
+            return None;
+        }
+        let device_dir = tempdir().unwrap();
+        let root = device_dir.path().join("iPod_Control");
+        for folder in ["Device", "iTunes", "Artwork"] {
+            std::fs::create_dir_all(root.join(folder)).unwrap();
+            for entry in std::fs::read_dir(source.join(folder)).unwrap() {
+                let entry = entry.unwrap();
+                std::fs::copy(entry.path(), root.join(folder).join(entry.file_name())).unwrap();
+            }
+        }
+        Some(device_dir)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn classic_removal_and_addition_round_trip_on_the_attached_nano3() {
+        let Some(device_dir) = build_classic_device_from_attachments() else {
+            return;
+        };
+        let device = Device::open(device_dir.path()).unwrap();
+        assert_eq!(device.profile().map(crate::DeviceProfile::key), Some("nano-3g"));
+        assert_eq!(device.library().unwrap().track_count(), 724);
+        assert_eq!(
+            device.missing_media_track_ids().unwrap().len(),
+            724,
+            "the database-only attachment intentionally has no Music tree"
+        );
+        let mut repair = device.edit().unwrap();
+        assert_eq!(repair.remove_missing_tracks().unwrap(), 724);
+        assert_eq!(repair.removal_count(), 724);
+
+        // A dangling media location can be removed even with Delete policy:
+        // the absent file is already in the requested final state.
+        let track = device.library().unwrap().tracks()[0].clone();
+        let mut edit = device.edit().unwrap();
+        edit.set_media_policy(MediaDeletionPolicy::Delete);
+        edit.remove_track(track.id).unwrap();
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        assert_eq!(staged.removed_tracks(), 1);
+        assert_eq!(staged.remaining_tracks(), 723);
+        assert!(
+            staged.deletions().is_empty(),
+            "missing media must not become an install-time deletion"
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(staged.manifest()).unwrap()).unwrap();
+        // The removed first track carries artwork, so the bundle also stages
+        // the reindexed ArtworkDB and all four ithmb files.
+        assert_eq!(manifest["outputs"].as_array().unwrap().len(), 6);
+        let targets: Vec<String> = manifest["outputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|output| output["target"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(targets.iter().any(|target| target == "iPod_Control/iTunes/iTunesDB"));
+        assert!(targets.iter().any(|target| target == "iPod_Control/Artwork/ArtworkDB"));
+        for name in ["F1061_1.ithmb", "F1055_1.ithmb", "F1068_1.ithmb", "F1060_1.ithmb"] {
+            assert!(targets.iter().any(|target| target == &format!("iPod_Control/Artwork/{name}")));
+        }
+        assert_eq!(staged.removed_ithmb().len(), 4);
+
+        // Install onto the virtual device (bundle/original) and read back.
+        let virtual_root = bundle.path().join("original");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        staged.install(&virtual_device).unwrap();
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 723);
+        let installed = std::fs::read(virtual_root.join("iPod_Control/iTunes/iTunesDB")).unwrap();
+        let guid = reopened.evidence().firewire_guid().expect("guid");
+        assert!(
+            crate::crypto::hash58::verify(&guid, &installed),
+            "installed classic iTunesDB does not verify with HASH58"
+        );
+
+        // Addition staging: one no-artwork track. The attached files carry no
+        // Music tree, so create the media directories the allocator scans.
+        let device = Device::open(device_dir.path()).unwrap();
+        for index in 0..40 {
+            std::fs::create_dir_all(
+                device_dir
+                    .path()
+                    .join(format!("iPod_Control/Music/F{index:02}")),
+            )
+            .unwrap();
+        }
+        let source = device_dir.path().join("source.mp3");
+        std::fs::write(&source, b"not a real mp3, but libpod does not decode audio").unwrap();
+        let mut edit = device.edit().unwrap();
+        edit.add_track(TrackToAdd {
+            source_path: source,
+            title: "Classic Added".to_owned(),
+            artist: Some("Classic Artist".to_owned()),
+            album: Some("Classic Album".to_owned()),
+            album_artist: None,
+            genre: None,
+            composer: None,
+            year: 2007,
+            track_number: 1,
+            total_tracks: 1,
+            disc_number: 1,
+            total_discs: 1,
+            bitrate: 128,
+            sample_rate: 44100,
+            length_ms: 60_000,
+            compilation: false,
+            media_kind: crate::MediaKind::Song,
+            reuse_album_art: false,
+            artwork_source: None,
+        })
+        .unwrap();
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        assert_eq!(staged.added_tracks(), 1);
+        assert_eq!(staged.remaining_tracks(), 725);
+        let virtual_root = bundle.path().join("original");
+        create_virtual_media_dirs(&virtual_root, staged.added_media());
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        install_staged_removal(
+            &virtual_device,
+            &staged,
+            FailureMode::SimulateInterruptionAfter(1),
+        )
+        .unwrap_err();
+        let mount = MountRoot::open(&virtual_root).unwrap();
+        recover_transaction(&mount).unwrap();
+        assert_eq!(
+            Device::open(&virtual_root)
+                .unwrap()
+                .library()
+                .unwrap()
+                .track_count(),
+            724,
+            "classic recovery must restore the original iTunesDB"
+        );
+        assert!(!virtual_root.join(staged.added_media()[0].as_str()).exists());
+
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        staged.install(&virtual_device).unwrap();
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 725);
+        let installed = std::fs::read(virtual_root.join("iPod_Control/iTunes/iTunesDB")).unwrap();
+        let guid = reopened.evidence().firewire_guid().expect("guid");
+        assert!(
+            crate::crypto::hash58::verify(&guid, &installed),
+            "installed classic iTunesDB (after add) does not verify with HASH58"
+        );
+        let added = reopened
+            .library()
+            .unwrap()
+            .tracks()
+            .iter()
+            .find(|track| track.title == "Classic Added")
+            .expect("added track present");
+        assert_eq!(added.artist, "Classic Artist");
+        assert!(added.location.as_str().starts_with("iPod_Control/Music/"));
+    }
+
+    #[test]
+    fn classic_playlist_crud_round_trip_on_the_attached_nano3() {
+        let Some(device_dir) = build_classic_device_from_attachments() else {
+            return;
+        };
+        let device = Device::open(device_dir.path()).unwrap();
+        let library = device.library().unwrap();
+        let original_playlist_count = library.playlists().len();
+        let master = library
+            .playlists()
+            .iter()
+            .find(|playlist| playlist.is_hidden)
+            .expect("classic master playlist");
+        let mut rejected = device.edit().unwrap();
+        assert!(matches!(
+            rejected.rename_playlist(master.id, "not allowed"),
+            Err(Error::Unsupported {
+                feature: "playlist mutation",
+                ..
+            })
+        ));
+
+        let tracks = [
+            library.tracks()[2].id,
+            library.tracks()[0].id,
+            library.tracks()[2].id,
+        ];
+        let mut edit = device.edit().unwrap();
+        let playlist_id = edit.create_playlist("Road Test", &tracks).unwrap();
+        edit.rename_playlist(playlist_id, "Road Test Created").unwrap();
+        assert_eq!(edit.playlist_edit_count(), 1);
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        assert_eq!(staged.remaining_tracks(), 724);
+        let virtual_root = bundle.path().join("original");
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        staged.install(&virtual_device).unwrap();
+        let reopened = Device::open(&virtual_root).unwrap();
+        let created = reopened
+            .library()
+            .unwrap()
+            .playlists()
+            .iter()
+            .find(|playlist| playlist.id == playlist_id)
+            .expect("created playlist");
+        assert_eq!(created.name, "Road Test Created");
+        assert_eq!(created.track_ids(), tracks);
+        assert!(!created.is_hidden);
+        assert!(!created.is_smart);
+        assert_eq!(
+            reopened.library().unwrap().playlists().len(),
+            original_playlist_count + 1
+        );
+        let installed =
+            std::fs::read(virtual_root.join("iPod_Control/iTunes/iTunesDB")).unwrap();
+        assert_eq!(
+            installed
+                .windows(8)
+                .filter(|window| *window == playlist_id.to_bits().to_le_bytes())
+                .count(),
+            2,
+            "playlist ID must be present in type-2 and type-3 datasets"
+        );
+
+        let mut edit = reopened.edit().unwrap();
+        edit.rename_playlist(playlist_id, "Road Test Updated").unwrap();
+        edit.set_playlist_tracks(playlist_id, &tracks[1..]).unwrap();
+        let update_bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(update_bundle.path()).unwrap();
+        let update_root = update_bundle.path().join("original");
+        staged.install(&Device::open(&update_root).unwrap()).unwrap();
+        let updated_device = Device::open(&update_root).unwrap();
+        let updated = updated_device
+            .library()
+            .unwrap()
+            .playlists()
+            .iter()
+            .find(|playlist| playlist.id == playlist_id)
+            .expect("updated playlist");
+        assert_eq!(updated.name, "Road Test Updated");
+        assert_eq!(updated.track_ids(), &tracks[1..]);
+
+        let mut edit = updated_device.edit().unwrap();
+        edit.delete_playlist(playlist_id).unwrap();
+        let delete_bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(delete_bundle.path()).unwrap();
+        let delete_root = delete_bundle.path().join("original");
+        staged.install(&Device::open(&delete_root).unwrap()).unwrap();
+        let deleted_device = Device::open(&delete_root).unwrap();
+        assert_eq!(
+            deleted_device.library().unwrap().playlists().len(),
+            original_playlist_count
+        );
+        assert!(deleted_device
+            .library()
+            .unwrap()
+            .playlists()
+            .iter()
+            .all(|playlist| playlist.id != playlist_id));
+        let installed =
+            std::fs::read(delete_root.join("iPod_Control/iTunes/iTunesDB")).unwrap();
+        let guid = deleted_device.evidence().firewire_guid().expect("guid");
+        assert!(crate::crypto::hash58::verify(&guid, &installed));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn classic_artwork_addition_round_trip_on_the_attached_nano3() {
+        let Some(device_dir) = build_classic_device_from_attachments() else {
+            return;
+        };
+        let device = Device::open(device_dir.path()).unwrap();
+        assert_eq!(device.library().unwrap().track_count(), 724);
+        for index in 0..40 {
+            std::fs::create_dir_all(
+                device_dir
+                    .path()
+                    .join(format!("iPod_Control/Music/F{index:02}")),
+            )
+            .unwrap();
+        }
+        let source = device_dir.path().join("source.mp3");
+        std::fs::write(&source, b"not a real mp3, but libpod does not decode audio").unwrap();
+        let art_dir = tempdir().unwrap();
+        let art_path = art_dir.path().join("cover.png");
+        let mut buffer = Vec::new();
+        let rgba = image::RgbaImage::from_pixel(600, 600, image::Rgba([200, 40, 120, 255]));
+        let encoder = image::codecs::png::PngEncoder::new(&mut buffer);
+        image::ImageEncoder::write_image(
+            encoder,
+            rgba.as_raw(),
+            600,
+            600,
+            image::ExtendedColorType::Rgba8,
+        )
+        .unwrap();
+        std::fs::write(&art_path, &buffer).unwrap();
+
+        let mut edit = device.edit().unwrap();
+        edit.add_track(TrackToAdd {
+            source_path: source,
+            title: "Classic Art".to_owned(),
+            artist: Some("Classic Artist".to_owned()),
+            album: Some("Classic Album".to_owned()),
+            album_artist: None,
+            genre: None,
+            composer: None,
+            year: 2007,
+            track_number: 1,
+            total_tracks: 1,
+            disc_number: 1,
+            total_discs: 1,
+            bitrate: 128,
+            sample_rate: 44100,
+            length_ms: 60_000,
+            compilation: false,
+            media_kind: crate::MediaKind::Song,
+            reuse_album_art: false,
+            artwork_source: Some(art_path),
+        })
+        .unwrap();
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        assert_eq!(staged.added_tracks(), 1);
+        assert_eq!(staged.added_artwork_tracks(), 1);
+        assert_eq!(staged.added_ithmb().len(), 4);
+        assert_eq!(staged.remaining_tracks(), 725);
+
+        // The staged ArtworkDB grew by one record and each ithmb file grew by
+        // exactly one slot.
+        let artwork_bytes = std::fs::read(bundle.path().join("ArtworkDB")).unwrap();
+        assert_eq!(crate::artwork::parse_artwork_records(&artwork_bytes).unwrap().len(), 142);
+        let slot_sizes: [(String, u64); 4] = [
+            ("F1061_1.ithmb".to_owned(), 6160),
+            ("F1055_1.ithmb".to_owned(), 32768),
+            ("F1068_1.ithmb".to_owned(), 32768),
+            ("F1060_1.ithmb".to_owned(), 204_800),
+        ];
+        for (name, slot) in &slot_sizes {
+            let staged_file = bundle.path().join("iPod_Control/Artwork").join(name);
+            let original = bundle.path().join("original/iPod_Control/Artwork").join(name);
+            let grown = std::fs::metadata(&staged_file).unwrap().len();
+            let before = std::fs::metadata(&original).unwrap().len();
+            assert_eq!(grown, before + slot, "{name} did not grow by one slot");
+        }
+
+        let virtual_root = bundle.path().join("original");
+        create_virtual_media_dirs(&virtual_root, staged.added_media());
+        let virtual_device = Device::open(&virtual_root).unwrap();
+        staged.install(&virtual_device).unwrap();
+        let reopened = Device::open(&virtual_root).unwrap();
+        assert_eq!(reopened.library().unwrap().track_count(), 725);
+        let installed =
+            std::fs::read(virtual_root.join("iPod_Control/iTunes/iTunesDB")).unwrap();
+        let guid = reopened.evidence().firewire_guid().expect("guid");
+        assert!(
+            crate::crypto::hash58::verify(&guid, &installed),
+            "installed classic iTunesDB does not verify with HASH58"
+        );
+        let installed_art =
+            std::fs::read(virtual_root.join("iPod_Control/Artwork/ArtworkDB")).unwrap();
+        let records = crate::artwork::parse_artwork_records(&installed_art).unwrap();
+        assert_eq!(records.len(), 142);
+        let added = reopened
+            .library()
+            .unwrap()
+            .tracks()
+            .iter()
+            .find(|track| track.title == "Classic Art")
+            .expect("added track present");
+        let record = records
+            .iter()
+            .find(|record| record.track_id == added.id)
+            .expect("artwork record for the added track");
+        assert_eq!(record.formats.len(), 4);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn sqlite_playlist_crud_round_trip_on_the_attached_nano7() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        if !fixture.is_dir() {
+            return;
+        }
+        let device = Device::open(&fixture).unwrap();
+        let library = device.library().unwrap();
+        let original_playlist_count = library.playlists().len();
+        let master = library
+            .playlists()
+            .iter()
+            .find(|playlist| playlist.is_hidden)
+            .expect("Nano 7G master playlist");
+        let smart = library
+            .playlists()
+            .iter()
+            .find(|playlist| playlist.is_smart && !playlist.is_hidden)
+            .expect("Nano 7G smart playlist");
+        let mut rejected = device.edit().unwrap();
+        assert!(matches!(
+            rejected.rename_playlist(master.id, "not allowed"),
+            Err(Error::Unsupported {
+                feature: "playlist mutation",
+                ..
+            })
+        ));
+        assert!(matches!(
+            rejected.rename_playlist(smart.id, "not allowed"),
+            Err(Error::Unsupported {
+                feature: "playlist mutation",
+                ..
+            })
+        ));
+
+        let tracks = [
+            library.tracks()[2].id,
+            library.tracks()[0].id,
+            library.tracks()[2].id,
+        ];
+        let mut edit = device.edit().unwrap();
+        let playlist_id = edit.create_playlist("Road Test", &tracks).unwrap();
+        edit.rename_playlist(playlist_id, "Road Test Created")
+            .unwrap();
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        assert_eq!(staged.remaining_tracks(), library.track_count());
+
+        let staged_library = Library::read_sqlite(
+            &bundle.path().join(SqliteLibraryFile::Library.file_name()),
+            &bundle
+                .path()
+                .join(SqliteLibraryFile::Locations.file_name()),
+        )
+        .unwrap();
+        let created = staged_library
+            .playlists()
+            .iter()
+            .find(|playlist| playlist.id == playlist_id)
+            .expect("created SQLite playlist");
+        assert_eq!(created.name, "Road Test Created");
+        assert_eq!(created.track_ids(), tracks);
+        assert!(!created.is_hidden);
+        assert!(!created.is_smart);
+        assert_eq!(staged_library.playlists().len(), original_playlist_count + 1);
+
+        let stored_id = i64::from_ne_bytes(playlist_id.to_bits().to_ne_bytes());
+        let dynamic = Connection::open(bundle.path().join("Dynamic.itdb")).unwrap();
+        assert_eq!(
+            dynamic
+                .query_row(
+                    "SELECT COUNT(*) FROM container_ui WHERE container_pid=?1",
+                    [stored_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            std::fs::read(bundle.path().join("iTunesCDB")).unwrap(),
+            std::fs::read(fixture.join("iPod_Control/iTunes/iTunesCDB")).unwrap(),
+            "playlist-only edits must leave the CDB byte-identical"
+        );
+        assert_eq!(
+            std::fs::read(bundle.path().join("Locations.itdb.cbk")).unwrap(),
+            std::fs::read(
+                fixture.join("iPod_Control/iTunes/iTunes Library.itlp/Locations.itdb.cbk")
+            )
+            .unwrap(),
+            "playlist-only edits must leave the Locations signature byte-identical"
+        );
+
+        let create_root = bundle.path().join("original");
+        staged.install(&Device::open(&create_root).unwrap()).unwrap();
+        let created_device = Device::open(&create_root).unwrap();
+        let mut edit = created_device.edit().unwrap();
+        edit.rename_playlist(playlist_id, "Road Test Updated")
+            .unwrap();
+        edit.set_playlist_tracks(playlist_id, &tracks[1..])
+            .unwrap();
+        let update_bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(update_bundle.path()).unwrap();
+        let update_root = update_bundle.path().join("original");
+        staged.install(&Device::open(&update_root).unwrap()).unwrap();
+        let updated_device = Device::open(&update_root).unwrap();
+        let updated = updated_device
+            .library()
+            .unwrap()
+            .playlists()
+            .iter()
+            .find(|playlist| playlist.id == playlist_id)
+            .expect("updated SQLite playlist");
+        assert_eq!(updated.name, "Road Test Updated");
+        assert_eq!(updated.track_ids(), &tracks[1..]);
+
+        let mut edit = updated_device.edit().unwrap();
+        edit.delete_playlist(playlist_id).unwrap();
+        let delete_bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(delete_bundle.path()).unwrap();
+        let delete_root = delete_bundle.path().join("original");
+        staged.install(&Device::open(&delete_root).unwrap()).unwrap();
+        let deleted_device = Device::open(&delete_root).unwrap();
+        assert_eq!(
+            deleted_device.library().unwrap().playlists().len(),
+            original_playlist_count
+        );
+        let dynamic = Connection::open(
+            delete_root.join("iPod_Control/iTunes/iTunes Library.itlp/Dynamic.itdb"),
+        )
+        .unwrap();
+        assert_eq!(
+            dynamic
+                .query_row(
+                    "SELECT COUNT(*) FROM container_ui WHERE container_pid=?1",
+                    [stored_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn normalized_matching_avoids_duplicate_artists() {
+        // A staged addition whose artist differs only by case must reuse the
+        // existing artist row instead of creating a duplicate that splits the
+        // device browser.
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        if !fixture.is_dir() {
+            return;
+        }
+        let device = Device::open(&fixture).unwrap();
+        let original_pid: i64 = {
+            let library = rusqlite::Connection::open(
+                fixture.join("iPod_Control/iTunes/iTunes Library.itlp/Library.itdb"),
+            )
+            .unwrap();
+            library
+                .query_row(
+                    "SELECT pid FROM artist WHERE name = 'Linkin Park'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let source = fixture.join("iPod_Control/Music/F11/BMJO.mp3");
+        if !source.is_file() {
+            return;
+        }
+        let mut edit = device.edit().unwrap();
+        edit.add_track(TrackToAdd {
+            source_path: source,
+            title: "Normalization Check".to_owned(),
+            artist: Some("LINKIN PARK".to_owned()), // case differs from the row
+            album: Some("Normalized Test Album".to_owned()),
+            album_artist: None,
+            genre: None,
+            composer: None,
+            year: 2007,
+            track_number: 1,
+            total_tracks: 1,
+            disc_number: 1,
+            total_discs: 1,
+            bitrate: 128,
+            sample_rate: 44100,
+            length_ms: 60_000,
+            compilation: false,
+            media_kind: crate::MediaKind::Song,
+            reuse_album_art: false,
+            artwork_source: None,
+        })
+        .unwrap();
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+        let library = rusqlite::Connection::open(
+            bundle.path().join(SqliteLibraryFile::Library.file_name()),
+        )
+        .unwrap();
+        let artist_pid: i64 = library
+            .query_row(
+                "SELECT artist_pid FROM item WHERE title = 'Normalization Check'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(artist_pid, original_pid, "case-folded artist must reuse the row");
+        let duplicates: i64 = library
+            .query_row("SELECT COUNT(*) FROM artist WHERE name = 'Linkin Park'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(duplicates, 1, "no duplicate artist rows");
+        assert_eq!(staged.remaining_tracks(), 727);
+    }
+
+    /// Dumps every row of a table, ordered, as comparable values.
+    fn table_rows(connection: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        table_rows_where(connection, table, "")
+    }
+
+    fn table_rows_where(
+        connection: &Connection,
+        table: &str,
+        filter: &str,
+    ) -> Vec<Vec<rusqlite::types::Value>> {
+        let sql = if filter.is_empty() {
+            format!("SELECT * FROM {table} ORDER BY rowid")
+        } else {
+            format!("SELECT * FROM {table} WHERE {filter} ORDER BY rowid")
+        };
+        let mut statement = connection.prepare(&sql).unwrap_or_else(|error| {
+            panic!("prepare {table}: {error}")
+        });
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| {
+                let mut values = Vec::with_capacity(columns);
+                for index in 0..columns {
+                    values.push(row.get(index)?);
+                }
+                Ok(values)
+            })
+            .unwrap_or_else(|error| panic!("query {table}: {error}"))
+            .map(|row| row.unwrap_or_else(|error| panic!("row {table}: {error}")))
+            .collect()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn sqlite_roundtrip_preserves_untouched_data() {
+        // A removal rewrites only the rows it must; every other row in the
+        // library and locations databases must stay row-identical, the
+        // companion databases must stay row-identical (minus the removed
+        // track's own rows), and the copied-not-rewritten companions
+        // (iTunesCDB, Locations.itdb.cbk) must stay byte-identical.
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("backup_7g");
+        if !fixture.is_dir() {
+            return;
+        }
+        let device = Device::open(&fixture).unwrap();
+        let track = device.library().unwrap().tracks()[50].clone();
+        let removed_pid = i64::from_ne_bytes(track.id.to_bits().to_ne_bytes());
+        let mut edit = device.edit().unwrap();
+        edit.remove_track(track.id).unwrap();
+        let bundle = tempdir().unwrap();
+        let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+
+        // Copied-not-rewritten companions must be byte-identical; removed
+        // tracks force the CDB to be re-encoded, so its retained chunks must
+        // be preserved and the rewritten CBK must hash against the rewritten
+        // Locations.itdb.
+        let original_cdb =
+            std::fs::read(fixture.join("iPod_Control/iTunes/iTunesCDB")).unwrap();
+        let staged_cdb = std::fs::read(bundle.path().join("iTunesCDB")).unwrap();
+        let original_header = u32::from_le_bytes(original_cdb[4..8].try_into().unwrap()) as usize;
+        let staged_header = u32::from_le_bytes(staged_cdb[4..8].try_into().unwrap()) as usize;
+        let original_payload = crate::storage::binary::cdb_decode_payload(&original_cdb, original_header).unwrap();
+        let staged_payload = crate::storage::binary::cdb_decode_payload(&staged_cdb, staged_header).unwrap();
+        let mut removed = std::collections::BTreeSet::new();
+        for (index, pid) in crate::storage::binary::cdb_track_pids(&original_payload)
+            .iter()
+            .enumerate()
+        {
+            if *pid == track.id {
+                removed.insert(index);
+            }
+        }
+        assert_eq!(removed.len(), 1, "removed track not found in the fixture CDB");
+        crate::storage::binary::assert_retained_chunks_preserved(
+            &original_payload,
+            &staged_payload,
+            &removed,
+        );
+        let staged_locations_bytes = std::fs::read(
+            bundle.path().join(SqliteLibraryFile::Locations.file_name()),
+        )
+        .unwrap();
+        let staged_cbk = std::fs::read(bundle.path().join("Locations.itdb.cbk")).unwrap();
+        let cbk_info =
+            crate::storage::binary::cdb_cbk_verify(&staged_locations_bytes, &staged_cbk, None)
+                .unwrap();
+        assert!(
+            cbk_info.digests_match(),
+            "rewritten CBK does not match the rewritten Locations.itdb"
+        );
+
+        // Tables the removal legitimately touches.
+        let touched = [
+            "item",
+            "avformat_info",
+            "item_to_container",
+            "album",
+            "artist",
+            "track_artist",
+            "composer",
+            "genre_map",
+            "category_map",
+            "track_size_calc",
+        ];
+        let original_library = Connection::open(
+            fixture.join("iPod_Control/iTunes/iTunes Library.itlp/Library.itdb"),
+        )
+        .unwrap();
+        let staged_library =
+            Connection::open(bundle.path().join(SqliteLibraryFile::Library.file_name())).unwrap();
+        let tables: Vec<String> = original_library
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        for table in tables {
+            if touched.contains(&table.as_str()) {
+                continue;
+            }
+            assert_eq!(
+                table_rows(&original_library, &table),
+                table_rows(&staged_library, &table),
+                "table {table} changed during a removal"
+            );
+        }
+
+        let original_locations = Connection::open(
+            fixture.join("iPod_Control/iTunes/iTunes Library.itlp/Locations.itdb"),
+        )
+        .unwrap();
+        let staged_locations =
+            Connection::open(bundle.path().join(SqliteLibraryFile::Locations.file_name())).unwrap();
+        assert_eq!(
+            table_rows(&original_locations, "base_location"),
+            table_rows(&staged_locations, "base_location"),
+            "base_location changed during a removal"
+        );
+
+        let original_dynamic = Connection::open(
+            fixture.join("iPod_Control/iTunes/iTunes Library.itlp/Dynamic.itdb"),
+        )
+        .unwrap();
+        let staged_dynamic = Connection::open(bundle.path().join("Dynamic.itdb")).unwrap();
+        assert_eq!(
+            table_rows_where(&original_dynamic, "item_stats", &format!("item_pid != {removed_pid}")),
+            table_rows(&staged_dynamic, "item_stats"),
+            "item_stats changed beyond the removed track during a removal"
+        );
+        for table in ["container_ui", "rental_info"] {
+            assert_eq!(
+                table_rows(&original_dynamic, table),
+                table_rows(&staged_dynamic, table),
+                "Dynamic.{table} changed during a removal"
+            );
+        }
+
+        for (name, staged_name) in [("Extras", "Extras.itdb"), ("Genius", "Genius.itdb")] {
+            let original_conn = Connection::open(
+                fixture
+                    .join("iPod_Control/iTunes/iTunes Library.itlp")
+                    .join(format!("{name}.itdb")),
+            )
+            .unwrap();
+            let staged_conn = Connection::open(bundle.path().join(staged_name)).unwrap();
+            let companion_tables: Vec<String> = original_conn
+                .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .map(|row| row.unwrap())
+                .collect();
+            for table in companion_tables {
+                assert_eq!(
+                    table_rows(&original_conn, &table),
+                    table_rows(&staged_conn, &table),
+                    "{name}.{table} changed during a removal"
+                );
+            }
+        }
+        let _ = staged;
+    }
+}

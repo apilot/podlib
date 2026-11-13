@@ -1,0 +1,63 @@
+[package]
+name = "libopod-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+description = "Safe Rust library for mounted, storage-backed iPods"
+repository = "https://github.com/koriwi/libopod"
+homepage = "https://github.com/koriwi/libopod"
+documentation = "https://docs.rs/libopod-rs"
+readme = "README.md"
+keywords = ["ipod", "itunesdb", "music", "sync"]
+categories = ["filesystem", "multimedia"]
+
+include = [
+    "/src/**",
+    "/examples/**",
+    "/tests/hashab_vectors.rs",
+    "/tests/private_nano7.rs",
+    "/tests/fixtures/hashab-vectors.json",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/HARDWARE_TESTING.md",
+    "/plan.md",
+    "/LICENSE",
+    "/LICENSES/**",
+    "/THIRD_PARTY.md",
+]
+
+[lib]
+# Keep the Rust import path `libopod` while publishing the package as `libopod-rs`.
+name = "libopod"
+
+[features]
+default = ["bundled-sqlite"]
+bundled-sqlite = ["rusqlite/bundled"]
+system-sqlite = []
+
+[dependencies]
+flate2 = "1.1.9"
+fs2 = "0.4.3"
+image = { version = "0.25.5", default-features = false, features = ["jpeg", "png"] }
+plist = "1.10.0"
+rusqlite = { version = "0.40.2", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.145"
+sha1 = "0.11.0"
+sha2 = "0.10.9"
+thiserror = "2.0.20"
+unicode-normalization = "0.1.24"
+
+[dev-dependencies]
+tempfile = "3.23.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# Vendored patch: newer clippy (1.99) emits lints this vendored snapshot was
+# never CI-cleaned against; don't fail workspace builds on upstream style.
+[lints.clippy]
+all = "allow"
+pedantic = "allow"

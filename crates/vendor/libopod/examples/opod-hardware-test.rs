@@ -1,0 +1,286 @@
+use std::{error::Error, ffi::OsString, io::{Error as IoError, Write as _}, path::PathBuf, process::ExitCode};
+
+use libopod::{
+    recover_interrupted_transaction_with_progress, Device, MediaDeletionPolicy, MediaKind,
+    ProgressEvent, TrackToAdd,
+    NANO7_ADDITION_HARDWARE_TEST_CONFIRMATION,
+    NANO7_ARTWORK_REMOVAL_DELETE_HARDWARE_TEST_CONFIRMATION,
+    NANO7_ARTWORK_REMOVAL_HARDWARE_TEST_CONFIRMATION, NANO7_ARTWORK_REUSE_ADDITION_CONFIRMATION,
+    NANO7_NEW_ART_ADDITION_CONFIRMATION, NANO7_NOOP_HARDWARE_TEST_CONFIRMATION,
+    NANO7_REMOVAL_DELETE_HARDWARE_TEST_CONFIRMATION, NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION,
+};
+
+type CliResult<T> = Result<T, Box<dyn Error>>;
+
+fn main() -> ExitCode {
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    match run(&arguments) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(arguments: &[OsString]) -> CliResult<()> {
+    match arguments {
+        [command, mount, staging, confirmation] if command == "noop" => {
+            let confirmation = confirmation
+                .to_str()
+                .ok_or_else(|| invalid_input("confirmation must be UTF-8"))?;
+            run_noop(mount, staging, confirmation)
+        }
+        [command, mount, index, staging, confirmation] if command == "remove" => {
+            let index = parse_index(index)?;
+            let confirmation = confirmation
+                .to_str()
+                .ok_or_else(|| invalid_input("confirmation must be UTF-8"))?;
+            run_removal(mount, index, staging, confirmation)
+        }
+        [command, mount, source, title, artist, album, length_ms, staging, confirmation]
+            if command == "add" =>
+        {
+            let length_ms = parse_u32(length_ms, "LENGTH_MS")?;
+            let confirmation = confirmation
+                .to_str()
+                .ok_or_else(|| invalid_input("confirmation must be UTF-8"))?;
+            run_addition(mount, source, title, artist, album, length_ms, staging, confirmation)
+        }
+        [command, mount, source, title, artist, album, length_ms, staging, confirmation]
+            if command == "add-reuse" =>
+        {
+            let length_ms = parse_u32(length_ms, "LENGTH_MS")?;
+            let confirmation = confirmation
+                .to_str()
+                .ok_or_else(|| invalid_input("confirmation must be UTF-8"))?;
+            run_art_addition(
+                mount, source, title, artist, album, length_ms, staging, confirmation, true, None,
+            )
+        }
+        [command, mount, source, art, title, artist, album, length_ms, staging, confirmation]
+            if command == "add-art" =>
+        {
+            let length_ms = parse_u32(length_ms, "LENGTH_MS")?;
+            let confirmation = confirmation
+                .to_str()
+                .ok_or_else(|| invalid_input("confirmation must be UTF-8"))?;
+            run_art_addition(
+                mount, source, title, artist, album, length_ms, staging, confirmation, false,
+                Some(art),
+            )
+        }
+        [command, mount] if command == "recover" => run_recovery(mount),
+        _ => Err(invalid_input(&format!(
+            "usage:\n  opod-hardware-test noop MOUNT EMPTY_HOST_DIRECTORY '{NANO7_NOOP_HARDWARE_TEST_CONFIRMATION}'\n  opod-hardware-test remove MOUNT TRACK_INDEX EMPTY_HOST_DIRECTORY '{NANO7_REMOVAL_HARDWARE_TEST_CONFIRMATION}'\n  opod-hardware-test remove MOUNT TRACK_INDEX EMPTY_HOST_DIRECTORY '{NANO7_REMOVAL_DELETE_HARDWARE_TEST_CONFIRMATION}'  (deletes the MP3)\n  opod-hardware-test remove MOUNT TRACK_INDEX EMPTY_HOST_DIRECTORY '{NANO7_ARTWORK_REMOVAL_HARDWARE_TEST_CONFIRMATION}'  (for an artwork-bearing track)\n  opod-hardware-test remove MOUNT TRACK_INDEX EMPTY_HOST_DIRECTORY '{NANO7_ARTWORK_REMOVAL_DELETE_HARDWARE_TEST_CONFIRMATION}'  (artwork-bearing, deletes MP3 and reindexes .ithmb)\n  opod-hardware-test add MOUNT SOURCE_MP3 TITLE ARTIST ALBUM LENGTH_MS EMPTY_HOST_DIRECTORY '{NANO7_ADDITION_HARDWARE_TEST_CONFIRMATION}'\n  opod-hardware-test add-reuse MOUNT SOURCE_MP3 TITLE ARTIST ALBUM LENGTH_MS EMPTY_HOST_DIRECTORY '{NANO7_ARTWORK_REUSE_ADDITION_CONFIRMATION}'\n  opod-hardware-test add-art MOUNT SOURCE_MP3 ART_IMAGE TITLE ARTIST ALBUM LENGTH_MS EMPTY_HOST_DIRECTORY '{NANO7_NEW_ART_ADDITION_CONFIRMATION}'\n  opod-hardware-test recover MOUNT"
+        ))),
+    }
+}
+
+fn run_noop(mount: &OsString, staging: &OsString, confirmation: &str) -> CliResult<()> {
+    let device = Device::open(PathBuf::from(mount))?;
+    let staged = device.stage_noop_preview(PathBuf::from(staging))?;
+    device.install_noop_hardware_test(&staged, confirmation)?;
+    println!("Nano 7G no-op transaction completed and read back successfully.");
+    println!("No tracks, artwork, or media files were changed.");
+    println!("Keep the host bundle, safely eject, reboot, and verify browsing/playback.");
+    Ok(())
+}
+
+fn run_removal(
+    mount: &OsString,
+    index: usize,
+    staging: &OsString,
+    confirmation: &str,
+) -> CliResult<()> {
+    let device = Device::open(PathBuf::from(mount))?;
+    let track = device
+        .library()
+        .and_then(|library| library.tracks().get(index))
+        .ok_or_else(|| invalid_input("TRACK_INDEX is not present in the opened library"))?;
+    let delete = matches!(
+        confirmation,
+        NANO7_REMOVAL_DELETE_HARDWARE_TEST_CONFIRMATION
+            | NANO7_ARTWORK_REMOVAL_DELETE_HARDWARE_TEST_CONFIRMATION
+    );
+    let mut edit = device.edit()?;
+    edit.remove_track(track.id)?;
+    edit.set_media_policy(if delete {
+        MediaDeletionPolicy::Delete
+    } else {
+        MediaDeletionPolicy::KeepOrphan
+    });
+    let staged = edit.stage_sqlite_preview(PathBuf::from(staging))?;
+    if track.has_artwork {
+        device.install_single_artwork_removal_hardware_test(&staged, confirmation)?;
+        println!(
+            "Nano 7G one-track artwork removal transaction completed and read back successfully."
+        );
+        println!(
+            "ArtworkDB records now: {}",
+            libopod::parse_artwork_records(&std::fs::read(
+                PathBuf::from(staging).join("ArtworkDB")
+            )?)?
+            .len()
+        );
+        if delete {
+            println!("The .ithmb files were reindexed and the MP3 was deleted.");
+        } else {
+            println!("The .ithmb slots remain as unreferenced data; the MP3 remains on disk.");
+        }
+    } else {
+        device.install_single_removal_hardware_test(&staged, confirmation)?;
+        println!("Nano 7G one-track removal transaction completed and read back successfully.");
+        if delete {
+            println!("The media file was deleted from the iPod.");
+        } else {
+            println!("The media file remains on the iPod as an unreferenced safety copy.");
+        }
+    }
+    println!("removed database index: {index}");
+    println!("remaining tracks: {}", staged.remaining_tracks());
+    println!("Keep the host bundle, safely eject, reboot, and validate before continuing.");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_addition(
+    mount: &OsString,
+    source: &OsString,
+    title: &OsString,
+    artist: &OsString,
+    album: &OsString,
+    length_ms: u32,
+    staging: &OsString,
+    confirmation: &str,
+) -> CliResult<()> {
+    let device = Device::open(PathBuf::from(mount))?;
+    let track = TrackToAdd {
+        source_path: PathBuf::from(source),
+        title: text(title),
+        artist: optional_text(artist),
+        album: optional_text(album),
+        album_artist: None,
+        genre: None,
+        composer: None,
+        year: 0,
+        track_number: 1,
+        total_tracks: 1,
+        disc_number: 1,
+        total_discs: 1,
+        bitrate: 192,
+        sample_rate: 44_100,
+        length_ms,
+        compilation: false,
+        media_kind: MediaKind::Song,
+        reuse_album_art: false,
+        artwork_source: None,
+    };
+    let mut edit = device.edit()?;
+    edit.add_track(track)?;
+    let staged = edit.stage_sqlite_preview(PathBuf::from(staging))?;
+    device.install_single_addition_hardware_test(&staged, confirmation)?;
+    println!("Nano 7G one-track addition transaction completed and read back successfully.");
+    println!("added database index: {}", staged.remaining_tracks() - 1);
+    println!("total tracks: {}", staged.remaining_tracks());
+    println!("installed media: {}", staged.added_media()[0]);
+    println!("Keep the host bundle, safely eject, reboot, and validate before continuing.");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_art_addition(
+    mount: &OsString,
+    source: &OsString,
+    title: &OsString,
+    artist: &OsString,
+    album: &OsString,
+    length_ms: u32,
+    staging: &OsString,
+    confirmation: &str,
+    reuse: bool,
+    art_image: Option<&OsString>,
+) -> CliResult<()> {
+    let device = Device::open(PathBuf::from(mount))?;
+    let track = TrackToAdd {
+        source_path: PathBuf::from(source),
+        title: text(title),
+        artist: optional_text(artist),
+        album: optional_text(album),
+        album_artist: None,
+        genre: None,
+        composer: None,
+        year: 0,
+        track_number: 1,
+        total_tracks: 1,
+        disc_number: 1,
+        total_discs: 1,
+        bitrate: 192,
+        sample_rate: 44_100,
+        length_ms,
+        compilation: false,
+        media_kind: MediaKind::Song,
+        reuse_album_art: reuse,
+        artwork_source: art_image.map(PathBuf::from),
+    };
+    let mut edit = device.edit()?;
+    edit.add_track(track)?;
+    let staged = edit.stage_sqlite_preview(PathBuf::from(staging))?;
+    device.install_artwork_addition_hardware_test(&staged, confirmation, !reuse)?;
+    println!("Nano 7G one-track artwork addition completed and read back successfully.");
+    println!("total tracks: {}", staged.remaining_tracks());
+    println!("artwork records: {}", 704 + staged.added_artwork_tracks());
+    if !staged.added_ithmb().is_empty() {
+        println!("new ithmb frames: {}", staged.added_ithmb().len());
+    }
+    println!("Keep the host bundle, safely eject, reboot, and validate before continuing.");
+    Ok(())
+}
+
+fn text(value: &OsString) -> String {
+    value.to_str().unwrap_or_default().to_owned()
+}
+
+fn optional_text(value: &OsString) -> Option<String> {
+    let value = value.to_str().unwrap_or_default();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn run_recovery(mount: &OsString) -> CliResult<()> {
+    if recover_interrupted_transaction_with_progress(PathBuf::from(mount), |event| {
+        let mut output = std::io::stdout().lock();
+        // Logging failures must not interrupt recovery. Debug-quote names so
+        // untrusted journal paths cannot inject terminal controls.
+        match event {
+            ProgressEvent::Phase(phase) => { let _ = writeln!(output, "{phase}…"); }
+            ProgressEvent::Item { operation, current, total, name } => {
+                let _ = writeln!(output, "{operation} [{current}/{total}]: {name:?}");
+            }
+            _ => {}
+        }
+        let _ = output.flush();
+    })? {
+        println!("Verified transaction backups were restored or committed cleanup completed.");
+    } else {
+        println!("No interrupted libopod transaction was present.");
+    }
+    Ok(())
+}
+
+fn parse_index(value: &OsString) -> CliResult<usize> {
+    value
+        .to_str()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| invalid_input("TRACK_INDEX must be a non-negative decimal integer"))
+}
+
+fn parse_u32(value: &OsString, name: &str) -> CliResult<u32> {
+    value
+        .to_str()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| invalid_input(&format!("{name} must be a non-negative decimal integer")))
+}
+
+fn invalid_input(message: &str) -> Box<dyn Error> {
+    Box::new(IoError::other(message.to_owned()))
+}

@@ -1,0 +1,1278 @@
+//! Schema-preserving track insertion into the staged `SQLite` databases.
+
+use std::path::Path;
+
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
+
+use super::sort::sort_key;
+use crate::{Error, MediaKind, PersistentId, Result, SqliteLibraryFile};
+
+/// A fully resolved staged track addition: metadata, persistent ID, media
+/// target, and timestamps are fixed before any database write.
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedAddition {
+    pub pid: PersistentId,
+    pub title: String,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub album_artist: Option<String>,
+    pub genre: Option<String>,
+    pub composer: Option<String>,
+    pub year: u32,
+    pub track_number: u32,
+    pub total_tracks: u32,
+    pub disc_number: u32,
+    pub total_discs: u32,
+    pub bitrate: u32,
+    pub sample_rate: u32,
+    pub length_ms: u32,
+    pub compilation: bool,
+    pub media_kind: MediaKind,
+    pub file_size: u64,
+    pub date_coredata: i64,
+    pub date_mac: u32,
+    pub media_relative: String,
+    /// Set when the added track inherits an existing album's artwork slots.
+    pub artwork: Option<ArtworkLink>,
+}
+
+/// A reused or freshly encoded artwork link: a fresh `mhii` image ID plus the
+/// slot references and (for new art) the encoded frames to write.
+#[derive(Clone, Debug)]
+pub(crate) struct ArtworkLink {
+    pub image_id: u32,
+    pub src_img_size: u32,
+    pub child_count: u32,
+    pub mhod_children: Vec<u8>,
+    /// Encoded `.ithmb` frames to append, in format order.
+    pub frames: Vec<ArtworkFrameOut>,
+}
+
+/// One encoded `.ithmb` frame plus the slot offset it will occupy.
+#[derive(Clone, Debug)]
+pub(crate) struct ArtworkFrameOut {
+    pub filename: String,
+    pub ithmb_offset: u32,
+    pub frame: Vec<u8>,
+}
+
+pub(crate) fn add_tracks_to_staged_databases(
+    directory: &Path,
+    additions: &[ResolvedAddition],
+    progress: &mut super::progress::Progress<'_>,
+) -> Result<()> {
+    if additions.is_empty() {
+        return Ok(());
+    }
+    let library_path = directory.join(SqliteLibraryFile::Library.file_name());
+    let mut connection = Connection::open_with_flags(
+        &library_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|source| sqlite_error("open staged library", &library_path, source))?;
+    attach(
+        &connection,
+        directory,
+        SqliteLibraryFile::Locations,
+        "locations",
+    )?;
+    attach(
+        &connection,
+        directory,
+        SqliteLibraryFile::Dynamic,
+        "dynamic",
+    )?;
+    let transaction = connection
+        .transaction()
+        .map_err(|source| sqlite_error("begin staged add", &library_path, source))?;
+    for (index, addition) in additions.iter().enumerate() {
+        progress(super::ProgressEvent::Item {
+            operation: "Updating SQLite library", current: index + 1, total: additions.len(),
+            name: &addition.title,
+        });
+        insert_track(&transaction, addition, &library_path)?;
+    }
+    progress(super::ProgressEvent::Phase("Verifying and indexing SQLite library"));
+    validate_added_invariants(&transaction, additions, &library_path)?;
+    // Reindex browse order columns so new artists/albums land in sorted
+    // position and pre-existing stale rows are healed.
+    reindex_browse_orders(&transaction, &library_path)?;
+    transaction
+        .commit()
+        .map_err(|source| sqlite_error("commit staged add", &library_path, source))?;
+    Ok(())
+}
+
+fn attach(
+    connection: &Connection,
+    directory: &Path,
+    file: SqliteLibraryFile,
+    schema: &'static str,
+) -> Result<()> {
+    let path = directory.join(file.file_name());
+    let text = path
+        .to_str()
+        .ok_or_else(|| Error::InvalidStagingDirectory {
+            path: directory.to_path_buf(),
+            reason: "SQLite preview currently requires a UTF-8 host path".to_owned(),
+        })?;
+    let sql = format!("ATTACH DATABASE ?1 AS {schema}");
+    connection
+        .execute(&sql, [text])
+        .map_err(|source| sqlite_error("attach staged companion", &path, source))?;
+    Ok(())
+}
+
+fn insert_track(
+    transaction: &Transaction<'_>,
+    addition: &ResolvedAddition,
+    path: &Path,
+) -> Result<()> {
+    let pid = i64::from_ne_bytes(addition.pid.to_bits().to_ne_bytes());
+    if pid == 0 {
+        return Err(Error::Verification {
+            format: "staged SQLite add",
+            reason: "a persistent ID of zero is invalid".to_owned(),
+        });
+    }
+    let duplicates: i64 = transaction
+        .query_row("SELECT COUNT(*) FROM item WHERE pid = ?1", [pid], |row| {
+            row.get(0)
+        })
+        .map_err(|source| sqlite_error("check staged persistent ID", path, source))?;
+    if duplicates != 0 {
+        return Err(Error::Verification {
+            format: "staged SQLite add",
+            reason: "the generated persistent ID collides with an existing track".to_owned(),
+        });
+    }
+
+    let mut next_pid = next_pid(transaction, path)?;
+    let album_artist = addition
+        .album_artist
+        .clone()
+        .or_else(|| addition.artist.clone());
+    let artist_pid = resolve_named_entity(
+        transaction,
+        path,
+        "artist",
+        album_artist.as_deref(),
+        &mut next_pid,
+        &[
+            "pid, kind, artwork_status, artwork_album_pid, name, name_order, sort_name, \
+             is_unknown, has_songs, has_music_videos, has_non_compilation_tracks, album_count",
+            "VALUES (?1, 2, 0, 0, ?2, ?3, ?4, 0, 1, 0, 1, 1)",
+        ],
+    )?;
+    let album_pid = resolve_album(
+        transaction,
+        path,
+        addition.album.as_deref(),
+        artist_pid,
+        &mut next_pid,
+    )?;
+    let track_artist_pid = resolve_named_entity(
+        transaction,
+        path,
+        "track_artist",
+        addition.artist.as_deref(),
+        &mut next_pid,
+        &[
+            "pid, name, name_order, sort_name, has_songs, has_music_videos, \
+             has_non_compilation_tracks, is_unknown, album_count",
+            "VALUES (?1, ?2, ?3, ?4, 1, 0, 1, 0, 0)",
+        ],
+    )?;
+    let composer_pid = resolve_named_entity(
+        transaction,
+        path,
+        "composer",
+        addition.composer.as_deref(),
+        &mut next_pid,
+        &[
+            "pid, name, name_order, sort_name, is_unknown, has_music",
+            "VALUES (?1, ?2, ?3, ?4, 0, 1)",
+        ],
+    )?;
+    let genre_id = resolve_genre(transaction, path, addition.genre.as_deref())?;
+
+    let orders = compute_orders(transaction, path, addition)?;
+    insert_item_row(
+        transaction,
+        path,
+        addition,
+        pid,
+        album_pid,
+        artist_pid,
+        track_artist_pid,
+        composer_pid,
+        genre_id,
+        &orders,
+    )?;
+    insert_avformat_row(transaction, path, addition, pid)?;
+    insert_location_row(transaction, path, addition, pid)?;
+    insert_container_rows(transaction, path, addition, pid)?;
+    update_derived_rows(
+        transaction,
+        path,
+        addition,
+        album_pid,
+        artist_pid,
+        track_artist_pid,
+        composer_pid,
+        genre_id,
+    )?;
+    link_artwork_rows(transaction, path, addition, pid, album_pid, artist_pid)?;
+    Ok(())
+}
+
+/// Sets the album/artist artwork references after a track with artwork is
+/// inserted.
+///
+/// Apple writes `album.artwork_item_pid` (a representative item) and
+/// `artist.artwork_album_pid` (a representative album) so the browse rows
+/// carry art; the artist row has no item-level fallback on the Nano 7G, so it
+/// stays blank unless the reference is set. Existing art is never overwritten.
+fn link_artwork_rows(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    addition: &ResolvedAddition,
+    item_pid: i64,
+    album_pid: i64,
+    artist_pid: i64,
+) -> Result<()> {
+    if addition.artwork.is_none() {
+        return Ok(());
+    }
+    if album_pid != 0 {
+        transaction
+            .execute(
+                "UPDATE album SET artwork_status = 1, artwork_item_pid = ?2 \
+                 WHERE pid = ?1 AND artwork_status = 0",
+                rusqlite::params![album_pid, item_pid],
+            )
+            .map_err(|source| sqlite_error("link album artwork", path, source))?;
+    }
+    if artist_pid != 0 {
+        transaction
+            .execute(
+                "UPDATE artist SET artwork_status = 1, artwork_album_pid = ?2 \
+                 WHERE pid = ?1 AND artwork_status = 0",
+                rusqlite::params![artist_pid, album_pid],
+            )
+            .map_err(|source| sqlite_error("link artist artwork", path, source))?;
+    }
+    Ok(())
+}
+
+fn next_pid(transaction: &Transaction<'_>, path: &Path) -> Result<i64> {
+    let max: Option<i64> = transaction
+        .query_row(
+            "SELECT MAX(pid) FROM (SELECT pid FROM album UNION ALL SELECT pid FROM artist \
+             UNION ALL SELECT pid FROM track_artist UNION ALL SELECT pid FROM composer)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error("read shared PID counter", path, source))?;
+    Ok(max.unwrap_or(0).saturating_add(1))
+}
+
+/// Looks up a named entity row (`artist`/`track_artist`/`composer`) by exact
+/// or normalized name, creating it with the shared counter when absent.
+fn resolve_named_entity(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    table: &str,
+    name: Option<&str>,
+    next_pid: &mut i64,
+    insert_sql: &[&str; 2],
+) -> Result<i64> {
+    let Some(name) = name else {
+        return Ok(0);
+    };
+    if name.is_empty() {
+        return Ok(0);
+    }
+    let existing: Option<i64> = transaction
+        .query_row(
+            &format!("SELECT pid FROM {table} WHERE name = ?1"),
+            [name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|source| Error::Verification {
+            format: "staged SQLite entity lookup",
+            reason: format!("{table} lookup failed: {source}"),
+        })?;
+    if let Some(pid) = existing {
+        return Ok(pid);
+    }
+    // iTunes stores the display name; taggers may emit NFC while the library
+    // holds NFD (or differ in case/article), so retry by normalized key before
+    // creating a duplicate entity.
+    let target = normalized_key(name);
+    let normalized_match = transaction
+        .prepare(&format!("SELECT pid, name FROM {table}"))
+        .map_err(|source| Error::Verification {
+            format: "staged SQLite entity lookup",
+            reason: format!("{table} scan failed: {source}"),
+        })?
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|source| Error::Verification {
+            format: "staged SQLite entity lookup",
+            reason: format!("{table} scan failed: {source}"),
+        })?
+        .filter_map(std::result::Result::ok)
+        .find(|(_, existing_name)| normalized_key(existing_name) == target)
+        .map(|(pid, _)| pid);
+    if let Some(pid) = normalized_match {
+        return Ok(pid);
+    }
+    let pid = *next_pid;
+    *next_pid = next_pid.saturating_add(1);
+    // Orders are (1-based rank) * 100, matching the existing rows and
+    // `compute_orders`/`artist_order_rank`; without the scale a new entity
+    // would sort before every existing one.
+    let name_order = i64::try_from(
+        insertion_rank(
+            transaction,
+            path,
+            &format!("SELECT name FROM {table} WHERE name IS NOT NULL"),
+            name,
+        )? * 100,
+    )
+    .unwrap_or(i64::MAX);
+    let sort_name = sort_key(name);
+    transaction
+        .execute(
+            &format!("INSERT INTO {table} ({}) {}", insert_sql[0], insert_sql[1]),
+            rusqlite::params![pid, name, name_order as i64, sort_name],
+        )
+        .map_err(|source| Error::Verification {
+            format: "staged SQLite entity insert",
+            reason: format!("{table} insert failed: {source}"),
+        })?;
+    Ok(pid)
+}
+
+fn resolve_album(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    album_name: Option<&str>,
+    artist_pid: i64,
+    next_pid: &mut i64,
+) -> Result<i64> {
+    let album_name = album_name.unwrap_or("");
+    let existing: Option<i64> = transaction
+        .query_row(
+            "SELECT pid FROM album WHERE name = ?1 AND artist_pid = ?2",
+            rusqlite::params![album_name, artist_pid],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|source| sqlite_error("look up album", path, source))?;
+    if let Some(pid) = existing {
+        return Ok(pid);
+    }
+    // Normalized fallback for the same artist (see resolve_named_entity).
+    let target = normalized_key(album_name);
+    let normalized_match = transaction
+        .prepare("SELECT pid, name FROM album WHERE artist_pid = ?1")
+        .map_err(|source| sqlite_error("scan albums", path, source))?
+        .query_map([artist_pid], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|source| sqlite_error("scan albums", path, source))?
+        .filter_map(std::result::Result::ok)
+        .find(|(_, existing_name)| normalized_key(existing_name) == target)
+        .map(|(pid, _)| pid);
+    if let Some(pid) = normalized_match {
+        return Ok(pid);
+    }
+    let pid = *next_pid;
+    *next_pid = next_pid.saturating_add(1);
+    let name_order = i64::try_from(
+        insertion_rank(transaction, path, "SELECT name FROM album WHERE name IS NOT NULL", album_name)? * 100,
+    )
+    .unwrap_or(i64::MAX);
+    let artist_order = artist_order_rank(transaction, path, artist_pid)?;
+    let sort_name = if album_name.is_empty() {
+        String::new()
+    } else {
+        sort_key(album_name)
+    };
+    transaction
+        .execute(
+            "INSERT INTO album (pid, kind, artwork_status, artwork_item_pid, artist_pid, \
+             user_rating, name, name_order, all_compilations, feed_url, season_number, \
+             is_unknown, has_songs, has_music_videos, sort_order, artist_order, \
+             has_any_compilations, sort_name, artist_count_calc, has_movies, item_count, \
+             min_volume_normalization_energy) \
+             VALUES (?1, 2, 0, 0, ?2, 0, ?3, ?4, 0, NULL, 0, ?5, 1, 0, ?4, ?6, 0, ?7, 1, 0, 1, 0)",
+            rusqlite::params![
+                pid,
+                artist_pid,
+                album_name,
+                name_order,
+                i64::from(album_name.is_empty()),
+                artist_order,
+                sort_name
+            ],
+        )
+        .map_err(|source| sqlite_error("insert album", path, source))?;
+    Ok(pid)
+}
+
+fn artist_order_rank(transaction: &Transaction<'_>, path: &Path, artist_pid: i64) -> Result<i64> {
+    let name: String = transaction
+        .query_row(
+            "SELECT COALESCE(name, '') FROM artist WHERE pid = ?1",
+            [artist_pid],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error("look up album artist", path, source))?;
+    let rank =
+        i64::try_from(insertion_rank(transaction, path, "SELECT name FROM artist WHERE name IS NOT NULL", &name)? * 100)
+            .unwrap_or(i64::MAX);
+    Ok(rank)
+}
+
+/// NFC-normalized, case-folded, article-stripped key used to match entity
+/// names (artists, albums, genres) across tagger/library spelling differences.
+fn normalized_key(name: &str) -> String {
+    sort_key(name.trim())
+}
+
+fn resolve_genre(transaction: &Transaction<'_>, path: &Path, genre: Option<&str>) -> Result<i64> {
+    let Some(genre) = genre else {
+        return Ok(0);
+    };
+    if genre.is_empty() {
+        return Ok(0);
+    }
+    let existing: Option<i64> = transaction
+        .query_row(
+            "SELECT id FROM genre_map WHERE genre = ?1",
+            [genre],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|source| sqlite_error("look up genre", path, source))?;
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+    let target = normalized_key(genre);
+    let normalized_match = transaction
+        .prepare("SELECT id, genre FROM genre_map")
+        .map_err(|source| sqlite_error("scan genres", path, source))?
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|source| sqlite_error("scan genres", path, source))?
+        .filter_map(std::result::Result::ok)
+        .find(|(_, existing_genre)| normalized_key(existing_genre) == target)
+        .map(|(id, _)| id);
+    if let Some(id) = normalized_match {
+        return Ok(id);
+    }
+    let next: Option<i64> = transaction
+        .query_row("SELECT MAX(id) FROM genre_map", [], |row| row.get(0))
+        .map_err(|source| sqlite_error("read genre counter", path, source))?;
+    let id = next.unwrap_or(0).saturating_add(1);
+    let rank = insertion_rank(transaction, path, "SELECT genre FROM genre_map WHERE genre IS NOT NULL", genre)?;
+    transaction
+        .execute(
+            "INSERT INTO genre_map (id, genre, genre_order, is_unknown, has_music, \
+             artist_count_calc, album_count_calc, compilation_count_calc, \
+             album_artist_count_calc) \
+             VALUES (?1, ?2, ?3, 0, 1, 1, 1, 0, 1)",
+            rusqlite::params![id, genre, i64::try_from(rank * 100).unwrap_or(i64::MAX)],
+        )
+        .map_err(|source| sqlite_error("insert genre", path, source))?;
+    Ok(id)
+}
+
+fn insertion_rank(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    names_sql: &str,
+    new_name: &str,
+) -> Result<usize> {
+    // NOTE(vendored patch): firmware-generated DBs (e.g. Nano 7G fw 1.1.2) contain
+    // rows with NULL names (placeholder artist entries), and rusqlite's
+    // `get::<String>` fails on NULL — so every rank query filters NULLs out.
+    // Candidate for upstream PR against koriwi/libopod.
+    let mut statement = transaction
+        .prepare(names_sql)
+        .map_err(|source| sqlite_error("prepare rank query", path, source))?;
+    let keys = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|source| sqlite_error("query rank names", path, source))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|source| sqlite_error("collect rank names", path, source))?;
+    drop(statement);
+    let mut distinct: Vec<String> = keys.iter().map(|key| sort_key(key)).collect();
+    distinct.sort();
+    distinct.dedup();
+    let new_key = sort_key(new_name);
+    Ok(distinct
+        .iter()
+        .filter(|key| key.as_str() < new_key.as_str())
+        .count()
+        + 1)
+}
+
+fn compute_orders(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    addition: &ResolvedAddition,
+) -> Result<ItemOrders> {
+    let title_key = if addition.title.is_empty() {
+        String::new()
+    } else {
+        sort_key(&addition.title)
+    };
+    let artist_key = addition
+        .artist
+        .as_ref()
+        .map_or_else(String::new, |name| sort_key(name));
+    let album_key = addition
+        .album
+        .as_ref()
+        .map_or_else(String::new, |name| sort_key(name));
+    let album_artist_key = addition.album_artist.as_ref().map_or_else(
+        || {
+            addition
+                .artist
+                .as_ref()
+                .map_or_else(String::new, |name| sort_key(name))
+        },
+        |name| sort_key(name),
+    );
+    let composer_key = addition
+        .composer
+        .as_ref()
+        .map_or_else(String::new, |name| sort_key(name));
+    let genre_key = addition
+        .genre
+        .as_ref()
+        .map_or_else(String::new, |name| sort_key(name));
+
+    let mut statement = transaction
+        .prepare(
+            "SELECT COALESCE(NULLIF(sort_title, ''), title, ''), \
+             COALESCE(NULLIF(sort_artist, ''), artist, ''), \
+             COALESCE(NULLIF(sort_album, ''), album, ''), \
+             COALESCE(NULLIF(sort_album_artist, ''), NULLIF(album_artist, ''), \
+                      NULLIF(sort_artist, ''), artist, ''), \
+             COALESCE(NULLIF(sort_composer, ''), composer, ''), \
+             COALESCE((SELECT genre FROM genre_map WHERE genre_map.id = item.genre_id), '') \
+             FROM item",
+        )
+        .map_err(|source| sqlite_error("prepare order query", path, source))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(|source| sqlite_error("query order keys", path, source))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|source| sqlite_error("collect order keys", path, source))?;
+    drop(statement);
+
+    let rank = |existing: Vec<String>, new_key: &str| -> i64 {
+        let mut distinct: Vec<String> = existing.iter().map(|key| sort_key(key)).collect();
+        distinct.sort();
+        distinct.dedup();
+        let rank = distinct.iter().filter(|key| key.as_str() < new_key).count() + 1;
+        i64::try_from(rank * 100).unwrap_or(i64::MAX)
+    };
+
+    Ok(ItemOrders {
+        title: rank(rows.iter().map(|row| row.0.clone()).collect(), &title_key),
+        artist: rank(rows.iter().map(|row| row.1.clone()).collect(), &artist_key),
+        album: rank(rows.iter().map(|row| row.2.clone()).collect(), &album_key),
+        album_artist: rank(
+            rows.iter().map(|row| row.3.clone()).collect(),
+            &album_artist_key,
+        ),
+        composer: rank(
+            rows.iter().map(|row| row.4.clone()).collect(),
+            &composer_key,
+        ),
+        genre: rank(rows.iter().map(|row| row.5.clone()).collect(), &genre_key),
+    })
+}
+
+struct ItemOrders {
+    title: i64,
+    artist: i64,
+    album: i64,
+    album_artist: i64,
+    composer: i64,
+    genre: i64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_item_row(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    addition: &ResolvedAddition,
+    pid: i64,
+    album_pid: i64,
+    artist_pid: i64,
+    track_artist_pid: i64,
+    composer_pid: i64,
+    genre_id: i64,
+    orders: &ItemOrders,
+) -> Result<()> {
+    let sort_title = (!addition.title.is_empty()).then(|| sort_key(&addition.title));
+    let sort_artist = non_empty_sort(addition.artist.as_deref());
+    let sort_album = non_empty_sort(addition.album.as_deref());
+    let sort_album_artist = addition
+        .album_artist
+        .as_deref()
+        .filter(|name| !name.is_empty())
+        .map(sort_key)
+        .or_else(|| non_empty_sort(addition.artist.as_deref()));
+    let sort_composer = non_empty_sort(addition.composer.as_deref());
+    let physical_order: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(physical_order), -1) + 1 FROM item",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error("read physical order", path, source))?;
+    let artwork_status = i64::from(addition.artwork.is_some());
+    let artwork_cache_id = addition.artwork.as_ref().map_or(0, |art| art.image_id);
+    let podcast = addition.media_kind == MediaKind::Podcast;
+
+    transaction
+        .execute(
+            "INSERT INTO item (pid, revision_level, media_kind, is_song, is_audio_book, \
+             is_music_video, is_movie, is_tv_show, is_home_video, is_ringtone, is_tone, \
+             is_voice_memo, is_book, is_rental, is_itunes_u, is_digital_booklet, is_podcast, \
+             date_modified, year, content_rating, content_rating_level, is_compilation, \
+             is_user_disabled, remember_bookmark, exclude_from_shuffle, part_of_gapless_album, \
+             chosen_by_auto_fill, artwork_status, artwork_cache_id, start_time_ms, stop_time_ms, \
+             total_time_ms, total_burn_time_ms, track_number, track_count, disc_number, \
+             disc_count, bpm, relative_volume, eq_preset, radio_stream_status, genius_id, \
+             genre_id, category_id, album_pid, artist_pid, composer_pid, title, artist, album, \
+             album_artist, composer, sort_title, sort_artist, sort_album, sort_album_artist, \
+             sort_composer, title_order, artist_order, album_order, genre_order, composer_order, \
+             album_artist_order, album_by_artist_order, series_name_order, comment, grouping, \
+             description, description_long, collection_description, copyright, track_artist_pid, \
+             physical_order, has_lyrics, date_released) \
+             VALUES (:pid, NULL, :media_kind, :is_song, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+             :is_podcast, :modified, :year, 0, 0, :compilation, 0, :remember_bookmark, \
+             :exclude_from_shuffle, 0, 0, :artwork_status, :artwork_cache_id, 0, 0, \
+             :length, NULL, :track_number, \
+             :total_tracks, :disc_number, :total_discs, 0, NULL, NULL, NULL, 0, :genre_id, 0, \
+             :album_pid, :artist_pid, :composer_pid, :title, :artist, :album, :album_artist, \
+             :composer, :sort_title, :sort_artist, :sort_album, :sort_album_artist, \
+             :sort_composer, :title_order, :artist_order, :album_order, :genre_order, \
+             :composer_order, :album_artist_order, :album_by_artist_order, 100, NULL, NULL, \
+             NULL, NULL, NULL, NULL, :track_artist_pid, :physical_order, 0, 0)",
+            rusqlite::named_params! {
+                ":pid": pid,
+                ":media_kind": addition.media_kind.sqlite_value(),
+                ":is_song": i64::from(!podcast),
+                ":is_podcast": i64::from(podcast),
+                ":modified": addition.date_coredata,
+                ":year": i64::from(addition.year),
+                ":remember_bookmark": i64::from(podcast),
+                ":exclude_from_shuffle": i64::from(podcast),
+                ":compilation": i64::from(addition.compilation),
+                ":artwork_status": artwork_status,
+                ":artwork_cache_id": artwork_cache_id,
+                ":length": f64::from(addition.length_ms),
+                ":track_number": i64::from(addition.track_number),
+                ":total_tracks": i64::from(addition.total_tracks),
+                ":disc_number": i64::from(addition.disc_number),
+                ":total_discs": i64::from(addition.total_discs),
+                ":genre_id": genre_id,
+                ":album_pid": album_pid,
+                ":artist_pid": artist_pid,
+                ":composer_pid": composer_pid,
+                ":title": opt_text(&addition.title),
+                ":artist": addition.artist.as_deref(),
+                ":album": addition.album.as_deref(),
+                ":album_artist": addition.album_artist.as_deref(),
+                ":composer": addition.composer.as_deref(),
+                ":sort_title": sort_title,
+                ":sort_artist": sort_artist,
+                ":sort_album": sort_album,
+                ":sort_album_artist": sort_album_artist,
+                ":sort_composer": sort_composer,
+                ":title_order": orders.title,
+                ":artist_order": orders.artist,
+                ":album_order": orders.album,
+                ":genre_order": orders.genre,
+                ":composer_order": orders.composer,
+                ":album_artist_order": orders.album_artist,
+                ":album_by_artist_order": orders.album_artist,
+                ":track_artist_pid": track_artist_pid,
+                ":physical_order": physical_order,
+            },
+        )
+        .map_err(|source| sqlite_error("insert item", path, source))?;
+    Ok(())
+}
+
+fn non_empty_sort(value: Option<&str>) -> Option<String> {
+    value.filter(|name| !name.is_empty()).map(sort_key)
+}
+
+fn opt_text(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
+}
+
+fn insert_avformat_row(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    addition: &ResolvedAddition,
+    pid: i64,
+) -> Result<()> {
+    let duration = u64::from(addition.length_ms)
+        .saturating_mul(u64::from(addition.sample_rate))
+        .saturating_div(1000);
+    transaction
+        .execute(
+            "INSERT INTO avformat_info (item_pid, sub_id, audio_format, bit_rate, channels, \
+             sample_rate, duration, gapless_heuristic_info, gapless_encoding_delay, \
+             gapless_encoding_drain, gapless_last_frame_resynch, analysis_inhibit_flags, \
+             audio_fingerprint, volume_normalization_energy) \
+             VALUES (?1, 0, 301, ?2, 0, ?3, ?4, 0, 0, 0, 0, 0, 0, 0)",
+            rusqlite::params![
+                pid,
+                i64::from(addition.bitrate),
+                f64::from(addition.sample_rate),
+                i64::try_from(duration).unwrap_or(i64::MAX),
+            ],
+        )
+        .map_err(|source| sqlite_error("insert avformat_info", path, source))?;
+    Ok(())
+}
+
+fn insert_location_row(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    addition: &ResolvedAddition,
+    pid: i64,
+) -> Result<()> {
+    // Resolve the music root by path instead of assuming its row id.
+    let base_location_id: i64 = transaction
+        .query_row(
+            "SELECT id FROM locations.base_location WHERE path = 'iPod_Control/Music'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error("resolve music base location", path, source))?;
+    transaction
+        .execute(
+            "INSERT INTO locations.location (item_pid, sub_id, base_location_id, location_type, \
+             location, extension, kind_id, date_created, file_size, file_creator, file_type, \
+             num_dir_levels_file, num_dir_levels_lib) \
+             VALUES (?1, 0, ?2, 0x46494C45, ?3, 0x4D503320, 1, ?4, ?5, NULL, NULL, NULL, NULL)",
+            rusqlite::params![
+                pid,
+                base_location_id,
+                addition.media_relative,
+                addition.date_coredata,
+                i64::try_from(addition.file_size).unwrap_or(i64::MAX),
+            ],
+        )
+        .map_err(|source| sqlite_error("insert location", path, source))?;
+    Ok(())
+}
+
+fn insert_container_rows(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    addition: &ResolvedAddition,
+    pid: i64,
+) -> Result<()> {
+    let master: i64 = transaction
+        .query_row(
+            "SELECT primary_container_pid FROM db_info LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error("read master container", path, source))?;
+    insert_container_membership(transaction, path, pid, master)?;
+    if addition.media_kind == MediaKind::Podcast {
+        let podcast = resolve_podcast_container(transaction, path, addition.date_coredata)?;
+        insert_container_membership(transaction, path, pid, podcast)?;
+        transaction
+            .execute(
+                "INSERT INTO podcast_info (item_pid, date_released, external_guid, feed_url, \
+                 feed_keywords) VALUES (?1, 0, NULL, NULL, NULL)",
+                [pid],
+            )
+            .map_err(|source| sqlite_error("insert podcast_info", path, source))?;
+        transaction
+            .execute(
+                "INSERT INTO dynamic.item_stats (item_pid, has_been_played) VALUES (?1, 0)",
+                [pid],
+            )
+            .map_err(|source| sqlite_error("insert podcast playback state", path, source))?;
+    }
+    Ok(())
+}
+
+fn insert_container_membership(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    item_pid: i64,
+    container_pid: i64,
+) -> Result<()> {
+    transaction
+        .execute(
+            "INSERT INTO item_to_container (item_pid, container_pid, physical_order, \
+             shuffle_order) \
+             VALUES (?1, ?2, (SELECT COALESCE(MAX(physical_order), -1) + 1 FROM \
+             item_to_container WHERE container_pid = ?2), NULL)",
+            rusqlite::params![item_pid, container_pid],
+        )
+        .map_err(|source| sqlite_error("insert item_to_container", path, source))?;
+    Ok(())
+}
+
+fn resolve_podcast_container(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    timestamp: i64,
+) -> Result<i64> {
+    let existing = transaction
+        .query_row(
+            "SELECT pid FROM container WHERE distinguished_kind = 11 LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|source| sqlite_error("resolve podcast container", path, source))?;
+    if let Some(pid) = existing {
+        return Ok(pid);
+    }
+    let pid = loop {
+        let candidate = i64::from_ne_bytes(crate::random::next_u64().to_ne_bytes());
+        if candidate == 0 {
+            continue;
+        }
+        let exists: i64 = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM container WHERE pid = ?1) OR \
+                 EXISTS(SELECT 1 FROM item WHERE pid = ?1)",
+                [candidate],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error("allocate podcast container", path, source))?;
+        if exists == 0 {
+            break candidate;
+        }
+    };
+    let name_order: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(name_order), 0) + 100 FROM container",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error("allocate podcast container order", path, source))?;
+    transaction
+        .execute(
+            "INSERT INTO container (pid, distinguished_kind, date_created, date_modified, name, \
+             name_order, parent_pid, media_kinds, workout_template_id, is_hidden, \
+             smart_is_folder, smart_is_dynamic, smart_is_filtered, smart_is_genius, \
+             smart_enabled_only, smart_is_limited, smart_limit_kind, smart_limit_order, \
+             smart_evaluation_order, smart_limit_value, smart_reverse_limit_order, \
+             smart_criteria, description) VALUES \
+             (?1, 11, ?2, ?2, 'Podcasts', ?3, 0, 4, 0, 1, 0, NULL, NULL, 0, 0, NULL, NULL, \
+              NULL, NULL, NULL, NULL, NULL, NULL)",
+            rusqlite::params![pid, timestamp, name_order],
+        )
+        .map_err(|source| sqlite_error("create podcast container", path, source))?;
+    transaction
+        .execute(
+            "INSERT INTO dynamic.container_ui (container_pid, play_order, is_reversed, \
+             album_field_order, repeat_mode, shuffle_items, has_been_shuffled) \
+             VALUES (?1, 39, 0, 1, 0, 0, 0)",
+            [pid],
+        )
+        .map_err(|source| sqlite_error("create podcast container UI state", path, source))?;
+    Ok(pid)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_derived_rows(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    addition: &ResolvedAddition,
+    album_pid: i64,
+    artist_pid: i64,
+    track_artist_pid: i64,
+    composer_pid: i64,
+    genre_id: i64,
+) -> Result<()> {
+    if album_pid != 0 {
+        transaction
+            .execute(
+                "UPDATE album SET \
+                 item_count = (SELECT COUNT(*) FROM item WHERE item.album_pid = album.pid), \
+                 has_songs = 1, \
+                 all_compilations = CASE WHEN ?2 = 0 THEN 0 ELSE all_compilations END, \
+                 min_volume_normalization_energy = COALESCE((SELECT \
+                 MIN(volume_normalization_energy) FROM avformat_info JOIN item \
+                 ON item.pid = avformat_info.item_pid WHERE item.album_pid = album.pid), 0) \
+                 WHERE pid = ?1",
+                rusqlite::params![album_pid, i64::from(addition.compilation)],
+            )
+            .map_err(|source| sqlite_error("update album totals", path, source))?;
+    }
+    if artist_pid != 0 {
+        transaction
+            .execute(
+                "UPDATE artist SET has_songs = 1, album_count = (SELECT COUNT(DISTINCT \
+                 album_pid) FROM item WHERE item.artist_pid = artist.pid) WHERE pid = ?1",
+                [artist_pid],
+            )
+            .map_err(|source| sqlite_error("update artist totals", path, source))?;
+    }
+    if track_artist_pid != 0 {
+        transaction
+            .execute(
+                "UPDATE track_artist SET has_songs = 1, has_non_compilation_tracks = \
+                 CASE WHEN ?2 != 0 THEN has_non_compilation_tracks ELSE 1 END WHERE pid = ?1",
+                rusqlite::params![track_artist_pid, i64::from(addition.compilation)],
+            )
+            .map_err(|source| sqlite_error("update track_artist totals", path, source))?;
+    }
+    if composer_pid != 0 {
+        transaction
+            .execute(
+                "UPDATE composer SET has_music = 1 WHERE pid = ?1",
+                [composer_pid],
+            )
+            .map_err(|source| sqlite_error("update composer totals", path, source))?;
+    }
+    if genre_id != 0 {
+        transaction
+            .execute(
+                "UPDATE genre_map SET has_music = 1, \
+                 artist_count_calc = (SELECT COUNT(DISTINCT artist_pid) FROM item WHERE \
+                 item.genre_id = genre_map.id), \
+                 album_artist_count_calc = (SELECT COUNT(DISTINCT artist_pid) FROM item WHERE \
+                 item.genre_id = genre_map.id), \
+                 album_count_calc = (SELECT COUNT(DISTINCT album_pid) FROM item WHERE \
+                 item.genre_id = genre_map.id), \
+                 compilation_count_calc = (SELECT COUNT(DISTINCT album_pid) FROM item WHERE \
+                 item.genre_id = genre_map.id AND COALESCE(is_compilation, 0) != 0) \
+                 WHERE id = ?1",
+                [genre_id],
+            )
+            .map_err(|source| sqlite_error("update genre totals", path, source))?;
+    }
+    // Resolve the audio size row by kind instead of assuming its pid.
+    let audio_pid: i64 = transaction
+        .query_row(
+            "SELECT pid FROM track_size_calc WHERE kind = 'audio'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error("resolve audio size row", path, source))?;
+    transaction
+        .execute(
+            "UPDATE track_size_calc SET size = size + ?1 WHERE kind = 'audio' AND pid = ?2",
+            rusqlite::params![
+                i64::try_from(addition.file_size).unwrap_or(i64::MAX),
+                audio_pid
+            ],
+        )
+        .map_err(|source| sqlite_error("update track_size_calc", path, source))?;
+    Ok(())
+}
+
+fn validate_added_invariants(
+    transaction: &Transaction<'_>,
+    additions: &[ResolvedAddition],
+    path: &Path,
+) -> Result<()> {
+    for addition in additions {
+        let pid = i64::from_ne_bytes(addition.pid.to_bits().to_ne_bytes());
+        let rows: i64 = transaction
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM item WHERE pid = ?1) + \
+                 (SELECT COUNT(*) FROM locations.location WHERE item_pid = ?1 AND sub_id = 0) + \
+                 (SELECT COUNT(*) FROM avformat_info WHERE item_pid = ?1 AND sub_id = 0) + \
+                 (SELECT COUNT(*) FROM item_to_container WHERE item_pid = ?1) + \
+                 (SELECT COUNT(*) FROM podcast_info WHERE item_pid = ?1) + \
+                 (SELECT COUNT(*) FROM dynamic.item_stats WHERE item_pid = ?1)",
+                [pid],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error("validate added rows", path, source))?;
+        let expected = if addition.media_kind == MediaKind::Podcast {
+            7
+        } else {
+            4
+        };
+        if rows != expected {
+            return Err(Error::Verification {
+                format: "staged SQLite add",
+                reason: "an added track lacks its required companion rows".to_owned(),
+            });
+        }
+    }
+    let violations: i64 = transaction
+        .query_row(
+            "SELECT \
+             (SELECT COUNT(*) FROM (SELECT container_pid, COUNT(*) n, MIN(physical_order) lo, \
+             MAX(physical_order) hi, COUNT(DISTINCT physical_order) d FROM item_to_container \
+             GROUP BY container_pid \
+             HAVING lo != 0 OR hi != n - 1 OR d != n)) + \
+             (SELECT COUNT(*) FROM album a WHERE a.item_count != (SELECT COUNT(*) FROM item \
+             WHERE item.album_pid = a.pid))",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error("validate added invariants", path, source))?;
+    if violations != 0 {
+        return Err(Error::Verification {
+            format: "staged SQLite add",
+            reason: "ordering or album-count invariants were violated".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn sqlite_error(operation: &'static str, path: &Path, source: rusqlite::Error) -> Error {
+    Error::Sqlite {
+        operation,
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+/// Recomputes the iTunes-style browse order columns for the whole staged
+/// library, healing stale values on every write.
+///
+/// Apple (and older libopod writers) leave `name_order` rows that no longer
+/// match sorted position — e.g. the pre-`9ffb669` bug wrote unscaled ranks,
+/// which put the Artists tab out of order. This pass renumbers every browse
+/// table and the per-item order columns from scratch.
+///
+/// The scheme is verified against Apple-written Nano 7G data:
+/// - `artist`/`track_artist`/`composer`.`name_order` and every item
+///   `*_order` column: sorted-position × 100 over distinct sort keys;
+/// - `album`.`name_order`/`sort_order`: sorted-position × 100 over **rows**, one
+///   slot per album row (ties get consecutive slots — e.g. four "ASMR" albums
+///   at 1300/1400/1500/1600);
+/// - `genre_map`.`genre_order`: 1-based rank, unscaled;
+/// - `album`.`artist_order`: the album's artist rank (matches
+///   `artist`.`name_order`).
+///
+/// Columns with a different (unverified) scheme are left untouched:
+/// `item`.`title_order` and `item`.`series_name_order`.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn reindex_browse_orders(transaction: &Transaction<'_>, path: &Path) -> Result<()> {
+    reindex_named_table(transaction, path, "artist")?;
+    reindex_named_table(transaction, path, "track_artist")?;
+    reindex_named_table(transaction, path, "composer")?;
+
+    let genre_rows: Vec<(i64, String)> = transaction
+        .prepare("SELECT id, COALESCE(genre, '') FROM genre_map")
+        .map_err(|source| sqlite_error("prepare genre reindex", path, source))?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|source| sqlite_error("query genre reindex", path, source))?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|source| sqlite_error("collect genre reindex", path, source))?;
+    let genre_orders = key_orders(genre_rows.iter().map(|(_, genre)| genre), 1);
+    for (id, genre) in &genre_rows {
+        if let Some(order) = genre_orders.get(&sort_key(genre)) {
+            transaction
+                .execute(
+                    "UPDATE genre_map SET genre_order = ?1 WHERE id = ?2",
+                    rusqlite::params![order, id],
+                )
+                .map_err(|source| sqlite_error("update genre order", path, source))?;
+        }
+    }
+
+    let mut item_rows = transaction
+        .prepare(
+            "SELECT pid, \
+               COALESCE(NULLIF(sort_artist, ''), artist, ''), \
+               COALESCE(NULLIF(sort_album, ''), album, ''), \
+               COALESCE((SELECT genre FROM genre_map WHERE genre_map.id = item.genre_id), ''), \
+               COALESCE(NULLIF(sort_composer, ''), composer, ''), \
+               COALESCE(NULLIF(sort_album_artist, ''), NULLIF(album_artist, ''), \
+                        NULLIF(sort_artist, ''), artist, ''), \
+               COALESCE(NULLIF(sort_title, ''), title, '') \
+             FROM item",
+        )
+        .map_err(|source| sqlite_error("prepare item order reindex", path, source))?;
+    let item_keys = item_rows
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(|source| sqlite_error("query item order reindex", path, source))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|source| sqlite_error("collect item order reindex", path, source))?;
+    drop(item_rows);
+    let artist_orders = key_orders(item_keys.iter().map(|row| &row.1), 100);
+    let album_orders = key_orders(item_keys.iter().map(|row| &row.2), 100);
+    let item_genre_orders = key_orders(item_keys.iter().map(|row| &row.3), 100);
+    let composer_orders = key_orders(item_keys.iter().map(|row| &row.4), 100);
+    let album_artist_orders = key_orders(item_keys.iter().map(|row| &row.5), 100);
+
+    // Album rows: one rank slot per album row, sorted by sort key, ties in
+    // pid order (Apple ranks rows, not distinct names — "Follow the Leader"
+    // is 5100 while its deduped name rank is 48). sort_order mirrors
+    // name_order exactly, as Apple writes it.
+    let mut albums: Vec<(i64, String)> = transaction
+        .prepare("SELECT pid, COALESCE(NULLIF(sort_name, ''), name, '') FROM album")
+        .map_err(|source| sqlite_error("prepare album reindex", path, source))?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|source| sqlite_error("query album reindex", path, source))?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|source| sqlite_error("collect album reindex", path, source))?;
+    albums.sort_by(|left, right| {
+        sort_key(&left.1)
+            .cmp(&sort_key(&right.1))
+            .then(left.0.cmp(&right.0))
+    });
+    for (index, (pid, _name)) in albums.iter().enumerate() {
+        let order = i64::try_from(index + 1)
+            .ok()
+            .and_then(|position| position.checked_mul(100))
+            .unwrap_or(i64::MAX);
+        transaction
+            .execute(
+                "UPDATE album SET name_order = ?1, sort_order = ?1 WHERE pid = ?2",
+                rusqlite::params![order, pid],
+            )
+            .map_err(|source| sqlite_error("update album order", path, source))?;
+    }
+    for (pid, artist, album, genre, composer, album_artist, _title) in &item_keys {
+        let artist_order = artist_orders.get(&sort_key(artist)).copied().unwrap_or(100);
+        let album_order = album_orders.get(&sort_key(album)).copied().unwrap_or(100);
+        let genre_order = item_genre_orders
+            .get(&sort_key(genre))
+            .copied()
+            .unwrap_or(100);
+        let composer_order = composer_orders
+            .get(&sort_key(composer))
+            .copied()
+            .unwrap_or(100);
+        let album_artist_order = album_artist_orders
+            .get(&sort_key(album_artist))
+            .copied()
+            .unwrap_or(100);
+        transaction
+            .execute(
+                "UPDATE item SET artist_order = ?1, album_order = ?2, genre_order = ?3, \
+                 composer_order = ?4, album_artist_order = ?5, album_by_artist_order = ?5 \
+                 WHERE pid = ?6",
+                rusqlite::params![
+                    artist_order,
+                    album_order,
+                    genre_order,
+                    composer_order,
+                    album_artist_order,
+                    pid
+                ],
+            )
+            .map_err(|source| sqlite_error("update item orders", path, source))?;
+    }
+
+    let albums: Vec<(i64, String)> = transaction
+        .prepare(
+            "SELECT a.pid, COALESCE(art.name, '') FROM album a \
+             LEFT JOIN artist art ON art.pid = a.artist_pid",
+        )
+        .map_err(|source| sqlite_error("prepare album artist reindex", path, source))?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|source| sqlite_error("query album artist reindex", path, source))?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|source| sqlite_error("collect album artist reindex", path, source))?;
+    let artist_table_orders = reindex_named_table(transaction, path, "artist")?;
+    for (pid, artist_name) in &albums {
+        if let Some(order) = artist_table_orders.get(&sort_key(artist_name)) {
+            transaction
+                .execute(
+                    "UPDATE album SET artist_order = ?1 WHERE pid = ?2",
+                    rusqlite::params![order, pid],
+                )
+                .map_err(|source| sqlite_error("update album artist order", path, source))?;
+        }
+    }
+    Ok(())
+}
+
+/// Reindexes one named browse table (`artist`, `track_artist`, `composer`):
+/// `name_order` = sorted-position × 100 over distinct sort keys. Returns the
+/// key → order map for callers that need it (album artist ranks).
+fn reindex_named_table(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    table: &str,
+) -> Result<std::collections::HashMap<String, i64>> {
+    let rows: Vec<(i64, String)> = transaction
+        .prepare(&format!(
+            "SELECT pid, COALESCE(NULLIF(sort_name, ''), name, '') FROM {table}"
+        ))
+        .map_err(|source| sqlite_error("prepare browse reindex", path, source))?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|source| sqlite_error("query browse reindex", path, source))?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|source| sqlite_error("collect browse reindex", path, source))?;
+    let orders = key_orders(rows.iter().map(|(_, name)| name), 100);
+    for (pid, name) in rows {
+        if let Some(order) = orders.get(&sort_key(&name)) {
+            transaction
+                .execute(
+                    &format!("UPDATE {table} SET name_order = ?1 WHERE pid = ?2"),
+                    rusqlite::params![order, pid],
+                )
+                .map_err(|source| sqlite_error("update browse order", path, source))?;
+        }
+    }
+    Ok(orders)
+}
+
+/// Maps distinct sort keys to `(position + 1) * scale` in sorted order.
+/// An empty key sorts first, matching Apple's rank-1 default.
+fn key_orders<'a>(
+    keys: impl Iterator<Item = &'a String>,
+    scale: i64,
+) -> std::collections::HashMap<String, i64> {
+    let mut distinct: Vec<String> = keys.map(|key| sort_key(key)).collect();
+    distinct.sort();
+    distinct.dedup();
+    distinct
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let order = i64::try_from(index + 1)
+                .ok()
+                .and_then(|position| position.checked_mul(scale))
+                .unwrap_or(i64::MAX);
+            (key.clone(), order)
+        })
+        .collect()
+}
