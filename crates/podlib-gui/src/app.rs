@@ -3,27 +3,37 @@
 //! Every blocking step (sudo mount, eject sequence, library open) runs on
 //! a background thread and reports through an mpsc channel; the UI only
 //! drains it with `try_recv` (egui FAQ: never block the UI thread), and
-//! workers wake the event loop via `ctx.request_repaint()`.
+//! workers wake the event loop via `ctx.request_repaint()`. The library
+//! backend itself lives on its own persistent worker thread — see
+//! [`crate::library`] for why.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 
 use eframe::egui;
+use podlib::{Playlist, PlaylistId, Track, TrackId};
 
 use crate::device::{self, DeviceCandidate, MountError, MountSpec};
+use crate::library::{
+    changes_from_track, drafts_from_paths, guard_playlist_mutation, panic_message,
+    EditDialogFields, DraggedTracks, LibraryCommand, LibraryOutcome, LibrarySnapshot,
+    LibraryWorker,
+};
 
-/// Track/playlist counters shown after a successful connect. Round 1
-/// opens the library in the worker and drops it; round 2 moves live
-/// backend operations into UI state and will keep it instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LibraryCounts {
-    pub tracks: usize,
-    pub playlists: usize,
-}
+/// Row height of the track table cells, keeps the column grid aligned.
+const ROW_HEIGHT: f32 = 20.0;
+/// Fixed column widths of the track table: title/artist/album/duration.
+const COLUMN_WIDTHS: [(f32, &str); 4] = [
+    (260.0, "Название"),
+    (180.0, "Исполнитель"),
+    (180.0, "Альбом"),
+    (70.0, "Длит."),
+];
 
 /// Messages from worker threads to the UI.
 enum DeviceEvent {
-    Connected(Result<LibraryCounts, ConnectError>),
+    /// Device mounted read-write; payload is the mount point.
+    Connected(Result<PathBuf, ConnectError>),
     Ejected(Result<(), String>),
 }
 
@@ -33,8 +43,6 @@ enum ConnectError {
     /// untouched, so the message must not claim it was mounted.
     Preflight(String),
     Mount { error: MountError, stderr: String },
-    /// Library open/count failure: the volume IS mounted at this point.
-    Open(String),
     /// Worker thread panicked mid-operation; operation state is unknown.
     Internal(String),
 }
@@ -45,11 +53,10 @@ struct DeviceEntry {
     block_dev: Option<PathBuf>,
 }
 
-/// Device currently connected through the GUI (round 1: read-only use).
+/// Device currently connected through the GUI.
 struct ConnectedDevice {
     mount: PathBuf,
     block_dev: PathBuf,
-    counts: LibraryCounts,
 }
 
 /// Error prepared for display: message + optional advice + raw tool output.
@@ -57,6 +64,72 @@ struct UiError {
     message: String,
     hint: Option<String>,
     stderr: Option<String>,
+}
+
+/// Decision of the confirm-on-close guard (F4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseDecision {
+    /// Nothing to do, or safe to let the window close.
+    Allow,
+    /// Cancel the OS close and open the confirmation modal.
+    BlockWithConfirm,
+}
+
+/// Close-guard state machine: an OS close while an operation is in
+/// flight would kill the detached worker thread mid-persist (possible
+/// corruption of the DB on the device), so the first close is cancelled
+/// and confirmed. After the user confirms, later close requests pass
+/// through — no confirm loop. While idle the window closes as usual.
+fn close_decision(
+    close_requested: bool,
+    operation_active: bool,
+    close_confirmed: bool,
+) -> CloseDecision {
+    if !close_requested || close_confirmed || !operation_active {
+        return CloseDecision::Allow;
+    }
+    CloseDecision::BlockWithConfirm
+}
+
+/// Which operation the UI is waiting on; at most one at a time. Only
+/// bookkeeping — the outcome itself carries the fresh snapshot and the
+/// ready-made status text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingKind {
+    Refresh,
+    AddTracks,
+    RemoveTrack,
+    EditTrack,
+    CreatePlaylist,
+    DeletePlaylist,
+    AddToPlaylist,
+    RemoveFromPlaylist,
+}
+
+/// Edit-dialog state: which track plus the text as shown on screen.
+struct EditDialogState {
+    id: TrackId,
+    fields: EditDialogFields,
+    error: Option<String>,
+}
+
+/// Live library UI state: the worker handle plus a local snapshot that is
+/// replaced wholesale after every operation (full re-list, KISS).
+struct LibraryUi {
+    worker: LibraryWorker,
+    snapshot: LibrarySnapshot,
+    /// Reply channel of the initial open; yields exactly one message.
+    opening: Option<Receiver<LibraryOutcome>>,
+    /// The single operation in flight, with its reply channel.
+    pending: Option<(PendingKind, Receiver<LibraryOutcome>)>,
+    // Dialog/confirm state (modal flags live here so they survive frames).
+    confirm_delete_track: Option<TrackId>,
+    purge_media: bool,
+    confirm_delete_playlist: Option<PlaylistId>,
+    create_open: bool,
+    new_playlist_name: String,
+    edit_dialog: Option<EditDialogState>,
+    picker_tracks: Option<Vec<TrackId>>,
 }
 
 pub struct PodlibApp {
@@ -67,6 +140,12 @@ pub struct PodlibApp {
     password: String,
     confirm_mount: bool,
     confirm_eject: bool,
+    /// Confirm-close modal is open: an operation was in flight when the
+    /// user asked to close the window.
+    confirm_close: bool,
+    /// The user confirmed closing despite an in-flight operation; the
+    /// guard lets subsequent close requests pass (no confirm loop).
+    force_close: bool,
     start_mount: bool,
     start_eject: bool,
     busy: bool,
@@ -74,6 +153,8 @@ pub struct PodlibApp {
     error: Option<UiError>,
     rx: Option<Receiver<DeviceEvent>>,
     connected: Option<ConnectedDevice>,
+    /// Present while a device is connected and its library worker is open.
+    library: Option<LibraryUi>,
 }
 
 impl PodlibApp {
@@ -85,6 +166,8 @@ impl PodlibApp {
             password: String::new(),
             confirm_mount: false,
             confirm_eject: false,
+            confirm_close: false,
+            force_close: false,
             start_mount: false,
             start_eject: false,
             busy: false,
@@ -92,6 +175,7 @@ impl PodlibApp {
             error: None,
             rx: None,
             connected: None,
+            library: None,
         };
         app.refresh_devices();
         app
@@ -111,6 +195,8 @@ impl PodlibApp {
     fn selected_entry(&self) -> Option<&DeviceEntry> {
         self.selected.and_then(|index| self.devices.get(index))
     }
+
+    // ---- event draining ----
 
     fn drain_events(&mut self) {
         // Take the receiver so event handlers can freely mutate `self`.
@@ -135,24 +221,17 @@ impl PodlibApp {
     fn handle_event(&mut self, event: DeviceEvent) {
         self.busy = false;
         match event {
-            DeviceEvent::Connected(Ok(counts)) => {
-                let entry = self.selected_entry();
-                let (mount, block_dev) = match entry {
-                    Some(entry) => (
-                        entry.candidate.mount.clone(),
-                        entry.block_dev.clone().unwrap_or_default(),
-                    ),
-                    None => return, // selection changed mid-operation: drop
-                };
-                self.status = format!(
-                    "Подключено: {} треков, {} плейлистов",
-                    counts.tracks, counts.playlists
-                );
+            DeviceEvent::Connected(Ok(mount)) => {
+                let block_dev = self
+                    .selected_entry()
+                    .and_then(|entry| entry.block_dev.clone())
+                    .unwrap_or_default();
                 self.connected = Some(ConnectedDevice {
-                    mount,
+                    mount: mount.clone(),
                     block_dev,
-                    counts,
                 });
+                self.status = "Открываю библиотеку…".to_owned();
+                self.start_library(mount);
             }
             DeviceEvent::Connected(Err(error)) => {
                 self.error = Some(match error {
@@ -165,11 +244,6 @@ impl PodlibApp {
                     // claiming a mounted volume here would be a lie.
                     ConnectError::Preflight(message) => UiError {
                         message: format!("Монтирование не выполнено: {message}"),
-                        hint: None,
-                        stderr: None,
-                    },
-                    ConnectError::Open(message) => UiError {
-                        message: format!("Том смонтирован, но библиотека не открылась: {message}"),
                         hint: None,
                         stderr: None,
                     },
@@ -191,15 +265,202 @@ impl PodlibApp {
                 self.refresh_devices();
             }
             DeviceEvent::Ejected(Err(message)) => {
+                // The library was closed before the sequence ran, so the
+                // volume may still be mounted — say so honestly.
+                let hint = if self.connected.is_some() {
+                    Some(
+                        "Библиотека закрыта, но том мог остаться смонтированным. \
+                         Подключите устройство заново, чтобы продолжить работу."
+                            .to_owned(),
+                    )
+                } else {
+                    None
+                };
                 self.error = Some(UiError {
                     message,
-                    hint: None,
+                    hint,
                     stderr: None,
                 });
                 self.status.clear();
             }
         }
     }
+
+    // ---- library lifecycle ----
+
+    /// Spawns the library worker for a freshly mounted volume. The
+    /// backend is opened inside the worker thread (`Box<dyn
+    /// LibraryBackend>` is not `Send` — see library.rs for the rationale).
+    fn start_library(&mut self, mount: PathBuf) {
+        let (worker, opened) = LibraryWorker::spawn(mount);
+        self.library = Some(LibraryUi {
+            worker,
+            snapshot: LibrarySnapshot::default(),
+            opening: Some(opened),
+            pending: None,
+            confirm_delete_track: None,
+            purge_media: false,
+            confirm_delete_playlist: None,
+            create_open: false,
+            new_playlist_name: String::new(),
+            edit_dialog: None,
+            picker_tracks: None,
+        });
+    }
+
+    /// True while no library operation is in flight.
+    fn library_idle(&self) -> bool {
+        self.library
+            .as_ref()
+            .is_some_and(|library| library.pending.is_none() && library.opening.is_none())
+    }
+
+    fn library_busy(&self) -> bool {
+        self.library
+            .as_ref()
+            .is_some_and(|library| library.pending.is_some() || library.opening.is_some())
+    }
+
+    fn drain_library(&mut self) {
+        // 1) The initial open result arrives on its own channel. Each
+        // match arm re-borrows the field it needs so `self.library = None`
+        // arms stay legal.
+        let opening = self.library.as_mut().and_then(|library| library.opening.take());
+        if let Some(rx) = opening {
+            match rx.try_recv() {
+                Ok(LibraryOutcome::Loaded(snapshot)) => {
+                    if let Some(library) = self.library.as_mut() {
+                        library.snapshot = snapshot;
+                        self.status = format!(
+                            "Подключено: {} треков, {} плейлистов",
+                            library.snapshot.tracks.len(),
+                            library.snapshot.playlists.len()
+                        );
+                    }
+                }
+                Ok(LibraryOutcome::Failed { message, hint }) => {
+                    self.error = Some(UiError {
+                        message,
+                        hint,
+                        stderr: None,
+                    });
+                    self.status.clear();
+                    // Dead worker; the volume stays mounted.
+                    self.library = None;
+                }
+                Err(TryRecvError::Empty) => {
+                    if let Some(library) = self.library.as_mut() {
+                        library.opening = Some(rx);
+                    }
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.error = Some(UiError {
+                        message: "Воркер библиотеки завершился, не открыв её".to_owned(),
+                        hint: Some("Подключите устройство заново.".to_owned()),
+                        stderr: None,
+                    });
+                    self.library = None;
+                }
+                Ok(unexpected) => {
+                    // The open channel yields exactly one message; anything
+                    // else is a protocol bug. Keep waiting rather than lie.
+                    let _ = unexpected;
+                    if let Some(library) = self.library.as_mut() {
+                        library.opening = Some(rx);
+                    }
+                }
+            }
+            if self.library.is_none() {
+                return;
+            }
+        }
+
+        // 2) The single pending operation, if any.
+        let pending = self.library.as_mut().and_then(|library| library.pending.take());
+        if let Some((kind, rx)) = pending {
+            match rx.try_recv() {
+                Ok(LibraryOutcome::Closed) => {
+                    self.library = None;
+                }
+                Ok(LibraryOutcome::Loaded(snapshot)) => {
+                    if let Some(library) = self.library.as_mut() {
+                        library.snapshot = snapshot;
+                    }
+                    self.status = "Список обновлён".to_owned();
+                }
+                Ok(LibraryOutcome::Applied { snapshot, summary }) => {
+                    if let Some(library) = self.library.as_mut() {
+                        library.snapshot = snapshot;
+                    }
+                    self.status = summary;
+                }
+                Ok(LibraryOutcome::Failed { message, hint }) => {
+                    self.error = Some(UiError {
+                        message,
+                        hint,
+                        stderr: None,
+                    });
+                    self.status.clear();
+                }
+                Err(TryRecvError::Empty) => {
+                    if let Some(library) = self.library.as_mut() {
+                        library.pending = Some((kind, rx));
+                    }
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.error = Some(UiError {
+                        message: "Воркер библиотеки завершился во время операции".to_owned(),
+                        hint: Some(
+                            "Состояние операции неизвестно; отключите и подключите устройство \
+                             заново."
+                                .to_owned(),
+                        ),
+                        stderr: None,
+                    });
+                    self.library = None;
+                }
+            }
+        }
+    }
+
+    /// Sends one library command and remembers to drain its reply. One
+    /// operation at a time; failures to send are surfaced as UI errors.
+    fn library_request(&mut self, command: LibraryCommand, kind: PendingKind, status: &str) {
+        if !self.library_idle() {
+            // Never drop an action silently: buttons inside modals and
+            // context-menu choices are not gated on idleness, so a busy
+            // worker must refuse visibly instead of ignoring the request.
+            // (With no library at all the status area already shows the
+            // dead-worker notice, so the exact wording matters less there.)
+            self.error = Some(UiError {
+                message: "Дождитесь завершения текущей операции".to_owned(),
+                hint: None,
+                stderr: None,
+            });
+            return;
+        }
+        let request = match self.library.as_ref() {
+            Some(library) => library.worker.request(command),
+            None => Err("библиотека не открыта".to_owned()),
+        };
+        match request {
+            Ok(rx) => {
+                if let Some(library) = self.library.as_mut() {
+                    library.pending = Some((kind, rx));
+                }
+                self.status = status.to_owned();
+            }
+            Err(message) => {
+                self.error = Some(UiError {
+                    message,
+                    hint: None,
+                    stderr: None,
+                });
+            }
+        }
+    }
+
+    // ---- device worker threads ----
 
     fn spawn_connect(&mut self) {
         let Some(entry) = self.selected_entry() else {
@@ -208,9 +469,7 @@ impl PodlibApp {
         let Some(block_dev) = entry.block_dev.clone() else {
             self.error = Some(UiError {
                 message: "Не удалось определить блочное устройство по sysfs".to_owned(),
-                hint: Some(
-                    "Проверьте, что том смонтирован, и нажмите «Обновить».".to_owned(),
-                ),
+                hint: Some("Проверьте, что том смонтирован, и нажмите «Обновить».".to_owned()),
                 stderr: None,
             });
             return;
@@ -244,14 +503,22 @@ impl PodlibApp {
             &connected.block_dev,
             Path::new("/sys/dev/block"),
         );
+        // Take the library out: the backend must be closed (and joined)
+        // before the unmount sequence, on the eject thread itself.
+        let library = self.library.take();
         let ctx = self.ctx.clone();
         let (tx, rx) = channel();
         self.rx = Some(rx);
         self.busy = true;
         self.error = None;
         self.status =
-            "Отключение: sync → unmount → power-off…".to_owned();
+            "Отключение: закрытие библиотеки → sync → unmount → power-off…".to_owned();
         std::thread::spawn(move || {
+            if let Some(library) = library {
+                // Blocking close: the backend owns files on the mounted
+                // volume, so it must be gone before sync/unmount.
+                library.worker.close_and_join();
+            }
             // catch_unwind: a worker panic must still produce an event,
             // otherwise the UI would silently stay busy forever.
             let result = run_worker_step(
@@ -262,6 +529,8 @@ impl PodlibApp {
             ctx.request_repaint();
         });
     }
+
+    // ---- panels ----
 
     fn device_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Устройство");
@@ -315,7 +584,7 @@ impl PodlibApp {
     fn status_area(&mut self, ui: &mut egui::Ui) {
         ui.heading("podlib");
         ui.add_space(8.0);
-        if self.busy {
+        if self.busy || self.library_busy() {
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new());
                 ui.label(&self.status);
@@ -350,13 +619,17 @@ impl PodlibApp {
                         connected.block_dev.display()
                     ),
                 );
-                ui.label(format!(
-                    "Треков: {} · Плейлистов: {}",
-                    connected.counts.tracks, connected.counts.playlists
-                ));
+                if self.library.is_none() && !self.busy {
+                    ui.colored_label(
+                        egui::Color32::LIGHT_RED,
+                        "Библиотека недоступна: воркер закрылся. Отключите и подключите \
+                         устройство заново.",
+                    );
+                }
                 ui.add_space(8.0);
+                let ready = !self.busy && self.library_idle();
                 if ui
-                    .add_enabled(!self.busy, egui::Button::new("Безопасно отключить"))
+                    .add_enabled(ready, egui::Button::new("Безопасно отключить"))
                     .clicked()
                 {
                     self.confirm_eject = true;
@@ -365,9 +638,316 @@ impl PodlibApp {
             None => {
                 ui.label(
                     "Выберите устройство слева и нажмите «Подключить». \
-                     После подключения здесь появятся счётчики библиотеки.",
+                     После подключения здесь появится статус, а справа — плейлисты.",
                 );
             }
+        }
+    }
+
+    /// Central panel: toolbar + track table with drag-and-drop rows.
+    fn library_view(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let idle = self.library_idle();
+            if ui
+                .add_enabled(idle, egui::Button::new("Обновить"))
+                .clicked()
+            {
+                self.library_request(
+                    LibraryCommand::Refresh,
+                    PendingKind::Refresh,
+                    "Обновляю список…",
+                );
+            }
+            if ui
+                .add_enabled(idle, egui::Button::new("+ Плейлист"))
+                .clicked()
+            {
+                if let Some(library) = self.library.as_mut() {
+                    library.create_open = true;
+                    library.new_playlist_name.clear();
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new("Перетащите аудиофайлы в окно, чтобы добавить")
+                        .weak(),
+                );
+            });
+        });
+        ui.separator();
+
+        // Immutable borrow for rendering; context-menu choices are
+        // collected into locals and applied after the loop.
+        let Some(library) = self.library.as_ref() else {
+            return;
+        };
+        if library.snapshot.tracks.is_empty() {
+            ui.label("Библиотека пуста. Перетащите аудиофайлы в окно.");
+            return;
+        }
+
+        let mut edit_id: Option<TrackId> = None;
+        let mut add_ids: Option<Vec<TrackId>> = None;
+        let mut delete_id: Option<TrackId> = None;
+        // Menus stay closed while an operation is in flight: their
+        // choices fire library requests a busy worker would refuse.
+        let menus_allowed = context_menu_allowed(self);
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            // Header row, same column geometry as the data rows.
+            ui.horizontal(|ui| {
+                for (width, name) in COLUMN_WIDTHS {
+                    ui.add_sized(
+                        [width, ROW_HEIGHT],
+                        egui::Label::new(egui::RichText::new(name).strong()),
+                    );
+                }
+            });
+            ui.separator();
+            for track in &library.snapshot.tracks {
+                let row_id = egui::Id::unique(("track_row", track.id.to_bits()));
+                let response = ui
+                    .dnd_drag_source(row_id, DraggedTracks(vec![track.id]), |ui| {
+                        track_row(ui, track);
+                    })
+                    .response;
+                let mut open_edit = false;
+                let mut open_add = false;
+                let mut open_delete = false;
+                if menus_allowed {
+                    response.context_menu(|ui| {
+                        if ui.button("Изменить…").clicked() {
+                            open_edit = true;
+                            ui.close();
+                        }
+                        if ui.button("Добавить в плейлист…").clicked() {
+                            open_add = true;
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("Удалить…").clicked() {
+                            open_delete = true;
+                            ui.close();
+                        }
+                    });
+                }
+                if open_edit {
+                    edit_id = Some(track.id);
+                }
+                if open_add {
+                    add_ids = Some(vec![track.id]);
+                }
+                if open_delete {
+                    delete_id = Some(track.id);
+                }
+            }
+        });
+
+        // Apply the collected actions (unique borrow again).
+        if let Some(id) = edit_id {
+            if let Some(library) = self.library.as_mut() {
+                if let Some(track) = library.snapshot.track(id) {
+                    library.edit_dialog = Some(EditDialogState {
+                        id,
+                        fields: EditDialogFields::from_track(track),
+                        error: None,
+                    });
+                }
+            }
+        }
+        if let Some(track_ids) = add_ids {
+            if let Some(library) = self.library.as_mut() {
+                library.picker_tracks = Some(track_ids);
+            }
+        }
+        if let Some(id) = delete_id {
+            if let Some(library) = self.library.as_mut() {
+                library.confirm_delete_track = Some(id);
+                library.purge_media = false;
+            }
+        }
+    }
+
+    /// Right panel: playlists, each header a drop target for dragged tracks.
+    fn playlists_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Плейлисты");
+        let Some(library) = self.library.as_ref() else {
+            return;
+        };
+        let mut add_drop: Option<(PlaylistId, Vec<TrackId>)> = None;
+        let mut master_drop: Option<String> = None;
+        let mut delete_playlist: Option<PlaylistId> = None;
+        let mut remove_member: Option<(PlaylistId, TrackId)> = None;
+        // Menus stay closed while an operation is in flight: their
+        // choices fire library requests a busy worker would refuse.
+        let menus_allowed = context_menu_allowed(self);
+        for playlist in &library.snapshot.playlists {
+            let is_master = playlist.is_master;
+            let header_text = if is_master {
+                format!("{} (мастер)", playlist.name)
+            } else {
+                playlist.name.clone()
+            };
+            let header_id = egui::Id::unique(("playlist_header", playlist.id.to_bits()));
+            let (_, dropped) = ui.dnd_drop_zone::<DraggedTracks, _>(
+                egui::Frame::default().inner_margin(egui::Margin::same(2)),
+                |ui| {
+                    let collapsing = egui::CollapsingHeader::new(header_text.as_str())
+                        .id_salt(header_id)
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            for member_id in playlist.unique_track_ids() {
+                                let title = library
+                                    .snapshot
+                                    .track(member_id)
+                                    .map(|track| track.title.as_str())
+                                    .unwrap_or("<нет в библиотеке>");
+                                let mut remove = false;
+                                let row = ui
+                                    .horizontal(|ui| {
+                                        ui.add_sized(
+                                            [ui.available_width() - 8.0, ROW_HEIGHT - 4.0],
+                                            egui::Label::new(
+                                                egui::RichText::new(title).weak(),
+                                            ),
+                                        );
+                                    })
+                                    .response;
+                                if !is_master && menus_allowed {
+                                    row.context_menu(|ui| {
+                                        if ui.button("Убрать из плейлиста").clicked() {
+                                            remove = true;
+                                            ui.close();
+                                        }
+                                    });
+                                }
+                                if remove {
+                                    remove_member = Some((playlist.id, member_id));
+                                }
+                            }
+                            if playlist.track_ids.is_empty() {
+                                ui.label(egui::RichText::new("— пусто —").weak());
+                            }
+                        });
+                    if !is_master {
+                        let mut delete = false;
+                        if menus_allowed {
+                            collapsing.header_response.context_menu(|ui| {
+                                if ui.button("Удалить плейлист…").clicked() {
+                                    delete = true;
+                                    ui.close();
+                                }
+                            });
+                        }
+                        if delete {
+                            delete_playlist = Some(playlist.id);
+                        }
+                    }
+                },
+            );
+            if let Some(dragged) = dropped {
+                // WHY the UI refuses master drops instead of trusting the
+                // backend: the 7G adapter rejects master-member mutations,
+                // but the classic backend allows them on purpose (firmware
+                // parity) — where they are pointless anyway: the master is
+                // the mirror of the whole library and duplicates are
+                // ignored. One consistent rule, explained without a round
+                // trip to the device.
+                if is_master {
+                    master_drop = Some(playlist.name.clone());
+                } else {
+                    add_drop = Some((playlist.id, dragged.0.clone()));
+                }
+            }
+        }
+
+        if let Some(name) = master_drop {
+            self.error = Some(UiError {
+                message: format!("«{name}» — мастер-плейлист: добавлять в него нельзя"),
+                hint: Some(
+                    "Создайте пользовательский плейлист («+ Плейлист») и бросьте трек на него."
+                        .to_owned(),
+                ),
+                stderr: None,
+            });
+        }
+        if let Some((playlist, track_ids)) = add_drop {
+            self.library_request(
+                LibraryCommand::AddToPlaylist {
+                    playlist,
+                    track_ids,
+                },
+                PendingKind::AddToPlaylist,
+                "Добавляю в плейлист…",
+            );
+        }
+        if let Some(id) = delete_playlist {
+            if let Some(library) = self.library.as_mut() {
+                library.confirm_delete_playlist = Some(id);
+            }
+        }
+        if let Some((playlist, member)) = remove_member {
+            self.library_request(
+                LibraryCommand::RemoveFromPlaylist {
+                    playlist,
+                    track_ids: vec![member],
+                },
+                PendingKind::RemoveFromPlaylist,
+                "Убираю из плейлиста…",
+            );
+        }
+    }
+
+    // ---- file drag-and-drop from the file manager ----
+
+    fn collect_dropped_files(&mut self, ui: &egui::Ui) {
+        // Copy the paths immediately: egui owns them for this frame only.
+        let dropped: Vec<PathBuf> = ui
+            .input(|input| {
+                input
+                    .raw
+                    .dropped_files
+                    .iter()
+                    // path() is infallible on native (&Path, not Option).
+                    .map(|file| PathBuf::from(file.path()))
+                    .collect()
+            });
+        if dropped.is_empty() {
+            return;
+        }
+        let (drafts, skipped) = drafts_from_paths(&dropped);
+        if drafts.is_empty() {
+            if !skipped.is_empty() {
+                self.status = format!("Пропущены не-аудио файлы: {}", skipped.join(", "));
+            }
+            return;
+        }
+        let mut status = format!("Добавляю файлы: {} шт.", drafts.len());
+        if !skipped.is_empty() {
+            status.push_str(&format!("; пропущены: {}", skipped.join(", ")));
+        }
+        self.library_request(
+            LibraryCommand::AddTracks(drafts),
+            PendingKind::AddTracks,
+            &status,
+        );
+    }
+
+    // ---- modals ----
+
+    /// F4: intercepts the OS close request while an operation is in
+    /// flight, cancels it and opens the confirmation modal instead.
+    /// Documented eframe 0.37 pattern: check
+    /// `ctx.input(|i| i.viewport().close_requested())` during the frame
+    /// and answer with `ViewportCommand::CancelClose`.
+    fn guard_close_request(&mut self, ui: &egui::Ui) {
+        let close_requested = ui.input(|input| input.viewport().close_requested());
+        let operation_active = self.busy || self.library_busy();
+        if close_decision(close_requested, operation_active, self.force_close)
+            == CloseDecision::BlockWithConfirm
+        {
+            // CancelClose must be sent during this frame, or eframe exits.
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm_close = true;
         }
     }
 
@@ -426,7 +1006,7 @@ impl PodlibApp {
             ui.set_width(400.0);
             ui.heading("Безопасно отключить устройство?");
             ui.add_space(4.0);
-            ui.label("Будут выполнены: sync, unmount, power-off (udisksctl).");
+            ui.label("Будут выполнены: закрытие библиотеки, sync, unmount, power-off.");
             ui.label("Убедитесь, что операции записи завершены.");
             ui.separator();
             ui.horizontal(|ui| {
@@ -446,15 +1026,464 @@ impl PodlibApp {
             self.start_eject = true;
         }
     }
+
+    /// F4: asks before closing the window mid-operation. Confirming
+    /// sends `ViewportCommand::Close`, which surfaces as a fresh close
+    /// request the guard lets through (`force_close`).
+    fn maybe_close_confirm_modal(&mut self, ctx: &egui::Context) {
+        if !self.confirm_close {
+            return;
+        }
+        let mut confirmed = false;
+        let response = egui::Modal::new(egui::Id::unique("confirm_close")).show(ctx, |ui| {
+            ui.set_width(440.0);
+            ui.heading("Идёт операция с библиотекой");
+            ui.add_space(4.0);
+            ui.label("Закрыть всё равно? Возможно повреждение базы на устройстве.");
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Отмена").clicked() {
+                    ui.close();
+                }
+                if ui.button("Закрыть").clicked() {
+                    confirmed = true;
+                    ui.close();
+                }
+            });
+        });
+        if confirmed || response.should_close() {
+            self.confirm_close = false;
+        }
+        if confirmed {
+            self.force_close = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    fn maybe_delete_track_modal(&mut self, ctx: &egui::Context) {
+        let Some(track_id) = self
+            .library
+            .as_ref()
+            .and_then(|library| library.confirm_delete_track)
+        else {
+            return;
+        };
+        let title = self
+            .library
+            .as_ref()
+            .and_then(|library| library.snapshot.track(track_id))
+            .map(|track| track.title.clone())
+            .unwrap_or_default();
+        let mut confirmed = false;
+        let response = egui::Modal::new(egui::Id::unique("confirm_delete_track")).show(ctx, |ui| {
+            ui.set_width(440.0);
+            ui.heading(format!("Удалить трек «{title}»?"));
+            ui.add_space(4.0);
+            ui.label("Трек исчезнет из библиотеки и всех плейлистов.");
+            if let Some(library) = self.library.as_mut() {
+                // The checkbox lives in the state so it survives frames.
+                ui.checkbox(&mut library.purge_media, "Удалить и медиа-файл с устройства");
+            }
+            ui.label(
+                egui::RichText::new(
+                    "Без галочки аудиофайл останется на диске как «осиротевший».",
+                )
+                .weak(),
+            );
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Отмена").clicked() {
+                    ui.close();
+                }
+                if ui.button("Удалить").clicked() {
+                    confirmed = true;
+                    ui.close();
+                }
+            });
+        });
+        if confirmed || response.should_close() {
+            if let Some(library) = self.library.as_mut() {
+                library.confirm_delete_track = None;
+            }
+        }
+        if confirmed {
+            let purge = self
+                .library
+                .as_ref()
+                .map(|library| library.purge_media)
+                .unwrap_or(false);
+            self.library_request(
+                LibraryCommand::RemoveTrack {
+                    id: track_id,
+                    purge_media: purge,
+                },
+                PendingKind::RemoveTrack,
+                "Удаляю трек…",
+            );
+        }
+    }
+
+    fn maybe_delete_playlist_modal(&mut self, ctx: &egui::Context) {
+        let Some(playlist_id) = self
+            .library
+            .as_ref()
+            .and_then(|library| library.confirm_delete_playlist)
+        else {
+            return;
+        };
+        let name = self
+            .library
+            .as_ref()
+            .and_then(|library| library.snapshot.playlist(playlist_id))
+            .map(|playlist| playlist.name.clone())
+            .unwrap_or_default();
+        let mut confirmed = false;
+        let response =
+            egui::Modal::new(egui::Id::unique("confirm_delete_playlist")).show(ctx, |ui| {
+                ui.set_width(400.0);
+                ui.heading(format!("Удалить плейлист «{name}»?"));
+                ui.add_space(4.0);
+                ui.label("Сами треки останутся в библиотеке.");
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Отмена").clicked() {
+                        ui.close();
+                    }
+                    if ui.button("Удалить").clicked() {
+                        confirmed = true;
+                        ui.close();
+                    }
+                });
+            });
+        if confirmed || response.should_close() {
+            if let Some(library) = self.library.as_mut() {
+                library.confirm_delete_playlist = None;
+            }
+        }
+        if confirmed {
+            self.library_request(
+                LibraryCommand::DeletePlaylist { id: playlist_id },
+                PendingKind::DeletePlaylist,
+                "Удаляю плейлист…",
+            );
+        }
+    }
+
+    fn maybe_create_playlist_modal(&mut self, ctx: &egui::Context) {
+        if !self.library.as_ref().is_some_and(|library| library.create_open) {
+            return;
+        }
+        let mut confirmed = false;
+        let mut name = String::new();
+        let response = egui::Modal::new(egui::Id::unique("create_playlist")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.heading("Новый плейлист");
+            ui.add_space(4.0);
+            let Some(library) = self.library.as_mut() else {
+                return;
+            };
+            ui.horizontal(|ui| {
+                ui.label("Название:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut library.new_playlist_name)
+                        .desired_width(240.0),
+                );
+            });
+            name = library.new_playlist_name.clone();
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Отмена").clicked() {
+                    ui.close();
+                }
+                let ready = !library.new_playlist_name.trim().is_empty();
+                if ui.add_enabled(ready, egui::Button::new("Создать")).clicked() {
+                    confirmed = true;
+                    ui.close();
+                }
+            });
+        });
+        if confirmed || response.should_close() {
+            if let Some(library) = self.library.as_mut() {
+                library.create_open = false;
+            }
+        }
+        if confirmed && !name.trim().is_empty() {
+            self.library_request(
+                LibraryCommand::CreatePlaylist { name },
+                PendingKind::CreatePlaylist,
+                "Создаю плейлист…",
+            );
+        }
+    }
+
+    fn maybe_edit_track_modal(&mut self, ctx: &egui::Context) {
+        if !self
+            .library
+            .as_ref()
+            .is_some_and(|library| library.edit_dialog.is_some())
+        {
+            return;
+        }
+        let mut save = false;
+        let response = egui::Modal::new(egui::Id::unique("edit_track")).show(ctx, |ui| {
+            ui.set_width(500.0);
+            ui.heading("Изменить трек");
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "Жанр не редактируется: библиотека не отдаёт его при чтении, \
+                     и правка перезаписала бы его пустым значением.",
+                )
+                .weak(),
+            );
+            ui.add_space(4.0);
+            let Some(library) = self.library.as_mut() else {
+                return;
+            };
+            let Some(dialog) = library.edit_dialog.as_mut() else {
+                return;
+            };
+            let mut fields = dialog.fields.clone();
+            ui.horizontal(|ui| {
+                ui.label("Название:      ");
+                ui.add(
+                    egui::TextEdit::singleline(&mut fields.title).desired_width(320.0),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Исполнитель:  ");
+                ui.add(
+                    egui::TextEdit::singleline(&mut fields.artist).desired_width(320.0),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Альбом:       ");
+                ui.add(
+                    egui::TextEdit::singleline(&mut fields.album).desired_width(320.0),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Альбом-артист:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut fields.album_artist)
+                        .desired_width(320.0),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Трек №:       ");
+                ui.add(
+                    egui::TextEdit::singleline(&mut fields.track_number)
+                        .desired_width(60.0),
+                );
+                ui.label("Диск №:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut fields.disc_number)
+                        .desired_width(60.0),
+                );
+            });
+            dialog.fields = fields;
+            if let Some(error) = &dialog.error {
+                ui.colored_label(egui::Color32::LIGHT_RED, error);
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Отмена").clicked() {
+                    ui.close();
+                }
+                if ui.button("Сохранить").clicked() {
+                    save = true;
+                    ui.close();
+                }
+            });
+        });
+        if !(save || response.should_close()) {
+            return; // still open, nothing to apply
+        }
+        // Take the dialog out to work without nested borrows.
+        let Some(library) = self.library.as_mut() else {
+            return;
+        };
+        let Some(dialog) = library.edit_dialog.take() else {
+            return;
+        };
+        if !save {
+            return; // plain close: no request, id is untouched
+        }
+        let attempt = library
+            .snapshot
+            .track(dialog.id)
+            .map(|track| changes_from_track(track, &dialog.fields));
+        match attempt {
+            // Unchanged dialog → no request, so the id survives by contract.
+            Some(Ok(changes)) if changes.is_empty() => {
+                self.status = "Изменений нет".to_owned();
+            }
+            Some(Ok(changes)) => {
+                self.library_request(
+                    LibraryCommand::EditTrack {
+                        id: dialog.id,
+                        changes,
+                    },
+                    PendingKind::EditTrack,
+                    "Сохраняю изменения…",
+                );
+            }
+            // Validation failure: reopen with the inline error.
+            Some(Err(message)) => {
+                if let Some(library) = self.library.as_mut() {
+                    library.edit_dialog = Some(EditDialogState {
+                        error: Some(message),
+                        ..dialog
+                    });
+                }
+            }
+            // The track vanished between frames; keep the dialog closed.
+            None => {}
+        }
+    }
+
+    fn maybe_add_to_playlist_modal(&mut self, ctx: &egui::Context) {
+        if !self
+            .library
+            .as_ref()
+            .is_some_and(|library| library.picker_tracks.is_some())
+        {
+            return;
+        }
+        // Snapshot the choices so the modal closure stays borrow-free.
+        let playlists: Vec<Playlist> = self
+            .library
+            .as_ref()
+            .map(|library| library.snapshot.playlists.clone())
+            .unwrap_or_default();
+        let mut chosen: Option<PlaylistId> = None;
+        let response = egui::Modal::new(egui::Id::unique("add_to_playlist")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.heading("Добавить в плейлист");
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                for playlist in &playlists {
+                    let guarded = guard_playlist_mutation(playlist).is_err();
+                    let label = if guarded {
+                        format!("{} (нельзя)", playlist.name)
+                    } else {
+                        playlist.name.clone()
+                    };
+                    let width = ui.available_width() - 8.0;
+                    if ui
+                        .add_enabled(
+                            !guarded,
+                            egui::Button::new(label).min_size([width, 26.0].into()),
+                        )
+                        .clicked()
+                    {
+                        chosen = Some(playlist.id);
+                        ui.close();
+                    }
+                }
+            });
+        });
+        if chosen.is_some() || response.should_close() {
+            if let Some(library) = self.library.as_mut() {
+                library.picker_tracks = None;
+            }
+        }
+        if let Some(playlist) = chosen {
+            let track_ids = self
+                .library
+                .as_ref()
+                .and_then(|library| library.picker_tracks.clone())
+                .unwrap_or_default();
+            self.library_request(
+                LibraryCommand::AddToPlaylist {
+                    playlist,
+                    track_ids,
+                },
+                PendingKind::AddToPlaylist,
+                "Добавляю в плейлист…",
+            );
+        }
+    }
 }
 
-/// Worker-thread body: sudo rw-mount, then open the library and count.
-/// The backend is opened and dropped here — see [`LibraryCounts`].
+/// Renders one track-table row: four fixed-width cells (drag source body).
+fn track_row(ui: &mut egui::Ui, track: &Track) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [COLUMN_WIDTHS[0].0, ROW_HEIGHT],
+            egui::Label::new(egui::RichText::new(track.title.as_str()).strong()),
+        );
+        ui.add_sized(
+            [COLUMN_WIDTHS[1].0, ROW_HEIGHT],
+            egui::Label::new(optional_text(&track.artist)),
+        );
+        ui.add_sized(
+            [COLUMN_WIDTHS[2].0, ROW_HEIGHT],
+            egui::Label::new(optional_text(&track.album)),
+        );
+        ui.add_sized(
+            [COLUMN_WIDTHS[3].0, ROW_HEIGHT],
+            egui::Label::new(format_duration(track.duration_ms)),
+        );
+    });
+}
+
+/// Missing tags render as an em dash instead of nothing.
+fn optional_text(value: &Option<String>) -> String {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| "—".to_owned())
+}
+
+/// `123456` ms → `2:03`; zero means unknown → em dash.
+fn format_duration(duration_ms: u32) -> String {
+    if duration_ms == 0 {
+        return "—".to_owned();
+    }
+    let total_seconds = duration_ms / 1000;
+    format!("{}:{:02}", total_seconds / 60, total_seconds % 60)
+}
+
+/// Gate for opening any context menu: every choice inside fires a
+/// library request, and a busy worker must not even be offered more
+/// work. Centralised so every menu site follows one rule.
+fn context_menu_allowed(app: &PodlibApp) -> bool {
+    app.library_idle()
+}
+
+/// Full-window overlay while files hover over the viewport.
+fn draw_drop_overlay(ui: &egui::Ui, names: &[String]) {
+    let ctx = ui.ctx();
+    let painter =
+        ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("drop_overlay")));
+    let rect = ctx.content_rect();
+    painter.rect_filled(rect, 12.0, egui::Color32::from_black_alpha(160));
+    let font = egui::TextStyle::Heading.resolve(&ctx.global_style());
+    let text = if names.len() == 1 {
+        format!("Отпустите, чтобы добавить: {}", names[0])
+    } else {
+        format!("Отпустите, чтобы добавить файлы: {} шт.", names.len())
+    };
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        font,
+        egui::Color32::WHITE,
+    );
+}
+
+/// Worker-thread body: sudo rw-mount only. The library is NOT opened here:
+/// `Box<dyn LibraryBackend>` is not `Send`, so it is opened on the library
+/// worker thread instead (see library.rs).
 fn connect_device(
     password: String, // owned: dropped right after the mount command (W3)
     block_dev: PathBuf,
     mount_path: PathBuf,
-) -> Result<LibraryCounts, ConnectError> {
+) -> Result<PathBuf, ConnectError> {
     let (uid, gid) = device::current_uid_gid().ok_or_else(|| {
         ConnectError::Preflight("не удалось определить uid/gid процесса".to_owned())
     })?;
@@ -470,23 +1499,11 @@ fn connect_device(
     })?;
     // WHY: the password lives only for the duration of the command. sudo
     // has already consumed it (stdin is closed at this point), so it is
-    // dropped before the longer library-open phase instead of staying
-    // alive in the worker until connect_device returns.
+    // dropped before returning instead of staying alive in the worker.
     drop(password);
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     device::classify_mount_output(&output).map_err(|error| ConnectError::Mount { error, stderr })?;
-    // The udisksctl sequence is not needed here: the volume is mounted.
-    let backend =
-        podlib::open_library(&mount_path).map_err(|error| ConnectError::Open(error.to_string()))?;
-    let tracks = backend
-        .tracks()
-        .map_err(|error| ConnectError::Open(error.to_string()))?
-        .len();
-    let playlists = backend
-        .playlists()
-        .map_err(|error| ConnectError::Open(error.to_string()))?
-        .len();
-    Ok(LibraryCounts { tracks, playlists })
+    Ok(mount_path)
 }
 
 /// Runs a worker body, converting a panic into an honest error value.
@@ -500,31 +1517,53 @@ fn run_worker_step<T, E>(
         .unwrap_or_else(|panic| Err(on_panic(panic_message(panic))))
 }
 
-/// Extracts a human-readable message from a panic payload. Takes the box
-/// by value: downcasting through a coerced `&(dyn Any + Send)` silently
-/// fails (the derived vtable loses the type identity), while the owning
-/// `Box<dyn Any + Send>` downcasts correctly.
-fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(text) = payload.downcast_ref::<&str>() {
-        (*text).to_owned()
-    } else if let Some(text) = payload.downcast_ref::<String>() {
-        text.clone()
-    } else {
-        "причина не сообщена".to_owned()
-    }
-}
-
 impl eframe::App for PodlibApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events();
+        self.drain_library();
+        self.guard_close_request(ui);
+        self.collect_dropped_files(ui);
         egui::Panel::left("device_panel")
-            .default_size(360.0)
+            .default_size(340.0)
             .resizable(true)
             .show(ui, |ui| self.device_panel(ui));
-        egui::CentralPanel::default().show(ui, |ui| self.status_area(ui));
+        egui::Panel::right("playlists_panel")
+            .default_size(280.0)
+            .resizable(true)
+            .show(ui, |ui| self.playlists_panel(ui));
+        egui::CentralPanel::default().show(ui, |ui| {
+            self.status_area(ui);
+            if self.library.is_some() {
+                ui.separator();
+                self.library_view(ui);
+            }
+        });
+        // Hover preview above everything while files are dragged over us.
+        let hovered: Vec<String> = ui
+            .input(|input| {
+                input
+                    .raw
+                    .hovered_files
+                    .iter()
+                    .filter_map(|file| {
+                        file.path
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                    })
+                    .collect()
+            });
+        if !hovered.is_empty() {
+            draw_drop_overlay(ui, &hovered);
+        }
         let ctx = ui.ctx().clone();
         self.maybe_mount_modal(&ctx);
         self.maybe_eject_modal(&ctx);
+        self.maybe_close_confirm_modal(&ctx);
+        self.maybe_delete_track_modal(&ctx);
+        self.maybe_delete_playlist_modal(&ctx);
+        self.maybe_create_playlist_modal(&ctx);
+        self.maybe_edit_track_modal(&ctx);
+        self.maybe_add_to_playlist_modal(&ctx);
         if self.start_mount {
             self.start_mount = false;
             self.spawn_connect();
@@ -538,13 +1577,72 @@ impl eframe::App for PodlibApp {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use podlib::{build_nano2g_fixture, FixtureTrack};
+    use tempfile::TempDir;
+
     use super::*;
 
-    /// Headless app instance: `handle_event`/`drain_events` only touch
-    /// plain state (strings, options, channels), no egui rendering.
+    const POLL: Duration = Duration::from_millis(2);
+    const DEADLINE: usize = 2500; // ~5 s
+
+    /// Headless app instance: `handle_event`/`drain_*` only touch plain
+    /// state (strings, options, channels), no egui rendering.
     fn test_app() -> PodlibApp {
         PodlibApp::new(egui::Context::default())
     }
+
+    fn sample_track(id: u64, title: &str) -> Track {
+        Track {
+            id: TrackId::from_bits(id),
+            title: title.to_owned(),
+            artist: Some("Artist".to_owned()),
+            album: None,
+            album_artist: None,
+            duration_ms: 90_000,
+            track_number: 1,
+            disc_number: 1,
+            size_bytes: 1024,
+            has_artwork: false,
+        }
+    }
+
+    /// A mount with a one-track classic-device fixture.
+    fn fixture_mount() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        build_nano2g_fixture(
+            dir.path(),
+            &[FixtureTrack {
+                title: "Alpha".to_owned(),
+                artist: None,
+                album: None,
+                genre: None,
+                file_name: "a.mp3".to_owned(),
+                size_bytes: 2048,
+                duration_ms: 120_000,
+                track_number: 1,
+                disc_number: 1,
+            }],
+            &[],
+        )
+        .unwrap();
+        dir
+    }
+
+    /// Polls `drain_library` until `done` says stop or the deadline passes.
+    fn pump(app: &mut PodlibApp, mut done: impl FnMut(&PodlibApp) -> bool) -> bool {
+        for _ in 0..DEADLINE {
+            app.drain_library();
+            if done(app) {
+                return true;
+            }
+            std::thread::sleep(POLL);
+        }
+        false
+    }
+
+    // ---- device round-1 behaviour (kept) ----
 
     #[test]
     fn preflight_error_does_not_claim_mounted_volume() {
@@ -560,16 +1658,6 @@ mod tests {
     }
 
     #[test]
-    fn open_error_still_reports_mounted_volume() {
-        let mut app = test_app();
-        app.handle_event(DeviceEvent::Connected(Err(ConnectError::Open(
-            "библиотека повреждена".to_owned(),
-        ))));
-        let error = app.error.expect("open failure must be shown");
-        assert!(error.message.contains("смонтирован"));
-    }
-
-    #[test]
     fn panic_message_handles_common_payloads() {
         assert_eq!(panic_message(Box::new("str panic")), "str panic");
         assert_eq!(
@@ -581,10 +1669,8 @@ mod tests {
 
     #[test]
     fn worker_panic_maps_to_internal_error() {
-        let result: Result<LibraryCounts, ConnectError> = run_worker_step(
-            || panic!("worker exploded"),
-            ConnectError::Internal,
-        );
+        let result: Result<PathBuf, ConnectError> =
+            run_worker_step(|| panic!("worker exploded"), ConnectError::Internal);
         match result {
             Err(ConnectError::Internal(message)) => {
                 assert!(message.contains("worker exploded"))
@@ -599,7 +1685,8 @@ mod tests {
         app.busy = true;
         let (tx, rx) = channel();
         app.rx = Some(rx);
-        let error = run_worker_step(|| panic!("worker exploded"), ConnectError::Internal);
+        let error: Result<PathBuf, ConnectError> =
+            run_worker_step(|| panic!("worker exploded"), ConnectError::Internal);
         tx.send(DeviceEvent::Connected(error)).unwrap();
         drop(tx); // the panicking worker is gone: the channel closes
         app.drain_events();
@@ -611,8 +1698,284 @@ mod tests {
 
     #[test]
     fn worker_without_panic_passes_result_through() {
-        let result: Result<LibraryCounts, ConnectError> =
-            run_worker_step(|| Ok(LibraryCounts { tracks: 3, playlists: 1 }), |_| unreachable!());
-        assert!(matches!(result, Ok(LibraryCounts { tracks: 3, playlists: 1 })));
+        let result: Result<PathBuf, ConnectError> = run_worker_step(
+            || Ok(PathBuf::from("/run/media/ipod")),
+            |_| unreachable!(),
+        );
+        assert_eq!(
+            result.unwrap(),
+            PathBuf::from("/run/media/ipod")
+        );
+    }
+
+    // ---- library lifecycle through the real worker ----
+
+    #[test]
+    fn connected_event_opens_library_and_loads_snapshot() {
+        let dir = fixture_mount();
+        let mut app = test_app();
+        app.handle_event(DeviceEvent::Connected(Ok(dir.path().to_owned())));
+        assert!(app.connected.is_some());
+        assert!(app.library.is_some());
+        let loaded = pump(&mut app, |app| {
+            app.library
+                .as_ref()
+                .is_some_and(|library| library.opening.is_none())
+        });
+        assert!(loaded, "worker must deliver the initial listing");
+        let library = app.library.as_ref().unwrap();
+        assert_eq!(library.snapshot.tracks.len(), 1);
+        assert_eq!(library.snapshot.tracks[0].title, "Alpha");
+        assert!(app.status.contains("Подключено"));
+        assert!(app.status.contains("1 треков"));
+        let library = app.library.take().unwrap();
+        library.worker.close_and_join();
+    }
+
+    #[test]
+    fn open_failure_reports_mounted_volume_and_drops_library() {
+        let dir = TempDir::new().unwrap(); // no library inside
+        let mut app = test_app();
+        app.handle_event(DeviceEvent::Connected(Ok(dir.path().to_owned())));
+        let dropped = pump(&mut app, |app| app.library.is_none());
+        assert!(dropped, "failed open must drop the library UI");
+        let error = app.error.expect("open failure must be shown");
+        // The volume IS mounted at this point — the message says so.
+        assert!(error.message.contains("смонтирован"));
+        assert!(app.connected.is_some(), "device stays connected");
+    }
+
+    // ---- pending-op state machine (manual channels, no waiting) ----
+
+    fn app_with_open_library() -> (PodlibApp, TempDir) {
+        let dir = fixture_mount();
+        let mut app = test_app();
+        app.handle_event(DeviceEvent::Connected(Ok(dir.path().to_owned())));
+        let settled = pump(&mut app, |app| {
+            app.library
+                .as_ref()
+                .is_some_and(|library| library.opening.is_none())
+        });
+        assert!(settled, "fixture library must open in tests");
+        (app, dir)
+    }
+
+    #[test]
+    fn applied_outcome_updates_snapshot_and_status() {
+        let (mut app, _dir) = app_with_open_library();
+        let (tx, rx) = channel();
+        app.library
+            .as_mut()
+            .unwrap()
+            .pending = Some((PendingKind::AddTracks, rx));
+        tx.send(LibraryOutcome::Applied {
+            snapshot: LibrarySnapshot {
+                tracks: vec![sample_track(1, "A"), sample_track(2, "B")],
+                playlists: Vec::new(),
+            },
+            summary: "Добавлено треков: 1".to_owned(),
+        })
+        .unwrap();
+        app.drain_library();
+        let library = app.library.as_ref().unwrap();
+        assert_eq!(library.snapshot.tracks.len(), 2, "snapshot replaced");
+        assert!(library.pending.is_none(), "op must be settled");
+        assert_eq!(app.status, "Добавлено треков: 1");
+        assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn edit_outcome_reports_id_change_via_summary() {
+        let (mut app, _dir) = app_with_open_library();
+        let (tx, rx) = channel();
+        app.library
+            .as_mut()
+            .unwrap()
+            .pending = Some((PendingKind::EditTrack, rx));
+        let mut track = sample_track(9, "Beta");
+        track.duration_ms = 0; // renders as an em dash in the table
+        tx.send(LibraryOutcome::Applied {
+            snapshot: LibrarySnapshot {
+                tracks: vec![track],
+                playlists: Vec::new(),
+            },
+            summary: "Обновлено: «Beta» (новый id: 9)".to_owned(),
+        })
+        .unwrap();
+        app.drain_library();
+        let library = app.library.as_ref().unwrap();
+        assert_eq!(library.snapshot.tracks[0].title, "Beta");
+        assert_eq!(app.status, "Обновлено: «Beta» (новый id: 9)");
+    }
+
+    #[test]
+    fn failed_outcome_shows_error_but_keeps_library() {
+        let (mut app, _dir) = app_with_open_library();
+        let (tx, rx) = channel();
+        app.library
+            .as_mut()
+            .unwrap()
+            .pending = Some((PendingKind::DeletePlaylist, rx));
+        tx.send(LibraryOutcome::Failed {
+            message: "Плейлист 16 — встроенный, его нельзя изменять".to_owned(),
+            hint: Some("Мастер-плейлист доступен только для чтения".to_owned()),
+        })
+        .unwrap();
+        app.drain_library();
+        assert!(app.library.is_some(), "backend failure must not kill the UI");
+        assert!(app.library.as_ref().unwrap().pending.is_none());
+        let error = app.error.expect("backend failure must be shown");
+        assert!(error.message.contains("встроенный"));
+        assert!(error.hint.is_some());
+    }
+
+    #[test]
+    fn disconnected_worker_drops_library_and_explains() {
+        let (mut app, _dir) = app_with_open_library();
+        let (tx, rx) = channel();
+        app.library
+            .as_mut()
+            .unwrap()
+            .pending = Some((PendingKind::Refresh, rx));
+        drop(tx); // worker died mid-operation
+        app.drain_library();
+        assert!(app.library.is_none());
+        let error = app.error.expect("dead worker must be reported");
+        assert!(error.message.contains("завершился"));
+    }
+
+    #[test]
+    fn closed_outcome_drops_library() {
+        let (mut app, _dir) = app_with_open_library();
+        let (tx, rx) = channel();
+        app.library
+            .as_mut()
+            .unwrap()
+            .pending = Some((PendingKind::Refresh, rx));
+        tx.send(LibraryOutcome::Closed).unwrap();
+        app.drain_library();
+        assert!(app.library.is_none());
+    }
+
+    #[test]
+    fn ejected_error_keeps_connected_and_hints_reconnect() {
+        let (mut app, _dir) = app_with_open_library();
+        // spawn_eject takes the library before starting the sequence;
+        // simulate that here.
+        app.library = None;
+        let (tx, rx) = channel();
+        tx.send(DeviceEvent::Ejected(Err("unmount failed".to_owned()))).unwrap();
+        app.rx = Some(rx);
+        app.drain_events();
+        assert!(app.connected.is_some(), "failed eject keeps the device");
+        let error = app.error.expect("eject failure must be shown");
+        assert!(error.hint.is_some());
+        assert!(error.hint.unwrap().contains("заново"));
+    }
+
+    // ---- busy-worker refusal and menu gate (F2) ----
+
+    #[test]
+    fn busy_worker_rejects_new_request_visibly() {
+        let (mut app, _dir) = app_with_open_library();
+        let (_tx, rx) = channel();
+        app.library.as_mut().unwrap().pending = Some((PendingKind::Refresh, rx));
+        // A request while the worker is busy must be refused visibly,
+        // not dropped silently: the user's action deserves an answer.
+        app.library_request(
+            LibraryCommand::CreatePlaylist {
+                name: "Mix".to_owned(),
+            },
+            PendingKind::CreatePlaylist,
+            "Создаю плейлист…",
+        );
+        let error = app
+            .error
+            .expect("busy refusal must be visible to the user");
+        assert!(
+            error.message.contains("Дождитесь завершения"),
+            "got: {}",
+            error.message
+        );
+        // The in-flight operation is untouched.
+        let library = app.library.as_ref().unwrap();
+        assert!(matches!(library.pending, Some((PendingKind::Refresh, _))));
+        assert!(
+            !app.status.contains("Создаю плейлист"),
+            "status must not announce the rejected request"
+        );
+    }
+
+    #[test]
+    fn context_menu_gate_tracks_library_state() {
+        let (mut app, _dir) = app_with_open_library();
+        assert!(context_menu_allowed(&app), "idle app opens context menus");
+        let (_tx, rx) = channel();
+        app.library.as_mut().unwrap().pending = Some((PendingKind::Refresh, rx));
+        assert!(
+            !context_menu_allowed(&app),
+            "pending operation must gate context menus"
+        );
+        // The initial open counts as busy too.
+        let (_tx2, rx2) = channel();
+        let library = app.library.as_mut().unwrap();
+        library.pending = None;
+        library.opening = Some(rx2);
+        assert!(
+            !context_menu_allowed(&app),
+            "library opening must gate context menus too"
+        );
+    }
+
+    // ---- close guard state machine (F4, headless) ----
+
+    #[test]
+    fn close_while_idle_closes_without_confirm() {
+        assert_eq!(
+            close_decision(true, false, false),
+            CloseDecision::Allow,
+            "idle window closes as usual"
+        );
+    }
+
+    #[test]
+    fn close_while_operation_active_blocks_and_asks() {
+        assert_eq!(
+            close_decision(true, true, false),
+            CloseDecision::BlockWithConfirm,
+            "mid-operation close must not kill the worker thread"
+        );
+    }
+
+    #[test]
+    fn confirmed_close_passes_through_even_while_busy() {
+        assert_eq!(
+            close_decision(true, true, true),
+            CloseDecision::Allow,
+            "the user already chose to close: no confirm loop"
+        );
+    }
+
+    #[test]
+    fn no_close_request_is_a_noop() {
+        assert_eq!(close_decision(false, true, false), CloseDecision::Allow);
+        assert_eq!(close_decision(false, false, true), CloseDecision::Allow);
+    }
+
+    // ---- pure UI helpers ----
+
+    #[test]
+    fn duration_formats_minutes_seconds_and_unknown() {
+        assert_eq!(format_duration(0), "—");
+        assert_eq!(format_duration(1_000), "0:01");
+        assert_eq!(format_duration(123_456), "2:03");
+        assert_eq!(format_duration(3_600_000), "60:00");
+    }
+
+    #[test]
+    fn optional_text_renders_em_dash_for_missing_tags() {
+        assert_eq!(optional_text(&Some("X".to_owned())), "X");
+        assert_eq!(optional_text(&Some("   ".to_owned())), "—");
+        assert_eq!(optional_text(&None), "—");
     }
 }
