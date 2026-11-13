@@ -33,6 +33,19 @@ cargo build --release
 
 The `podlib` binary lands in `target/release/`.
 
+### Distro notes
+
+podlib needs only the Rust toolchain — SQLite is bundled, no system libraries required.
+
+| Distro | Command | Note |
+|---|---|---|
+| Arch | `pacman -S rust` | current enough |
+| Fedora | `dnf install rust cargo` | current enough |
+| Gentoo | `emerge --ask dev-lang/rust` | current enough |
+| Debian / Ubuntu | use [rustup](https://rustup.rs) | distro packages are often older than the required 1.88 |
+
+A GUI is planned for phase 4 and may add system dependencies (see the roadmap); packaging per distro will follow that.
+
 ## Usage
 
 ```sh
