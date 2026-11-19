@@ -731,10 +731,17 @@ impl<'device> EditSession<'device> {
             .iter()
             .map(|track| track.location.clone())
             .collect();
-        let removed_artwork_tracks = removed_tracks
-            .iter()
-            .filter(|track| track.has_artwork)
-            .count();
+        // NOTE(vendored patch): artwork flags without artwork storage (e.g.
+        // host-generation backups) are not reindexable — see the matching
+        // guard in removed_ithmb_targets.
+        let removed_artwork_tracks = if has_reindexable_artwork(self.device)? {
+            removed_tracks
+                .iter()
+                .filter(|track| track.has_artwork)
+                .count()
+        } else {
+            0
+        };
         let added_targets: Vec<IpodPath> = resolved
             .iter()
             .map(|addition| {
@@ -893,10 +900,17 @@ impl<'device> EditSession<'device> {
             .iter()
             .map(|track| track.location.clone())
             .collect();
-        let removed_artwork_tracks = removed_tracks
-            .iter()
-            .filter(|track| track.has_artwork)
-            .count();
+        // NOTE(vendored patch): artwork flags without artwork storage (e.g.
+        // host-generation backups) are not reindexable — see the matching
+        // guard in removed_ithmb_targets.
+        let removed_artwork_tracks = if has_reindexable_artwork(self.device)? {
+            removed_tracks
+                .iter()
+                .filter(|track| track.has_artwork)
+                .count()
+        } else {
+            0
+        };
         let added_targets: Vec<IpodPath> = resolved
             .iter()
             .map(|addition| {
@@ -1600,6 +1614,15 @@ fn removed_ithmb_targets(
     if !has_artwork {
         return Ok(Vec::new());
     }
+    // NOTE(vendored patch): mirror the `write_artwork_preview` guard — an
+    // initialized device (or a host-generation backup, which skips artwork
+    // binaries) can carry artwork flags without an ArtworkDB on disk. With
+    // no artwork storage there is nothing to reindex, so removals must not
+    // schedule `.ithmb` rewrites; `removed_artwork_tracks` is gated on the
+    // same predicate so install validation stays consistent.
+    if !has_reindexable_artwork(device)? {
+        return Ok(Vec::new());
+    }
     let profile = device.profile().ok_or_else(|| Error::Unsupported {
         feature: "artwork reindex",
         reason: "the device profile is unknown".to_owned(),
@@ -1612,6 +1635,14 @@ fn removed_ithmb_targets(
         .into_keys()
         .map(|name| IpodPath::new(format!("iPod_Control/Artwork/{name}")))
         .collect()
+}
+
+/// Whether the device carries reindexable artwork storage. Removals only
+/// schedule artwork rewrites when an `ArtworkDB` exists to rewrite.
+fn has_reindexable_artwork(device: &Device) -> Result<bool> {
+    device
+        .mount()
+        .contains(&IpodPath::new("iPod_Control/Artwork/ArtworkDB")?)
 }
 
 fn added_ithmb_targets(resolved: &[ResolvedAddition]) -> Result<Vec<IpodPath>> {
@@ -2526,6 +2557,8 @@ include!("tests.rs");
 mod classic_tests;
 #[cfg(test)]
 mod fast_tests;
+#[cfg(test)]
+mod fixture_tests;
 #[cfg(test)]
 mod recovery_progress_tests;
 #[cfg(test)]

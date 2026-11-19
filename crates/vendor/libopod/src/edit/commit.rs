@@ -498,7 +498,27 @@ fn install_inner(
     }
     progress(ProgressEvent::Phase("Reading back installed library"));
     let reopened = Device::open_during_transaction(device.mount().as_path())?;
-    if reopened.library().map_or(0, crate::Library::track_count) != staged.remaining_tracks() {
+    // NOTE(vendored patch): like-for-like read-back. Round 5.6 widened the
+    // staged-DB reparse (`remaining_tracks`) to include audiobooks, but the
+    // public read path keeps media_kind=8 items hidden, so the two counters
+    // differ by construction on book-carrying SQLite libraries. Count the
+    // installed database through the same verification query instead.
+    let is_sqlite_device = device.profile().is_some_and(|profile| {
+        profile.capabilities().backend == crate::BackendKind::SqliteWithBinaryCompanion
+    });
+    let installed_tracks = if is_sqlite_device {
+        let library = device.mount().resolve_existing(&IpodPath::new(
+            "iPod_Control/iTunes/iTunes Library.itlp/Library.itdb",
+        )?)?;
+        let locations = device.mount().resolve_existing(&IpodPath::new(
+            "iPod_Control/iTunes/iTunes Library.itlp/Locations.itdb",
+        )?)?;
+        crate::Library::read_sqlite_for_verification(&library, &locations)
+            .map_or(0, |library| library.track_count())
+    } else {
+        reopened.library().map_or(0, crate::Library::track_count)
+    };
+    if installed_tracks != staged.remaining_tracks() {
         return Err(Error::Verification {
             format: "device transaction",
             reason: "installed library track count failed read-back validation".to_owned(),
