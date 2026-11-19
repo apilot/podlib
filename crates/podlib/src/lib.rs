@@ -14,7 +14,8 @@ pub mod open;
 
 pub use backend::{BackendError, ItunesdbBackend, LibopodBackend, LibraryBackend};
 pub use domain::{
-    DomainError, Playlist, PlaylistDraft, PlaylistId, Track, TrackChanges, TrackDraft, TrackId,
+    assign_album_track_numbers, DomainError, Playlist, PlaylistDraft, PlaylistId, Track,
+    TrackChanges, TrackDraft, TrackId,
 };
 pub use fixture::{build_nano2g_fixture, FixturePlaylist, FixtureTrack};
 pub use open::{open_library, OpenError};

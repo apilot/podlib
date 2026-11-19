@@ -69,7 +69,6 @@ struct DeviceEntry {
 
 /// Device currently connected through the GUI.
 struct ConnectedDevice {
-    mount: PathBuf,
     block_dev: PathBuf,
     /// Hardware label from sysfs (e.g. «Apple iPod»), frozen at connect
     /// time so the app bar stays stable even if the scan list changes.
@@ -391,7 +390,6 @@ impl PodlibApp {
                     })
                     .unwrap_or_else(|| (Default::default(), "устройство".to_owned()));
                 self.connected = Some(ConnectedDevice {
-                    mount: mount.clone(),
                     block_dev,
                     label,
                 });
@@ -767,24 +765,14 @@ impl PodlibApp {
         let Some(connected) = self.connected.as_ref() else {
             return;
         };
-        // Round 5.3: sync → unmount (draining stacked mounts of the
-        // same devnode, up to five repeats while /proc/mounts still
-        // lists the source) → power off the whole disk.
-        let steps = {
-            let mut steps = vec![device::CommandSpec::new("sync", &[])];
-            steps.extend(
-                device::build_unmount_sequence(
-                    &connected.mount,
-                    &connected.block_dev,
-                    Path::new("/sys/dev/block"),
-                )
-                .into_iter()
-                .skip(1), // drop the sequence's own leading sync — the explicit sync above already flushed
-            );
-            steps.push(device::CommandSpec::new("sync", &[]));
-            steps
-        };
-        let block_dev = connected.block_dev.display().to_string();
+        // Round 6.1: close library → sync → drain unmounts (one per
+        // stacked mount of the devnode, per the /proc/mounts snapshot)
+        // → power off the whole disk under sudo, strictly LAST.
+        let block_dev = connected.block_dev.clone();
+        // The power-off step runs under sudo -S (password over stdin,
+        // never argv); taken here so it is consumed and cleared like in
+        // the connect flow.
+        let password = std::mem::take(&mut self.password);
         // Take the library out: the backend must be closed (and joined)
         // before the unmount sequence, on the eject thread itself.
         let library = self.library.take();
@@ -805,19 +793,27 @@ impl PodlibApp {
             // otherwise the UI would silently stay busy forever.
             let result = run_worker_step(
                 || {
+                    // The mount snapshot decides the drain length: one
+                    // unmount per stacked layer. The old code unmounted
+                    // once, powered off, and only then tried to drain —
+                    // behind a `?` — so power-off died on «The drive is
+                    // in use» while sibling mounts were still alive.
+                    let mounts = std::fs::read_to_string("/proc/mounts")
+                        .map(|content| device::parse_proc_mounts(&content))
+                        .unwrap_or_default();
+                    let (steps, power_off) = device::build_shutdown_steps(
+                        &block_dev,
+                        Path::new("/sys/dev/block"),
+                        &mounts,
+                    );
                     device::run_sequence(&steps).map_err(|error| error.to_string())?;
-                    // Drain stacked mounts: the first unmount may leave
-                    // sibling mounts of the same devnode alive.
-                    for _ in 0..5 {
-                        let mounts = std::fs::read_to_string("/proc/mounts")
-                            .map(|content| device::parse_proc_mounts(&content))
-                            .unwrap_or_default();
-                        if !device::mounts_contain_source(&mounts, Path::new(&block_dev)) {
-                            break;
-                        }
-                        let _ = std::process::Command::new("udisksctl")
-                            .args(["unmount", "-b", &block_dev])
-                            .status();
+                    // Power-off under sudo, strictly after the drain.
+                    let output = device::run_sudo_command(&password, &power_off)
+                        .map_err(|error| error.to_string())?;
+                    drop(password);
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        return Err(format!("шаг power-off (udisksctl): {}", stderr.trim()));
                     }
                     Ok(())
                 },
@@ -896,6 +892,7 @@ impl PodlibApp {
                             .add_enabled(ready, egui::Button::new("Безопасно отключить"))
                             .clicked()
                         {
+                            self.password.clear();
                             self.confirm_eject = true;
                         }
                         // WHY a painted circle: there is no stock dot
@@ -1459,45 +1456,22 @@ impl PodlibApp {
         if !self.confirm_mount {
             return;
         }
-        let mut confirmed = false;
-        let response = egui::Modal::new(egui::Id::unique("confirm_mount")).show(ctx, |ui| {
-            ui.set_width(440.0);
-            ui.heading("Подключить устройство (запись)");
-            ui.add_space(4.0);
-            ui.label(
-                "Система монтирует том HFS+ только для чтения; для записи нужен \
-                 повторный mount с force.",
-            );
-            ui.label(
-                "Пароль sudo нужен, потому что монтирование — системное действие. \
-                 Пароль передаётся напрямую команде sudo и нигде не сохраняется.",
-            );
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label("Пароль sudo:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.password)
-                        .password(true)
-                        .desired_width(220.0),
-                );
-            });
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui.button("Отмена").clicked() {
-                    ui.close();
-                }
-                let ready = !self.password.is_empty();
-                if ui.add_enabled(ready, egui::Button::new("Подключить")).clicked() {
-                    confirmed = true;
-                    ui.close();
-                }
-            });
-        });
-        if confirmed || response.should_close() {
-            self.confirm_mount = false;
-        }
-        if confirmed {
+        let decision = password_modal(
+            ctx,
+            "confirm_mount",
+            &mut self.password,
+            "Подключить устройство (запись)",
+            "Система монтирует том HFS+ только для чтения; для записи нужен \
+             повторный mount с force. Пароль sudo нужен, потому что \
+             монтирование — системное действие; он передаётся напрямую \
+             команде sudo и нигде не сохраняется.",
+            "Подключить",
+        );
+        if decision == PasswordModal::Confirmed {
             self.start_mount = true; // act after the frame (borrow rules)
+        }
+        if decision != PasswordModal::Open {
+            self.confirm_mount = false;
         }
     }
 
@@ -1505,29 +1479,24 @@ impl PodlibApp {
         if !self.confirm_eject {
             return;
         }
-        let mut confirmed = false;
-        let response = egui::Modal::new(egui::Id::unique("confirm_eject")).show(ctx, |ui| {
-            ui.set_width(400.0);
-            ui.heading("Безопасно отключить устройство?");
-            ui.add_space(4.0);
-            ui.label("Будут выполнены: закрытие библиотеки, sync, unmount, power-off.");
-            ui.label("Убедитесь, что операции записи завершены.");
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui.button("Отмена").clicked() {
-                    ui.close();
-                }
-                if ui.button("Отключить").clicked() {
-                    confirmed = true;
-                    ui.close();
-                }
-            });
-        });
-        if confirmed || response.should_close() {
-            self.confirm_eject = false;
-        }
-        if confirmed {
+        // Round 6.1: power-off runs under sudo, so disconnect asks for
+        // the same password as connect — one shared modal.
+        let decision = password_modal(
+            ctx,
+            "confirm_eject",
+            &mut self.password,
+            "Безопасно отключить устройство?",
+            "Будут выполнены: закрытие библиотеки, sync, unmount (с др\
+             ейном слоёв) и power-off под sudo. Убедитесь, что операции \
+             записи завершены. Пароль передаётся напрямую команде sudo и \
+             нигде не сохраняется.",
+            "Отключить",
+        );
+        if decision == PasswordModal::Confirmed {
             self.start_eject = true;
+        }
+        if decision != PasswordModal::Open {
+            self.confirm_eject = false;
         }
     }
 
@@ -3792,6 +3761,93 @@ fn draw_drop_overlay(ui: &egui::Ui, names: &[String]) {
     );
 }
 
+/// Outcome of one frame of the shared sudo-password modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PasswordModal {
+    /// Still open — keep showing it next frame.
+    Open,
+    /// The user confirmed (submit button, or Enter on a non-empty field).
+    Confirmed,
+    /// The user cancelled (Cancel button, Esc, backdrop click).
+    Cancelled,
+}
+
+/// Stable id of the shared modal's password field (the autofocus
+/// target), derived from the modal salt so each flow gets its own.
+fn password_field_id(id_salt: &str) -> egui::Id {
+    egui::Id::unique(id_salt).with("password_field")
+}
+
+/// Unified sudo-password modal (round 6.1) behind connect AND
+/// disconnect: the field takes focus whenever nothing else holds it
+/// (so it is focused the moment the modal opens — the search-box
+/// pattern), Enter submits a non-empty password, Esc and the backdrop
+/// click cancel, and the submit button stays disabled while the field
+/// is empty. The password never leaves the app: the caller consumes
+/// and clears it when the worker starts.
+fn password_modal(
+    ctx: &egui::Context,
+    id_salt: &str,
+    password: &mut String,
+    heading: &str,
+    body: &str,
+    submit_label: &str,
+) -> PasswordModal {
+    let field_id = password_field_id(id_salt);
+    let mut outcome = PasswordModal::Open;
+    let response = egui::Modal::new(egui::Id::unique(id_salt)).show(ctx, |ui| {
+        ui.set_width(440.0);
+        ui.heading(heading);
+        ui.add_space(4.0);
+        ui.label(body);
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("Пароль sudo:");
+            ui.add(
+                egui::TextEdit::singleline(password)
+                    .password(true)
+                    .desired_width(220.0)
+                    .id(field_id),
+            );
+            if ctx.memory(|memory| memory.focused().is_none()) {
+                ctx.memory_mut(|memory| memory.request_focus(field_id));
+            }
+            // Enter submits a non-empty password; an empty one keeps
+            // the modal open — the same rule as the disabled button.
+            // Checked at the input level (not via the field's
+            // lost_focus) so the shortcut works regardless of which
+            // widget egui considers focused inside the modal.
+            let submit_now =
+                ui.input(|input| input.key_pressed(egui::Key::Enter)) && !password.is_empty();
+            if submit_now {
+                outcome = PasswordModal::Confirmed;
+                ui.close();
+            }
+        });
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button("Отмена").clicked() {
+                outcome = PasswordModal::Cancelled;
+                ui.close();
+            }
+            let ready = !password.is_empty();
+            if ui
+                .add_enabled(ready, egui::Button::new(submit_label))
+                .clicked()
+            {
+                outcome = PasswordModal::Confirmed;
+                ui.close();
+            }
+        });
+    });
+    // Esc / backdrop close the modal without an in-closure decision —
+    // that is a cancellation too.
+    if response.should_close() && outcome == PasswordModal::Open {
+        outcome = PasswordModal::Cancelled;
+    }
+    outcome
+}
+
 /// Worker-thread body: run the sudo mount sequence (`mkdir -p`, then
 /// rw-mount) and report the mount point plus whether THIS run actually
 /// performed the mount (round 5.3: an already-mounted target is skipped
@@ -3834,7 +3890,7 @@ fn connect_device(
     }
     for spec in &steps {
         let output =
-            device::run_sudo_mount(&password, spec).map_err(|error| ConnectError::Mount {
+            device::run_sudo_command(&password, spec).map_err(|error| ConnectError::Mount {
                 stderr: String::new(),
                 error: MountError::Io(error),
             })?;
@@ -4919,10 +4975,33 @@ mod tests {
         let (mut app, _dir) = app_with_open_library();
         let dir = TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join("book")).unwrap();
-        let first = dir.path().join("book/01.mp3");
-        let second = dir.path().join("book/02.mp3");
-        std::fs::write(&first, b"x").unwrap();
-        std::fs::write(&second, b"x").unwrap();
+        // Round 6.1 B1: dispatched drafts must survive the duration
+        // probe, so the drop sources are real audio (ffmpeg AAC), not
+        // garbage bytes.
+        let mut sources = Vec::new();
+        for name in ["01", "02"] {
+            let path = dir.path().join(format!("book/{name}.m4a"));
+            let generated = std::process::Command::new("ffmpeg")
+                .args([
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:duration=0.2",
+                    "-c:a",
+                    "aac",
+                    &path.display().to_string(),
+                ])
+                .output()
+                .expect("run ffmpeg");
+            assert!(
+                generated.status.success(),
+                "fixture ffmpeg failed: {}",
+                String::from_utf8_lossy(&generated.stderr)
+            );
+            sources.push(path);
+        }
+        let first = sources[0].clone();
+        let second = sources[1].clone();
 
         // Frame 1: the directory drop.
         egui::__run_test_ui(|ui| {
@@ -5031,6 +5110,109 @@ mod tests {
         app.finish_tag_review_frame(false, true, false);
         assert!(app.tag_review.is_none(), "cancel drops the draft");
         assert!(app.error.is_none(), "cancel dispatches nothing");
+    }
+
+    // ---- round 6.1 F3: shared sudo-password modal ----
+
+    /// Runs one headless frame through both password modals (the same
+    /// order as the production `ui()`), feeding extra input events.
+    fn password_modal_frame(app: &mut PodlibApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            ui.style_mut().animation_time = 0.0;
+            app.maybe_mount_modal(&ui.ctx().clone());
+            app.maybe_eject_modal(&ui.ctx().clone());
+        });
+        output.textures_delta.clear();
+    }
+
+    fn enter_pressed() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::Enter,
+            pressed: true,
+            physical_key: None,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    fn escape_pressed() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::Escape,
+            pressed: true,
+            physical_key: None,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    #[test]
+    fn password_modal_autofocuses_the_field() {
+        let mut app = test_app();
+        app.confirm_mount = true;
+        let ctx = egui::Context::default();
+        password_modal_frame(&mut app, &ctx, Vec::new());
+        assert_eq!(
+            ctx.memory(|memory| memory.focused()),
+            Some(password_field_id("confirm_mount")),
+            "the password field must take focus the moment the modal opens"
+        );
+    }
+
+    #[test]
+    fn eject_modal_autofocuses_its_own_field() {
+        let mut app = test_app();
+        app.confirm_eject = true;
+        let ctx = egui::Context::default();
+        password_modal_frame(&mut app, &ctx, Vec::new());
+        assert_eq!(
+            ctx.memory(|memory| memory.focused()),
+            Some(password_field_id("confirm_eject")),
+            "each flow focuses its own field, not the other flow's"
+        );
+        assert!(!app.start_eject && app.confirm_eject, "still open");
+    }
+
+    #[test]
+    fn password_modal_enter_submits_non_empty_password() {
+        let mut app = test_app();
+        app.confirm_mount = true;
+        let ctx = egui::Context::default();
+        password_modal_frame(&mut app, &ctx, Vec::new()); // open + autofocus
+        app.password = "sudo-pass".to_owned();
+        password_modal_frame(&mut app, &ctx, vec![enter_pressed()]);
+        assert!(!app.confirm_mount, "modal must close on Enter");
+        assert!(app.start_mount, "Enter on a non-empty password confirms");
+    }
+
+    #[test]
+    fn password_modal_enter_on_empty_password_keeps_it_open() {
+        let mut app = test_app();
+        app.confirm_mount = true;
+        let ctx = egui::Context::default();
+        password_modal_frame(&mut app, &ctx, Vec::new());
+        password_modal_frame(&mut app, &ctx, vec![enter_pressed()]); // empty field
+        assert!(app.confirm_mount, "an empty password must not confirm");
+        assert!(!app.start_mount);
+    }
+
+    #[test]
+    fn password_modal_esc_cancels() {
+        let mut app = test_app();
+        app.confirm_eject = true;
+        app.password = "x".to_owned();
+        let ctx = egui::Context::default();
+        password_modal_frame(&mut app, &ctx, Vec::new());
+        password_modal_frame(&mut app, &ctx, vec![escape_pressed()]);
+        assert!(!app.confirm_eject, "Esc closes the modal");
+        assert!(!app.start_eject, "Esc does not start the eject");
     }
 
     #[test]

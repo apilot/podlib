@@ -462,3 +462,119 @@ fn staged_edits_preserve_artist_invariants() {
     assert!(added_media.is_file(), "added media missing");
 }
 
+#[test]
+fn removing_an_audiobook_end_to_end() {
+    // Round 5.7: audiobooks (media_kind 8) are invisible to the public
+    // read, and `remove_track` used to validate existence against that
+    // narrow list only — every GUI delete of an audiobook failed with
+    // TrackNotFound before any SQL ran. The session must accept pids
+    // from the wide verification read, and the full remove → stage →
+    // install pipeline must wipe the item row, the location rows and
+    // the media file for a record the CDB never knew.
+    let device_dir = copy_fixture();
+    let library = library_path(device_dir.path());
+    for index in 0..20 {
+        fs::create_dir_all(
+            device_dir
+                .path()
+                .join(format!("iPod_Control/Music/F{index:02}")),
+        )
+        .unwrap();
+    }
+
+    // Deterministic victim: first audiobook in stable pid order, with
+    // its Locations.itdb path (the fixture carries location rows for
+    // every item, books included).
+    let remove_pid: i64 = {
+        let con = read_only(&library);
+        con.query_row(
+            "SELECT pid FROM item WHERE media_kind = 8 ORDER BY pid LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    let remove_media: String = {
+        let locations = read_only(
+            &device_dir
+                .path()
+                .join("iPod_Control/iTunes/iTunes Library.itlp/Locations.itdb"),
+        );
+        locations
+            .query_row(
+                "SELECT location FROM location WHERE item_pid = ?",
+                [remove_pid],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let media_path = device_dir
+        .path()
+        .join("iPod_Control/Music")
+        .join(&remove_media);
+    fs::create_dir_all(media_path.parent().unwrap()).unwrap();
+    fs::write(&media_path, b"audiobook media bytes").unwrap();
+
+    let device = Device::open(device_dir.path()).unwrap();
+    assert_eq!(
+        device.library().unwrap().track_count(),
+        811,
+        "audiobooks stay outside the public read"
+    );
+
+    let mut edit = device.edit().unwrap();
+    edit.set_media_policy(MediaDeletionPolicy::Delete);
+    // THE regression: the pid is absent from the narrow read; the
+    // session-side wide set must accept it instead of TrackNotFound.
+    edit.remove_track(PersistentId::from_bits(remove_pid as u64))
+        .unwrap();
+
+    let bundle = tempdir().unwrap();
+    let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+    assert_eq!(staged.removed_tracks(), 1);
+    assert_eq!(
+        staged.remaining_tracks(),
+        844,
+        "845 wide items minus the removed book"
+    );
+
+    create_virtual_media_dirs(device_dir.path(), staged.added_media());
+    let reopened = staged
+        .install_and_open(&device, InstallMode::Full, |_| {})
+        .unwrap();
+    assert_eq!(
+        reopened.library().unwrap().track_count(),
+        811,
+        "public read unchanged by the hidden removal"
+    );
+
+    // Item row gone from the installed Library.itdb.
+    let con = read_only(&library);
+    let items_left: i64 = con
+        .query_row(
+            "SELECT COUNT(*) FROM item WHERE pid = ?",
+            [remove_pid],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(items_left, 0, "audiobook item row still present");
+    drop(con);
+    // Location rows gone from the installed Locations.itdb.
+    let locations_left: i64 = {
+        let locations = read_only(
+            &device_dir
+                .path()
+                .join("iPod_Control/iTunes/iTunes Library.itlp/Locations.itdb"),
+        );
+        locations
+            .query_row(
+                "SELECT COUNT(*) FROM location WHERE item_pid = ?",
+                [remove_pid],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(locations_left, 0, "audiobook location rows still present");
+    assert!(!media_path.exists(), "removed media not deleted");
+}
+

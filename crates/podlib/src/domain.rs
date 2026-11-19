@@ -91,6 +91,10 @@ pub struct TrackDraft {
     pub genre: Option<String>,
     pub duration_ms: u32,
     pub track_number: u32,
+    /// Total tracks in the draft's album (0 = unknown). Filled for
+    /// batch adds whose drafts resolve to one device album — see
+    /// [`assign_album_track_numbers`] — so the iPod shows «1 из N».
+    pub track_count: u32,
     pub disc_number: u32,
     /// Raw iTunesDB media-kind bits (1 = song, 4 = podcast, 8 =
     /// audiobook; u32, not a backend enum — the domain stays backend
@@ -116,6 +120,7 @@ impl TrackDraft {
             genre: None,
             duration_ms: 0,
             track_number: 0,
+            track_count: 0,
             disc_number: 0,
             media_kind_bits: 1,
         })
@@ -127,6 +132,38 @@ impl TrackDraft {
     pub fn with_media_kind_bits(mut self, bits: u32) -> Self {
         self.media_kind_bits = bits;
         self
+    }
+}
+
+/// Fills `track_number`/`track_count` across a batch of drafts (round
+/// 6.1 B2): drafts that resolve to the SAME device album form one book
+/// and get a 1-based position plus the group size — otherwise the
+/// device shows bare track numbers and loses «глава 1 из 2». The
+/// grouping mirrors the backend album resolution: album name (absent
+/// collapses to the shared empty-name album) + album artist (falling
+/// back to artist, absent → empty). Groups of one stay untouched
+/// (0 = unknown). Order within a group is the batch order.
+pub fn assign_album_track_numbers(drafts: &mut [TrackDraft]) {
+    use std::collections::HashMap;
+    let mut groups: HashMap<(String, String), Vec<usize>> = HashMap::new();
+    for (index, draft) in drafts.iter().enumerate() {
+        let album = draft.album.clone().unwrap_or_default();
+        let album_artist = draft
+            .album_artist
+            .clone()
+            .or_else(|| draft.artist.clone())
+            .unwrap_or_default();
+        groups.entry((album, album_artist)).or_default().push(index);
+    }
+    for members in groups.into_values() {
+        if members.len() < 2 {
+            continue; // a single-track album carries no numbering
+        }
+        let count = members.len() as u32;
+        for (position, index) in members.iter().enumerate() {
+            drafts[*index].track_number = position as u32 + 1;
+            drafts[*index].track_count = count;
+        }
     }
 }
 
@@ -244,11 +281,61 @@ mod tests {
         assert_eq!(draft.media_kind_bits, 1, "the setter is chainable, not in-place");
     }
 
+    // ---- round 6.1 B2: batch album numbering ----
+
+    fn album_draft(title: &str, album: Option<&str>, artist: Option<&str>) -> TrackDraft {
+        let mut draft =
+            TrackDraft::new(PathBuf::from(format!("/drop/{title}.mp3")), title).unwrap();
+        draft.album = album.map(str::to_owned);
+        draft.artist = artist.map(str::to_owned);
+        draft
+    }
+
+    #[test]
+    fn two_chapters_of_one_book_get_1_of_2_numbering() {
+        let mut drafts = vec![
+            album_draft("Глава 1", Some("Сказки"), Some("Пушкин")),
+            album_draft("Глава 2", Some("Сказки"), Some("Пушкин")),
+        ];
+        assign_album_track_numbers(&mut drafts);
+        assert_eq!((drafts[0].track_number, drafts[0].track_count), (1, 2));
+        assert_eq!((drafts[1].track_number, drafts[1].track_count), (2, 2));
+    }
+
+    #[test]
+    fn untagged_chapters_share_the_empty_album_and_get_numbered() {
+        // The backend resolves an absent album to the shared empty-name
+        // album, so same-artist untagged chapters ARE one device album
+        // and need the same numbering.
+        let mut drafts = vec![
+            album_draft("a-1", None, Some("Автор")),
+            album_draft("a-2", None, Some("Автор")),
+        ];
+        assign_album_track_numbers(&mut drafts);
+        assert_eq!((drafts[0].track_number, drafts[0].track_count), (1, 2));
+        assert_eq!((drafts[1].track_number, drafts[1].track_count), (2, 2));
+    }
+
+    #[test]
+    fn different_albums_and_singles_stay_at_zero() {
+        let mut drafts = vec![
+            album_draft("x", Some("Альбом А"), Some("Автор")),
+            album_draft("y", Some("Альбом Б"), Some("Автор")),
+            album_draft("solo", Some("Альбом А"), Some("Другой")),
+        ];
+        assign_album_track_numbers(&mut drafts);
+        assert!(
+            drafts
+                .iter()
+                .all(|draft| draft.track_number == 0 && draft.track_count == 0),
+            "groups of one and cross-album drafts must stay untouched"
+        );
+    }
+
     #[test]
     fn track_changes_detect_empty_set() {
         let changes = TrackChanges::default();
-        assert!(changes.is_empty());
-        assert!(changes.validate().is_ok());
+        assert!(changes.is_empty());        assert!(changes.validate().is_ok());
     }
 
     #[test]

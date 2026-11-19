@@ -174,6 +174,28 @@ enum PlaylistEdit {
     Delete,
 }
 
+/// NOTE(vendored patch) round 5.7: existence universe for
+/// `remove_track`. The public `device.library()` read drops audiobooks
+/// (`is_song = 0`, `media_kind = 8`), so a GUI delete of an audiobook
+/// answered TrackNotFound before any SQL ran. At session open the
+/// device databases are re-read with the same wide verification filter
+/// staging uses (`Library::read_sqlite_for_verification`, ITLP paths
+/// resolved exactly like `stage_sqlite`) and only the pids are kept.
+/// The device library cache stays untouched — the GUI keeps its
+/// filtered view and its own complement read.
+fn wide_track_pids(device: &Device) -> Result<BTreeSet<PersistentId>> {
+    let itlp = device.mount().resolve_existing(&IpodPath::new(ITLP_PATH)?)?;
+    let library = Library::read_sqlite_for_verification(
+        &itlp.join("Library.itdb"),
+        &itlp.join("Locations.itdb"),
+    )
+    .map_err(|source| Error::Unsupported {
+        feature: "edit sessions",
+        reason: format!("the wide library re-read failed: {source}"),
+    })?;
+    Ok(library.tracks().iter().map(|track| track.id).collect())
+}
+
 /// An in-memory set of requested library changes.
 ///
 /// Sessions never modify the opened mount. Staging writes only to a separate,
@@ -181,6 +203,15 @@ enum PlaylistEdit {
 #[derive(Debug)]
 pub struct EditSession<'device> {
     device: &'device Device,
+    /// NOTE(vendored patch) round 5.7: pids from the wide verification
+    /// re-read of the device databases (audiobooks included — the same
+    /// universe staging's `before` uses). `remove_track` validates
+    /// against the narrow `device.library()` view OR this set, so a GUI
+    /// delete of an audiobook resolves instead of answering
+    /// TrackNotFound. Empty for the Binary backend: its library read is
+    /// already complete. The device library cache stays untouched —
+    /// the GUI keeps its filtered view and its own complement read.
+    wide_pids: BTreeSet<PersistentId>,
     removals: BTreeSet<PersistentId>,
     additions: Vec<TrackToAdd>,
     playlist_edits: BTreeMap<PersistentId, PlaylistEdit>,
@@ -225,8 +256,14 @@ impl<'device> EditSession<'device> {
                 }
             }
         }
+        let wide_pids = match profile.capabilities().backend {
+            BackendKind::SqliteWithBinaryCompanion => wide_track_pids(device)?,
+            // The classic read already sees every track it can write.
+            BackendKind::Binary => BTreeSet::new(),
+        };
         Ok(Self {
             device,
+            wide_pids,
             removals: BTreeSet::new(),
             additions: Vec::new(),
             playlist_edits: BTreeMap::new(),
@@ -253,13 +290,15 @@ impl<'device> EditSession<'device> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::TrackNotFound`] when `id` is absent from the opened
-    /// music library.
+    /// Returns [`Error::TrackNotFound`] when `id` is absent from both
+    /// the opened music library and the wide (audiobook-inclusive)
+    /// re-read kept by the session.
     pub fn remove_track(&mut self, id: PersistentId) -> Result<bool> {
         let exists = self
             .device
             .library()
-            .is_some_and(|library| library.tracks().iter().any(|track| track.id == id));
+            .is_some_and(|library| library.tracks().iter().any(|track| track.id == id))
+            || self.wide_pids.contains(&id);
         if !exists {
             return Err(Error::TrackNotFound);
         }

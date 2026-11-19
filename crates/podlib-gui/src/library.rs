@@ -17,8 +17,8 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::JoinHandle;
 
 use podlib::{
-    BackendError, LibraryBackend, Playlist, PlaylistDraft, PlaylistId, Track, TrackChanges,
-    TrackDraft, TrackId,
+    assign_album_track_numbers, BackendError, LibraryBackend, Playlist, PlaylistDraft,
+    PlaylistId, Track, TrackChanges, TrackDraft, TrackId,
 };
 
 /// One command to the library worker; plain data, so it is `Send` even
@@ -358,11 +358,16 @@ fn dispatch(backend: &mut dyn LibraryBackend, command: LibraryCommand) -> Librar
 }
 
 /// Adds a batch of drafts; firmware-unplayable formats are transcoded
-/// first (round 5.2), and a success re-lists the library.
+/// first (round 5.2), passthrough drafts get their real duration
+/// probed (round 6.1 B1), and a success re-lists the library.
 fn add_tracks_command(
     backend: &mut dyn LibraryBackend,
     drafts: Vec<TrackDraft>,
 ) -> LibraryOutcome {
+    let mut drafts = drafts;
+    // Round 6.1 B2: drafts resolving to one device album (chapters of
+    // a book) get 1..N numbering and the shared count before writing.
+    assign_album_track_numbers(&mut drafts);
     let total = drafts.len();
     // Round 5.2: firmware-unplayable formats (flac/ogg/wav) are
     // transcoded to AAC in this worker thread; the batch tempdir
@@ -375,7 +380,7 @@ fn add_tracks_command(
     };
     let mut added = 0usize;
     let mut stopped = None;
-    let mut transcode_failures: Vec<String> = Vec::new();
+    let mut add_failures: Vec<String> = Vec::new();
     for (index, draft) in drafts.iter().enumerate() {
         let prepared;
         if needs_transcode(&path_extension(&draft.source_path)) {
@@ -385,19 +390,36 @@ fn add_tracks_command(
                     Err(reason) => {
                         // The batch continues: the failed file is
                         // reported honestly in the summary tail.
-                        transcode_failures
-                            .push(format!("«{}»: {reason}", draft.title));
+                        add_failures.push(format!("«{}»: {reason}", draft.title));
                         continue;
                     }
                 }
             } else {
                 // Unreachable while the batch tempdir owns the path, but
                 // the draft is skipped honestly instead of panicking.
-                transcode_failures
-                    .push(format!("«{}»: нет временной папки транскода", draft.title));
+                add_failures.push(format!("«{}»: нет временной папки транскода", draft.title));
                 continue;
             }
+        } else if draft.duration_ms == 0 {
+            // Round 6.1 B1: a passthrough file's duration comes from
+            // nowhere else — probe it here. The iPod refuses to play a
+            // track whose total_time_ms stayed 0 (the live mp3-book
+            // failure), so a failed probe skips the draft honestly
+            // instead of adding a silent zero.
+            match probe_duration_ms(&draft.source_path) {
+                Ok(duration_ms) => {
+                    let mut probed = draft.clone();
+                    probed.duration_ms = duration_ms;
+                    prepared = Some(probed);
+                }
+                Err(reason) => {
+                    add_failures.push(format!("«{}»: {reason}", draft.title));
+                    continue;
+                }
+            }
         } else {
+            // The caller already supplied a duration — trust it and
+            // skip the probe.
             prepared = None;
         }
         let target = prepared.as_ref().unwrap_or(draft);
@@ -409,20 +431,21 @@ fn add_tracks_command(
             }
         }
     }
-    let failures_tail = transcode_failures_summary(&transcode_failures);
+    let failures_tail = add_failures_summary(&add_failures);
     match stopped {
-        None if added == total && transcode_failures.is_empty() => {
+        None if added == total && add_failures.is_empty() => {
             finish(backend, added_tracks_summary(added))
         }
         // Honest partial success without a backend error: some
-        // drafts failed their transcode and were skipped.
+        // drafts failed their transcode or their duration probe
+        // and were skipped.
         None => {
             let mut summary =
                 format!("{} из {total}", added_tracks_summary(added));
             summary.push_str(&failures_tail);
             finish(backend, summary)
         }
-        Some(error) if added == 0 && transcode_failures.is_empty() => {
+        Some(error) if added == 0 && add_failures.is_empty() => {
             failure_outcome(error)
         }
         // Partial success: show honestly how far it got.
@@ -602,11 +625,13 @@ fn ffmpeg_transcode_args(source: &std::path::Path, target: &std::path::Path) -> 
 }
 
 /// Honest batch tail for transcoding failures, appended to the summary.
-fn transcode_failures_summary(failures: &[String]) -> String {
+/// The honest failures tail of an add summary: transcode or duration
+/// probe problems, one line per skipped draft.
+fn add_failures_summary(failures: &[String]) -> String {
     if failures.is_empty() {
         String::new()
     } else {
-        format!("; транскод не удался: {}", failures.join("; "))
+        format!("; добавление не удалось: {}", failures.join("; "))
     }
 }
 
@@ -736,6 +761,56 @@ fn transcode_draft(
     Ok(prepared)
 }
 
+/// ffprobe arguments for the duration probe: print only the container
+/// duration, as a bare float line («873.958000») on stdout.
+fn ffprobe_duration_args(path: &std::path::Path) -> Vec<String> {
+    vec![
+        "-v".to_owned(),
+        "error".to_owned(),
+        "-show_entries".to_owned(),
+        "format=duration".to_owned(),
+        "-of".to_owned(),
+        "default=noprint_wrappers=1:nokey=1".to_owned(),
+        path.display().to_string(),
+    ]
+}
+
+/// Probes the real duration of a media file with `ffprobe` — the same
+/// CLI pattern as the ffmpeg transcode step (round 6.1 B1: passthrough
+/// drafts have no other source for `duration_ms`, and the iPod refuses
+/// to play a track whose total_time_ms stayed 0). Returns milliseconds;
+/// an honest one-line reason on failure: a missing binary, a non-zero
+/// exit, or output that is not a positive duration. `program` is
+/// injectable so tests can exercise the missing-binary path.
+fn probe_duration_ms_with(program: &str, path: &std::path::Path) -> Result<u32, String> {
+    let output = std::process::Command::new(program)
+        .args(ffprobe_duration_args(path))
+        .output()
+        .map_err(|_| format!("{program} не найден"))?;
+    if !output.status.success() {
+        let reason = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .next()
+            .unwrap_or("без вывода ffprobe")
+            .to_owned();
+        return Err(format!("ffprobe: {reason}"));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let seconds: f64 = stdout
+        .trim()
+        .parse()
+        .map_err(|_| format!("ffprobe: нечисловой вывод «{}»", stdout.trim()))?;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err(format!("ffprobe: бессмысленная длительность {seconds}"));
+    }
+    Ok((seconds * 1000.0).round() as u32)
+}
+
+/// Probes the duration with the real ffprobe.
+fn probe_duration_ms(path: &std::path::Path) -> Result<u32, String> {
+    probe_duration_ms_with("ffprobe", path)
+}
+
 /// Payload dragged from the track table: the ids of the dragged rows. A
 /// `Vec` (one id today) so multi-row drag needs no payload type change.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -842,7 +917,9 @@ mod tests {
 
     use super::*;
 
-    const TIMEOUT: Duration = Duration::from_secs(5);
+    // 30s: the ceiling only matters under heavy parallel load (the suite
+    // spawns real ffmpeg fixtures); workers normally reply in milliseconds.
+    const TIMEOUT: Duration = Duration::from_secs(30);
 
     fn fixture_track(title: &str) -> FixtureTrack {
         FixtureTrack {
@@ -933,6 +1010,32 @@ mod tests {
     fn write_file(dir: &Path, name: &str) -> PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, b"x").unwrap();
+        path
+    }
+
+    /// Real probeable passthrough audio (AAC in an .m4a container)
+    /// generated by the installed ffmpeg. Round 6.1 B1: garbage bytes
+    /// no longer reach `add_track` — the duration probe rejects them —
+    /// so add-flow tests need genuine media files.
+    fn real_passthrough_file(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(format!("{name}.m4a"));
+        let generated = std::process::Command::new("ffmpeg")
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=0.2",
+                "-c:a",
+                "aac",
+                &path.display().to_string(),
+            ])
+            .output()
+            .expect("run ffmpeg");
+        assert!(
+            generated.status.success(),
+            "fixture ffmpeg failed: {}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
         path
     }
 
@@ -1113,15 +1216,15 @@ mod tests {
     }
 
     #[test]
-    fn transcode_failures_summary_appends_an_honest_tail() {
-        assert_eq!(transcode_failures_summary(&[]), "");
+    fn add_failures_summary_appends_an_honest_tail() {
+        assert_eq!(add_failures_summary(&[]), "");
         assert_eq!(
-            transcode_failures_summary(&["«Книга»: ffmpeg не найден".to_owned()]),
-            "; транскод не удался: «Книга»: ffmpeg не найден"
+            add_failures_summary(&["«Книга»: ffmpeg не найден".to_owned()]),
+            "; добавление не удалось: «Книга»: ffmpeg не найден"
         );
         assert_eq!(
-            transcode_failures_summary(&["a".to_owned(), "b".to_owned()]),
-            "; транскод не удался: a; b"
+            add_failures_summary(&["a".to_owned(), "b".to_owned()]),
+            "; добавление не удалось: a; b"
         );
     }
 
@@ -1175,6 +1278,189 @@ mod tests {
         std::fs::write(&draft.source_path, b"not audio at all").unwrap();
         let error = transcode_draft(&draft, dir.path(), 0).unwrap_err();
         assert!(error.contains("ffmpeg"), "got: {error}");
+    }
+
+    // ---- round 6.1 B1: passthrough duration probe ----
+
+    #[test]
+    fn ffprobe_duration_args_are_exact() {
+        let args = ffprobe_duration_args(Path::new("/media/book/ch.mp3"));
+        assert_eq!(
+            args,
+            vec![
+                "-v".to_owned(),
+                "error".to_owned(),
+                "-show_entries".to_owned(),
+                "format=duration".to_owned(),
+                "-of".to_owned(),
+                "default=noprint_wrappers=1:nokey=1".to_owned(),
+                "/media/book/ch.mp3".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn probe_reports_a_missing_tool_with_clear_text() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("chapter.mp3");
+        std::fs::write(&source, b"not really audio").unwrap();
+        let error = probe_duration_ms_with("podlib-no-such-tool-xyz", &source).unwrap_err();
+        assert!(
+            error.contains("podlib-no-such-tool-xyz не найден"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn probe_parses_a_real_file_duration() {
+        // Minimal 8 kHz mono 16-bit PCM WAV, 1.0 s of silence: real
+        // bytes ffprobe can measure without ffmpeg.
+        let dir = TempDir::new().unwrap();
+        let data_size = 16_000u32;
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&36u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&8000u32.to_le_bytes());
+        wav.extend_from_slice(&16000u32.to_le_bytes()); // byte rate
+        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+        wav.extend_from_slice(&16u16.to_le_bytes()); // bits
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_size.to_le_bytes());
+        wav.extend(std::iter::repeat_n(0u8, data_size as usize));
+        let source = dir.path().join("chapter.wav");
+        std::fs::write(&source, &wav).unwrap();
+        let duration_ms = probe_duration_ms(&source).expect("real ffprobe");
+        assert!(
+            (950..=1050).contains(&duration_ms),
+            "1 s of PCM must probe to ~1000 ms, got {duration_ms}"
+        );
+    }
+
+    /// Mock backend recording every draft handed to `add_track` — lets
+    /// the B1/B2 passthrough branch be asserted end to end.
+    #[derive(Default)]
+    struct RecordingBackend {
+        added: Vec<TrackDraft>,
+    }
+
+    impl LibraryBackend for RecordingBackend {
+        fn tracks(&self) -> Result<Vec<Track>, BackendError> {
+            Ok(Vec::new())
+        }
+
+        fn playlists(&self) -> Result<Vec<Playlist>, BackendError> {
+            Ok(Vec::new())
+        }
+
+        fn add_track(&mut self, draft: &TrackDraft) -> Result<TrackId, BackendError> {
+            self.added.push(draft.clone());
+            Ok(TrackId::from_bits(self.added.len() as u64))
+        }
+
+        fn remove_track(&mut self, _id: TrackId, _purge_media: bool) -> Result<bool, BackendError> {
+            Ok(true)
+        }
+
+        fn edit_track(
+            &mut self,
+            id: TrackId,
+            _changes: &TrackChanges,
+        ) -> Result<Track, BackendError> {
+            Err(BackendError::TrackNotFound(id))
+        }
+
+        fn create_playlist(&mut self, _draft: &PlaylistDraft) -> Result<PlaylistId, BackendError> {
+            Err(BackendError::PlaylistNotFound(PlaylistId::from_bits(0)))
+        }
+
+        fn delete_playlist(&mut self, _id: PlaylistId) -> Result<bool, BackendError> {
+            Ok(false)
+        }
+
+        fn add_to_playlist(
+            &mut self,
+            _playlist: PlaylistId,
+            _track_ids: &[TrackId],
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn remove_from_playlist(
+            &mut self,
+            _playlist: PlaylistId,
+            _track_ids: &[TrackId],
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    /// End-to-end passthrough: two m4a chapters (real files generated
+    /// by the installed ffmpeg) must reach the backend with a probed
+    /// duration AND 1/2 album numbering (B1+B2 together).
+    #[test]
+    fn add_tracks_probes_passthrough_duration_and_numbers_album_chapters() {
+        let dir = TempDir::new().unwrap();
+        let mut drafts = Vec::new();
+        for name in ["Глава 1", "Глава 2"] {
+            let source = dir.path().join(format!("{name}.m4a"));
+            let generated = std::process::Command::new("ffmpeg")
+                .args([
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:duration=0.5",
+                    "-c:a",
+                    "aac",
+                    &source.display().to_string(),
+                ])
+                .output()
+                .expect("run ffmpeg");
+            assert!(
+                generated.status.success(),
+                "fixture ffmpeg failed: {}",
+                String::from_utf8_lossy(&generated.stderr)
+            );
+            drafts.push(TrackDraft::new(source, name).unwrap());
+        }
+        let mut backend = RecordingBackend::default();
+        let outcome = add_tracks_command(&mut backend, drafts);
+        assert!(
+            matches!(outcome, LibraryOutcome::Applied { .. }),
+            "both chapters must add cleanly"
+        );
+        assert_eq!(backend.added.len(), 2);
+        for draft in &backend.added {
+            assert!(draft.duration_ms > 0, "B1: probed duration must be filled");
+            assert_eq!(draft.track_count, 2, "B2: chapters share one album");
+        }
+        assert_eq!(backend.added[0].track_number, 1);
+        assert_eq!(backend.added[1].track_number, 2);
+    }
+
+    #[test]
+    fn add_tracks_reports_probe_failure_instead_of_silent_zero() {
+        // A .mp3 that is not audio: the probe fails honestly, the draft
+        // never reaches the backend, and the summary carries the reason
+        // — no silent total_time_ms = 0 on the device.
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("мусор.mp3");
+        std::fs::write(&source, b"definitely not audio").unwrap();
+        let mut backend = RecordingBackend::default();
+        let outcome =
+            add_tracks_command(&mut backend, vec![TrackDraft::new(source, "Глава").unwrap()]);
+        match outcome {
+            LibraryOutcome::Applied { summary, .. } => {
+                assert!(summary.contains("0 треков из 1"), "got: {summary}");
+                assert!(summary.contains("ffprobe"), "got: {summary}");
+            }
+            other => panic!("expected an honest Applied tail, got {other:?}"),
+        }
+        assert!(backend.added.is_empty(), "the failed draft must be skipped");
     }
 
     #[test]
@@ -1321,8 +1607,8 @@ mod tests {
         let (worker, _snapshot) = opened_worker(dir.path());
         let host = TempDir::new().unwrap();
         let paths = vec![
-            write_file(host.path(), "One.mp3"),
-            write_file(host.path(), "Two.mp3"),
+            real_passthrough_file(host.path(), "One"),
+            real_passthrough_file(host.path(), "Two"),
         ];
         let (drafts, skipped) = drafts_from_paths(&paths);
         assert!(skipped.is_empty());
@@ -1338,8 +1624,9 @@ mod tests {
         let (worker, _snapshot) = opened_worker(dir.path());
         let host = TempDir::new().unwrap();
         let paths = vec![
-            write_file(host.path(), "Good.mp3"),
-            // Second source does not exist: the backend fails copying it.
+            real_passthrough_file(host.path(), "Good"),
+            // Second source does not exist: the B1 probe fails on it,
+            // and the draft is skipped with an honest failure line.
             dir.path().join("nope.mp3"),
         ];
         let (drafts, _) = drafts_from_paths(&paths);
@@ -1575,9 +1862,12 @@ mod tests {
         let (worker, _opened) =
             LibraryWorker::spawn_with_backend(|| Box::new(PanickingBackend));
         // A real mutation (non-empty drafts), so the backend actually
-        // panics inside `add_track`; the worker must still answer.
-        let draft =
+        // panics inside `add_track`; the worker must still answer. The
+        // draft carries its own duration, so the B1 probe (which would
+        // reject the nonexistent source first) is skipped.
+        let mut draft =
             TrackDraft::new(PathBuf::from("/tmp/nope.mp3"), "X").expect("draft must be valid");
+        draft.duration_ms = 60_000;
         let rx = worker
             .request(LibraryCommand::AddTracks(vec![draft]))
             .expect("worker must accept commands before the panic");

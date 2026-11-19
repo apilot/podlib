@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 /// An inert command: program + args as plain strings. Built by the pure
-/// constructors ([`build_mount_command`], [`build_unmount_sequence`]) so
+/// constructors ([`build_mount_command`], [`build_shutdown_steps`]) so
 /// tests can assert exact command lines without executing anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
@@ -275,11 +275,16 @@ pub fn decide_mount(mounts: &[(String, String)], source: &Path, target: &Path) -
     MountDecision::Free
 }
 
-/// True while any mount of `source` still exists (the eject loop drains
-/// stacked mounts until this goes false, at most a few repeats).
-pub fn mounts_contain_source(mounts: &[(String, String)], source: &Path) -> bool {
+/// How many mounts of `source` the parsed `/proc/mounts` snapshot
+/// carries: each stacked layer needs its own unmount during the eject
+/// drain (the live incident had seven layers on one mount point, where
+/// a single unmount removed exactly one layer).
+pub fn count_mounts_with_source(mounts: &[(String, String)], source: &Path) -> usize {
     let source = source.display().to_string();
-    mounts.iter().any(|(mounted_source, _)| *mounted_source == source)
+    mounts
+        .iter()
+        .filter(|(mounted_source, _)| *mounted_source == source)
+        .count()
 }
 
 /// Full discovery, the «Обновить» button body: mounted iPod volumes plus
@@ -408,31 +413,43 @@ pub fn build_mount_sequence(spec: &MountSpec) -> Vec<CommandSpec> {
     ]
 }
 
-/// Safe-eject sequence from the runbook: flush buffers, unmount the
-/// volume, power off the whole USB disk (so the device firmware shows
-/// its eject screen). `udisksctl` needs no sudo for removable media owned
-/// by the active user. `_mount` is reserved for symmetry with the mount
-/// flow (udisksctl unmounts by device here). `sys_block_dir` is the
-/// injectable sysfs root used to resolve the whole-disk device — see
+/// Safe-eject shutdown plan (round 6.1): `sync` → one `unmount` per
+/// stacked mount of the volume → `power-off` LAST. The order is
+/// load-bearing: power-off with any mount still alive fails with
+/// «The drive is in use», which is exactly how the live eject died
+/// (the old drain ran after power-off, behind a `?`, unreachable).
+/// Returns the ordered steps (sync first) and the power-off step
+/// separately — it alone runs under sudo (see [`build_sudo_command`]),
+/// right after the steps, removing the need for a polkit agent.
+/// `mounts` is the parsed `/proc/mounts` snapshot; the drain is capped
+/// at [`EJECT_DRAIN_LIMIT`] layers. `sys_block_dir` is the injectable
+/// sysfs root used to resolve the whole-disk device — see
 /// [`parent_disk`].
-pub fn build_unmount_sequence(
-    _mount: &Path,
+pub fn build_shutdown_steps(
     block_dev: &Path,
     sys_block_dir: &Path,
-) -> Vec<CommandSpec> {
-    vec![
-        CommandSpec::new("sync", &[]),
+    mounts: &[(String, String)],
+) -> (Vec<CommandSpec>, CommandSpec) {
+    let layers = count_mounts_with_source(mounts, block_dev).min(EJECT_DRAIN_LIMIT);
+    let mut steps = vec![CommandSpec::new("sync", &[])];
+    steps.extend(std::iter::repeat_n(
         CommandSpec::new("udisksctl", &["unmount", "-b", &block_dev.display().to_string()]),
-        CommandSpec::new(
-            "udisksctl",
-            &[
-                "power-off",
-                "-b",
-                &parent_disk(block_dev, sys_block_dir).display().to_string(),
-            ],
-        ),
-    ]
+        layers,
+    ));
+    let power_off = CommandSpec::new(
+        "udisksctl",
+        &[
+            "power-off",
+            "-b",
+            &parent_disk(block_dev, sys_block_dir).display().to_string(),
+        ],
+    );
+    (steps, power_off)
 }
+
+/// Drain cap of the eject shutdown: stacked-mount layers are bounded so
+/// a runaway mount table cannot spin the unmount sequence forever.
+pub const EJECT_DRAIN_LIMIT: usize = 10;
 
 /// Wraps `spec` in `sudo -S -p ''`: the password is read from stdin and
 /// the prompt is empty, keeping stderr clean for error classification.
@@ -451,10 +468,12 @@ pub fn build_sudo_command(spec: &CommandSpec) -> Command {
     command
 }
 
-/// Runs the mount under sudo, feeding the password over the stdin pipe.
-/// The password lives only in the child's memory for the duration of the
-/// command; it is never logged, persisted, or placed in argv.
-pub fn run_sudo_mount(password: &str, spec: &CommandSpec) -> std::io::Result<Output> {
+/// Runs `spec` under sudo, feeding the password over the stdin pipe.
+/// Shared by the privileged system actions: the mount sequence and the
+/// eject power-off (round 6.1). The password lives only in the child's
+/// memory for the duration of the command; it is never logged,
+/// persisted, or placed in argv.
+pub fn run_sudo_command(password: &str, spec: &CommandSpec) -> std::io::Result<Output> {
     let mut child = build_sudo_command(spec).spawn()?;
     {
         // `build_sudo_command` always pipes stdin; `None` here would mean
@@ -809,14 +828,16 @@ mod tests {
     }
 
     #[test]
-    fn mounts_contain_source_tracks_the_eject_loop() {
+    fn count_mounts_with_source_counts_stacked_layers() {
         let mounts = vec![
             ("/dev/sda2".to_owned(), "/run/media/user/iPod".to_owned()),
             ("/dev/sda2".to_owned(), "/run/media/user/iPod1".to_owned()),
+            ("/dev/sdb1".to_owned(), "/run/media/user/other".to_owned()),
         ];
-        assert!(mounts_contain_source(&mounts, Path::new("/dev/sda2")));
-        assert!(!mounts_contain_source(&mounts, Path::new("/dev/sdb1")));
-        assert!(!mounts_contain_source(&[], Path::new("/dev/sda2")));
+        assert_eq!(count_mounts_with_source(&mounts, Path::new("/dev/sda2")), 2);
+        assert_eq!(count_mounts_with_source(&mounts, Path::new("/dev/sdb1")), 1);
+        assert_eq!(count_mounts_with_source(&[], Path::new("/dev/sda2")), 0);
+        assert_eq!(count_mounts_with_source(&mounts, Path::new("/dev/sda1")), 0);
     }
 
     #[test]
@@ -1012,22 +1033,62 @@ mod tests {
     }
 
     #[test]
-    fn unmount_sequence_is_sync_unmount_power_off() {
+    fn shutdown_steps_are_sync_drain_then_power_off_last() {
         let sys = TempDir::new().unwrap();
         let (dev, sys_block_dir) =
             fake_block_device(sys.path(), "../../devices/platform/usb/block/sda/sda2", true);
-        let steps = build_unmount_sequence(Path::new("/run/media/user/uuid"), &dev, &sys_block_dir);
-        assert_eq!(steps.len(), 3);
+        // The live incident: seven stacked mounts of the same devnode.
+        let mounts: Vec<(String, String)> = (0..7)
+            .map(|_| {
+                (
+                    dev.display().to_string(),
+                    "/run/media/user/uuid".to_owned(),
+                )
+            })
+            .collect();
+        let (steps, power_off) = build_shutdown_steps(&dev, &sys_block_dir, &mounts);
+        // Sync first, then ONE UNMOUNT PER STACKED LAYER (a single
+        // unmount removes a single layer — the live failure had seven).
+        assert_eq!(steps.len(), 1 + 7, "sync + one unmount per layer");
         assert_eq!(steps[0].program, "sync");
+        assert!(steps[1..].iter().all(|step| step.program == "udisksctl"
+            && step.args
+                == vec![
+                    "unmount".to_owned(),
+                    "-b".to_owned(),
+                    dev.display().to_string()
+                ]));
+        // Power-off targets the whole disk, not the partition, and comes
+        // back SEPARATELY: the caller runs it under sudo after the drain,
+        // so it is strictly the last step.
+        assert_eq!(power_off.program, "udisksctl");
         assert_eq!(
-            steps[1].args,
-            vec!["unmount".to_owned(), "-b".to_owned(), dev.display().to_string()]
-        );
-        // power-off targets the whole disk, not the partition.
-        assert_eq!(
-            steps[2].args,
+            power_off.args,
             vec!["power-off".to_owned(), "-b".to_owned(), "/dev/sda".to_owned()]
         );
+    }
+
+    #[test]
+    fn shutdown_drain_is_bounded_and_covers_an_empty_mount_table() {
+        let sys = TempDir::new().unwrap();
+        let (dev, sys_block_dir) =
+            fake_block_device(sys.path(), "../../devices/platform/usb/block/sda/sda2", true);
+        let mounts: Vec<(String, String)> = (0..EJECT_DRAIN_LIMIT * 2)
+            .map(|_| {
+                (
+                    dev.display().to_string(),
+                    "/run/media/user/uuid".to_owned(),
+                )
+            })
+            .collect();
+        let (steps, _) = build_shutdown_steps(&dev, &sys_block_dir, &mounts);
+        assert_eq!(steps.len(), 1 + EJECT_DRAIN_LIMIT, "drain cap holds");
+        // An unreadable/empty snapshot still yields the sync bookend and
+        // the final power-off (which then fails honestly if busy).
+        let (empty, power_off) = build_shutdown_steps(&dev, &sys_block_dir, &[]);
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0].program, "sync");
+        assert_eq!(power_off.program, "udisksctl");
     }
 
     #[test]

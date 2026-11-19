@@ -129,10 +129,13 @@ impl LibopodBackend {
     /// the GUI entirely. This read-only companion query fetches exactly
     /// that complement, with the raw media-kind bits the view filters
     /// need. Size stays 0 (it lives in Locations.itdb and is display-only
-    /// metadata); mutations on these records are refused before any
-    /// libopod call (see `reject_hidden_mutation`), so the missing
-    /// location never matters. An unreadable database yields an empty
-    /// list — the library still works without the enrichment.
+    /// metadata); hidden mutations are gated before any libopod call
+    /// (`reject_hidden_mutation`): audiobooks pass through (deletable
+    /// since round 5.7), other kinds are refused — so the missing
+    /// location only matters on the audiobook path, where libopod's
+    /// wide session-side re-read resolves it. An unreadable database
+    /// yields an empty list — the library still works without the
+    /// enrichment.
     fn hidden_items(&self) -> Vec<Track> {
         let path = self.mount.join(SQLITE_LIBRARY_PATH);
         let connection = match rusqlite::Connection::open_with_flags(
@@ -149,27 +152,54 @@ impl LibopodBackend {
         Ok(self.hidden_items().iter().map(|t| t.id.to_bits()).collect())
     }
 
-    /// Honest refusal for records libopod does not model (audiobooks,
-    /// video): `session.remove_track` would answer a generic
-    /// TrackNotFound and the UI would hint at a stale list. One precise
-    /// message instead, checked before any libopod call.
+    /// Raw media-kind bits of a hidden complement record, if `id` is
+    /// one. `None` covers both narrow-read tracks and unknown ids.
+    fn hidden_track_kind(&self, id: TrackId) -> Result<Option<u32>, BackendError> {
+        let bits = id.to_bits();
+        Ok(self
+            .hidden_items()
+            .iter()
+            .find(|track| track.id.to_bits() == bits)
+            .map(|track| track.media_kind))
+    }
+
+    /// Refusal gate for records the narrow read does not see. Hidden
+    /// audiobooks (media_kind 8) pass — since round 5.7 libopod's edit
+    /// session resolves their pids via the wide re-read, so deletion
+    /// flows through. Every other hidden kind (video, untested device
+    /// kinds) is refused before any libopod call with one precise
+    /// message: a generic TrackNotFound would hint at a stale list.
     fn reject_hidden_mutation(&self, id: TrackId) -> Result<(), BackendError> {
-        if !self.track_id_set()?.contains(&id.to_bits())
-            && self.hidden_track_ids()?.contains(&id.to_bits())
-        {
-            return Err(BackendError::Failure(
-                "Записи этого типа (аудиокниги, видео) нельзя удалять и изменять: \
-                 libopod не редактирует их"
-                    .to_owned(),
-            ));
+        if self.track_id_set()?.contains(&id.to_bits()) {
+            return Ok(());
         }
-        Ok(())
+        hidden_mutation_rejection(self.hidden_track_kind(id)?)
     }
 }
 
 fn optional(text: &str) -> Option<String> {
     let trimmed = text.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// Raw iTunesDB media-kind bits for audiobooks (see [`media_kind_bits`]).
+const AUDIOBOOK_MEDIA_KIND: u32 = 8;
+
+/// Decision core of [`LibopodBackend::reject_hidden_mutation`]:
+/// `media_kind` holds the raw bits of the hidden complement row
+/// (`None` = the id is not a hidden record at all → the known-set /
+/// libopod logic answers instead). Audiobooks pass; every other hidden
+/// kind is refused with the honest message — audiobooks ARE removable
+/// since round 5.7, so the old «аудиокниги» wording would lie.
+fn hidden_mutation_rejection(media_kind: Option<u32>) -> Result<(), BackendError> {
+    match media_kind {
+        None | Some(AUDIOBOOK_MEDIA_KIND) => Ok(()),
+        Some(_) => Err(BackendError::Failure(
+            "Записи этого типа (видео) нельзя удалять и изменять: \
+             libopod не редактирует их"
+                .to_owned(),
+        )),
+    }
 }
 
 fn map_track(track: &libopod::Track) -> Track {
@@ -335,7 +365,9 @@ fn track_to_add(draft: &TrackDraft) -> TrackToAdd {
         composer: None,
         year: 0,
         track_number: draft.track_number,
-        total_tracks: 0,
+        // Round 6.1 B2: the draft's album group size lands in the
+        // device's track_count column (0 = unknown, untouched drafts).
+        total_tracks: draft.track_count,
         disc_number: draft.disc_number,
         total_discs: 0,
         bitrate: 0,
@@ -423,7 +455,11 @@ impl LibraryBackend for LibopodBackend {
     fn remove_track(&mut self, id: TrackId, purge_media: bool) -> Result<bool, BackendError> {
         self.reject_hidden_mutation(id)?;
         let known = self.track_id_set()?;
-        if !known.contains(&id.to_bits()) {
+        // Round 5.7: a hidden audiobook is deletable even though the
+        // narrow read never lists it — libopod's session-side wide set
+        // (round 5.7) resolves the pid.
+        let hidden_audiobook = self.hidden_track_kind(id)? == Some(AUDIOBOOK_MEDIA_KIND);
+        if !known.contains(&id.to_bits()) && !hidden_audiobook {
             return Ok(false);
         }
         let stage_dir = Self::scratch_dir()?;
@@ -469,6 +505,7 @@ impl LibraryBackend for LibopodBackend {
             duration_ms: merged.duration_ms,
             media_kind_bits: merged.media_kind, // edits keep the kind
             track_number: merged.track_number,
+            track_count: 0, // the remove+re-add cycle loses the batch context
             disc_number: merged.disc_number,
         };
         let stage_dir = Self::scratch_dir()?;
@@ -605,6 +642,18 @@ mod tests {
         assert_eq!(optional("X"), Some("X".to_owned()));
     }
 
+    // ---- round 6.1 B2: draft album numbering reaches the device ----
+
+    #[test]
+    fn track_to_add_maps_draft_track_count_to_total_tracks() {
+        let mut draft = TrackDraft::new(PathBuf::from("/media/a.m4b"), "Глава 1").unwrap();
+        draft.track_number = 1;
+        draft.track_count = 2;
+        let addition = track_to_add(&draft);
+        assert_eq!(addition.track_number, 1);
+        assert_eq!(addition.total_tracks, 2, "the device must see «1 из 2»");
+    }
+
     // ---- master predicate (round 4.1 Ф1) ----
 
     #[test]
@@ -691,6 +740,49 @@ mod tests {
         assert_eq!(movie.media_kind, 2);
         assert_eq!(movie.duration_ms, 6000, "plain INTEGER cell");
         assert_eq!(movie.size_bytes, 0, "size lives in Locations.itdb");
+    }
+
+    #[test]
+    fn hidden_mutation_gate_passes_audiobooks_and_blocks_other_hidden_kinds() {
+        // Round 5.7 matrix over the same untyped schema as the
+        // enrichment test: a hidden audiobook (media_kind 8) must NOT
+        // be refused anymore — its removal flows into libopod's wide
+        // existence check — while other hidden kinds (video, kind 2)
+        // keep the honest refusal, now without blaming audiobooks.
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE item (pid, title, album, artist, album_artist, \
+                 total_time_ms, track_number, disc_number, artwork_status, \
+                 artwork_cache_id, media_kind, is_song, is_podcast);
+                 INSERT INTO item VALUES (-42, 'Часть 3', 'Сказки', 'Народ', '', \
+                   123.5, 1.0, 2.9, 1, 0, 8, 0, 0);
+                 INSERT INTO item VALUES (7, 'Фильм', 'Кино', 'Режиссёр', '', \
+                   6000, 2, 1, 0, 5, 2, 0, 0);",
+            )
+            .unwrap();
+        let hidden = hidden_items_from(&connection);
+        let kind_of = |bits: u64| {
+            hidden
+                .iter()
+                .find(|track| track.id.to_bits() == bits)
+                .map(|track| track.media_kind)
+        };
+        let audiobook = u64::from_ne_bytes((-42i64).to_ne_bytes());
+        let movie = 7u64;
+
+        // media_kind 8: no refusal — deletable via libopod (round 5.7).
+        assert!(hidden_mutation_rejection(kind_of(audiobook)).is_ok());
+        // media_kind 2 (video): refused, message honest about audiobooks.
+        let error = hidden_mutation_rejection(kind_of(movie)).unwrap_err();
+        let BackendError::Failure(text) = error else {
+            panic!("expected BackendError::Failure, got {error:?}");
+        };
+        assert!(text.contains("видео"), "message: {text}");
+        assert!(!text.contains("аудиокниги"), "message: {text}");
+        // Not a hidden record at all: the gate passes; the known-set
+        // logic answers (remove → Ok(false), edit → TrackNotFound).
+        assert!(hidden_mutation_rejection(None).is_ok());
     }
 
     #[test]
