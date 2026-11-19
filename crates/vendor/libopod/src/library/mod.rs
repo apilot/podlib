@@ -30,6 +30,8 @@ pub enum MediaKind {
     Song,
     /// A podcast episode, hidden from the normal Songs view.
     Podcast,
+    /// An audiobook, hidden from the normal Songs view.
+    Audiobook,
 }
 
 impl MediaKind {
@@ -37,12 +39,20 @@ impl MediaKind {
         match self {
             Self::Song => 1,
             Self::Podcast => 4,
+            Self::Audiobook => 8,
         }
     }
 
     pub(crate) const fn from_disk(value: i64, podcast: bool) -> Self {
-        if value == 4 || podcast {
+        if podcast || value == 4 {
             Self::Podcast
+        } else if value == 8 {
+            // NOTE(vendored patch): upstream only knows Song/Podcast here.
+            // Audiobook rows are written back by audiobook additions
+            // (is_song=0), and the staged-edit verification re-reads the
+            // library through this path, so the kind must round-trip —
+            // any upstream change to this mapping will conflict.
+            Self::Audiobook
         } else {
             Self::Song
         }
@@ -171,18 +181,56 @@ impl Library {
     }
 
     pub(crate) fn read_sqlite(library_path: &Path, locations_path: &Path) -> Result<Self> {
+        // Public contract (unchanged): songs/podcasts only. The podlib
+        // GUI pipeline relies on hidden items (audiobooks) staying out
+        // of this list.
+        Self::read_sqlite_with_items(
+            library_path,
+            locations_path,
+            "is_song = 1 OR media_kind IN (1, 4) OR is_podcast = 1",
+        )
+    }
+
+    // NOTE(vendored patch): upstream `read_sqlite` is parameterless with a
+    // hardcoded query. We extracted `read_sqlite_with_items(items_where)`
+    // and added this wider reparse (audiobooks included) on top of it —
+    // both are local-only, and any upstream change to the read query will
+    // conflict with the extra parameter and this function on upgrade.
+    /// Reparse used ONLY by the staged-edit verification: unlike the
+    /// public read path it also sees audiobooks (media_kind=8,
+    /// is_song=0) — everything an edit can write. Without this the
+    /// verification count mismatches on every audiobook addition
+    /// (live Nano 7G, round 5.6). The plain read path is untouched.
+    pub(crate) fn read_sqlite_for_verification(
+        library_path: &Path,
+        locations_path: &Path,
+    ) -> Result<Self> {
+        Self::read_sqlite_with_items(
+            library_path,
+            locations_path,
+            "is_song = 1 OR media_kind IN (1, 4, 8) OR is_podcast = 1",
+        )
+    }
+
+    fn read_sqlite_with_items(
+        library_path: &Path,
+        locations_path: &Path,
+        items_where: &str,
+    ) -> Result<Self> {
         let locations = read_locations(locations_path)?;
         let connection = open_read_only(library_path)?;
         let mut statement = connection
             .prepare(
-                "SELECT pid, COALESCE(title, ''), COALESCE(album, ''), \
-                 COALESCE(artist, ''), COALESCE(album_artist, ''), \
-                 COALESCE(total_time_ms, 0), COALESCE(track_number, 0), \
-                 COALESCE(disc_number, 0), COALESCE(artwork_status, 0), \
-                 COALESCE(artwork_cache_id, 0), COALESCE(media_kind, 0), \
-                 COALESCE(is_podcast, 0) \
-                 FROM item WHERE is_song = 1 OR media_kind IN (1, 4) OR is_podcast = 1 \
-                 ORDER BY COALESCE(physical_order, 0), pid",
+                &format!(
+                    "SELECT pid, COALESCE(title, ''), COALESCE(album, ''), \
+                     COALESCE(artist, ''), COALESCE(album_artist, ''), \
+                     COALESCE(total_time_ms, 0), COALESCE(track_number, 0), \
+                     COALESCE(disc_number, 0), COALESCE(artwork_status, 0), \
+                     COALESCE(artwork_cache_id, 0), COALESCE(media_kind, 0), \
+                     COALESCE(is_podcast, 0) \
+                     FROM item WHERE {items_where} \
+                     ORDER BY COALESCE(physical_order, 0), pid"
+                ),
             )
             .map_err(|source| sqlite_error("prepare track query", library_path, source))?;
         let rows = statement

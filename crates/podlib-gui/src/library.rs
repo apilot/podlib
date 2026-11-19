@@ -236,7 +236,12 @@ fn serve_loop(
     incoming: Receiver<(LibraryCommand, LibraryReply)>,
 ) {
     while let Ok((command, reply)) = incoming.recv() {
+        // Round 5.3 diagnostics (permanent): every command and outcome
+        // lands in podlib-gui.log — the «тихо ничего не сделал» class
+        // of reports must be answerable from the log alone.
+        eprintln!("[worker] cmd={command:?}");
         if matches!(command, LibraryCommand::Close) {
+            eprintln!("[worker] outcome=closed");
             drop(backend);
             let _ = reply.send(LibraryOutcome::Closed);
             return;
@@ -269,6 +274,22 @@ fn serve_loop(
                 return;
             }
         };
+        match &outcome {
+            LibraryOutcome::Applied { summary, .. } => {
+                eprintln!("[worker] outcome=applied summary={summary:?}");
+            }
+            LibraryOutcome::Loaded(snapshot) => {
+                eprintln!(
+                    "[worker] outcome=loaded tracks={} playlists={}",
+                    snapshot.tracks.len(),
+                    snapshot.playlists.len()
+                );
+            }
+            LibraryOutcome::Failed { message, .. } => {
+                eprintln!("[worker] outcome=failed message={message:?}");
+            }
+            LibraryOutcome::Closed => eprintln!("[worker] outcome=closed"),
+        }
         if reply.send(outcome).is_err() {
             return; // UI closed
         }
@@ -292,52 +313,12 @@ fn dispatch(backend: &mut dyn LibraryBackend, command: LibraryCommand) -> Librar
             Ok(snapshot) => LibraryOutcome::Loaded(snapshot),
             Err(error) => failure_outcome(error),
         },
-        LibraryCommand::AddTracks(drafts) => {
-            let total = drafts.len();
-            let mut added = 0usize;
-            let mut stopped = None;
-            for draft in &drafts {
-                match backend.add_track(draft) {
-                    Ok(_) => added += 1,
-                    Err(error) => {
-                        stopped = Some(error);
-                        break;
-                    }
-                }
-            }
-            match stopped {
-                None => finish(backend, added_tracks_summary(added)),
-                Some(error) if added == 0 => failure_outcome(error),
-                // Partial success: show honestly how far it got.
-                Some(error) => match list_snapshot(backend) {
-                    Ok(snapshot) => LibraryOutcome::Applied {
-                        snapshot,
-                        summary: format!(
-                            "{} из {total}; остановлено: {error}",
-                            added_tracks_summary(added)
-                        ),
-                    },
-                    Err(_) => failure_outcome(error),
-                },
-            }
-        }
+        LibraryCommand::AddTracks(drafts) => add_tracks_command(backend, drafts),
         LibraryCommand::RemoveTrack { id, purge_media } => match backend.remove_track(id, purge_media) {
             Ok(_) => finish(backend, "Трек удалён".to_owned()),
             Err(error) => failure_outcome(error),
         },
-        LibraryCommand::EditTrack { id, changes } => match backend.edit_track(id, &changes) {
-            Ok(track) => {
-                // Contract: the resulting id is authoritative; edits are
-                // remove-and-re-add, so it usually changes — surface it.
-                let summary = if track.id == id {
-                    format!("Обновлено: «{}»", track.title)
-                } else {
-                    format!("Обновлено: «{}» (новый id: {})", track.title, track.id)
-                };
-                finish(backend, summary)
-            }
-            Err(error) => failure_outcome(error),
-        },
+        LibraryCommand::EditTrack { id, changes } => edit_track_command(backend, id, changes),
         LibraryCommand::CreatePlaylist { name } => match PlaylistDraft::new(&name, Vec::new()) {
             Ok(draft) => match backend.create_playlist(&draft) {
                 Ok(_) => finish(backend, format!("Создан плейлист «{name}»")),
@@ -373,6 +354,110 @@ fn dispatch(backend: &mut dyn LibraryBackend, command: LibraryCommand) -> Librar
             Err(error) => failure_outcome(error),
         },
         LibraryCommand::Close => LibraryOutcome::Closed, // handled in the loop
+    }
+}
+
+/// Adds a batch of drafts; firmware-unplayable formats are transcoded
+/// first (round 5.2), and a success re-lists the library.
+fn add_tracks_command(
+    backend: &mut dyn LibraryBackend,
+    drafts: Vec<TrackDraft>,
+) -> LibraryOutcome {
+    let total = drafts.len();
+    // Round 5.2: firmware-unplayable formats (flac/ogg/wav) are
+    // transcoded to AAC in this worker thread; the batch tempdir
+    // lives until the batch ends and cleans itself up on drop.
+    let transcode_dir = match tempfile::tempdir() {
+        Ok(dir) => Some(dir),
+        Err(error) => {
+            return failure_outcome(BackendError::Io(std::io::Error::other(error)));
+        }
+    };
+    let mut added = 0usize;
+    let mut stopped = None;
+    let mut transcode_failures: Vec<String> = Vec::new();
+    for (index, draft) in drafts.iter().enumerate() {
+        let prepared;
+        if needs_transcode(&path_extension(&draft.source_path)) {
+            if let Some(dir) = transcode_dir.as_ref().map(|dir| dir.path()) {
+                match transcode_draft(draft, dir, index) {
+                    Ok(transcoded) => prepared = Some(transcoded),
+                    Err(reason) => {
+                        // The batch continues: the failed file is
+                        // reported honestly in the summary tail.
+                        transcode_failures
+                            .push(format!("«{}»: {reason}", draft.title));
+                        continue;
+                    }
+                }
+            } else {
+                // Unreachable while the batch tempdir owns the path, but
+                // the draft is skipped honestly instead of panicking.
+                transcode_failures
+                    .push(format!("«{}»: нет временной папки транскода", draft.title));
+                continue;
+            }
+        } else {
+            prepared = None;
+        }
+        let target = prepared.as_ref().unwrap_or(draft);
+        match backend.add_track(target) {
+            Ok(_) => added += 1,
+            Err(error) => {
+                stopped = Some(error);
+                break;
+            }
+        }
+    }
+    let failures_tail = transcode_failures_summary(&transcode_failures);
+    match stopped {
+        None if added == total && transcode_failures.is_empty() => {
+            finish(backend, added_tracks_summary(added))
+        }
+        // Honest partial success without a backend error: some
+        // drafts failed their transcode and were skipped.
+        None => {
+            let mut summary =
+                format!("{} из {total}", added_tracks_summary(added));
+            summary.push_str(&failures_tail);
+            finish(backend, summary)
+        }
+        Some(error) if added == 0 && transcode_failures.is_empty() => {
+            failure_outcome(error)
+        }
+        // Partial success: show honestly how far it got.
+        Some(error) => match list_snapshot(backend) {
+            Ok(snapshot) => {
+                let mut summary = format!(
+                    "{} из {total}; остановлено: {error}",
+                    added_tracks_summary(added)
+                );
+                summary.push_str(&failures_tail);
+                LibraryOutcome::Applied { snapshot, summary }
+            }
+            Err(_) => failure_outcome(error),
+        },
+    }
+}
+
+/// Applies tag edits to one track and re-lists on success.
+fn edit_track_command(
+    backend: &mut dyn LibraryBackend,
+    id: TrackId,
+    changes: TrackChanges,
+) -> LibraryOutcome {
+    match backend.edit_track(id, &changes) {
+        Ok(track) => {
+            // Contract: the resulting id is authoritative; edits are
+            // remove-and-re-add, so it usually changes — surface it.
+            let summary = if track.id == id {
+                format!("Обновлено: «{}»", track.title)
+            } else {
+                format!("Обновлено: «{}» (новый id: {})", track.title, track.id)
+            };
+            finish(backend, summary)
+        }
+        Err(error) => failure_outcome(error),
     }
 }
 
@@ -454,27 +539,137 @@ pub(crate) fn panic_message(payload: Box<dyn Any + Send>) -> String {
     }
 }
 
-/// File extensions accepted from drag-and-drop (case-insensitive). Tags
-/// are not parsed: title = file stem, other fields stay empty — the same
-/// defaults as `podlib-cli add` without flags.
-pub const AUDIO_EXTENSIONS: [&str; 7] = ["mp3", "m4a", "aac", "wav", "flac", "ogg", "oga"];
+/// File extensions accepted from drag-and-drop (case-insensitive).
+/// `m4b` = audiobook container → drafts get audiobook bits (round 5.1).
+/// flac/ogg/oga/wav are transcoded in the worker (round 5.2): Nano 7G
+/// firmware plays AAC-family audio only.
+pub const AUDIO_EXTENSIONS: [&str; 8] = ["mp3", "m4a", "m4b", "aac", "wav", "flac", "ogg", "oga"];
+
+/// The extension that marks an audiobook file.
+const AUDIOBOOK_EXTENSION: &str = "m4b";
+
+/// Lowercased extension of a path, or an empty string when absent.
+pub(crate) fn path_extension(path: &std::path::Path) -> String {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+/// True for formats the Nano 7G firmware cannot play (flac/ogg/wav):
+/// the worker must transcode them to AAC before add_track.
+pub(crate) fn needs_transcode(extension: &str) -> bool {
+    matches!(extension, "flac" | "ogg" | "oga" | "wav")
+}
+
+/// Target container extension of a transcode: audiobook bits get the
+/// book container, everything else the music one.
+fn transcode_target_extension(media_kind_bits: u32) -> &'static str {
+    if media_kind_bits == 8 {
+        "m4b"
+    } else {
+        "m4a"
+    }
+}
+
+/// Exact argument list of the transcode command: silence the banner,
+/// drop any cover video stream, keep chapter metadata, encode AAC at a
+/// fixed bitrate and mux into the iPod container.
+fn ffmpeg_transcode_args(source: &std::path::Path, target: &std::path::Path) -> Vec<String> {
+    vec![
+        "-hide_banner".to_owned(),
+        "-loglevel".to_owned(),
+        "error".to_owned(),
+        "-y".to_owned(),
+        "-i".to_owned(),
+        source.display().to_string(),
+        "-vn".to_owned(),
+        "-map_chapters".to_owned(),
+        "0".to_owned(),
+        "-c:a".to_owned(),
+        "aac".to_owned(),
+        "-b:a".to_owned(),
+        "192k".to_owned(),
+        "-f".to_owned(),
+        "ipod".to_owned(),
+        target.display().to_string(),
+    ]
+}
+
+/// Honest batch tail for transcoding failures, appended to the summary.
+fn transcode_failures_summary(failures: &[String]) -> String {
+    if failures.is_empty() {
+        String::new()
+    } else {
+        format!("; транскод не удался: {}", failures.join("; "))
+    }
+}
+
+/// Recursively collects audio files under `directory` (std fs walk):
+/// hidden entries (leading dot) and non-audio files are skipped.
+fn collect_audio_files(directory: &std::path::Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let hidden = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with('.'));
+        if hidden {
+            continue;
+        }
+        if path.is_dir() {
+            collect_audio_files(&path, out);
+        } else if AUDIO_EXTENSIONS.contains(&path_extension(&path).as_str()) {
+            out.push(path);
+        }
+    }
+}
 
 /// Maps dropped file paths into track drafts. Returns the drafts plus
 /// human-readable names of skipped paths (not an audio extension, or a
-/// stem that cannot serve as a title) so the UI can show what was ignored.
+/// stem that cannot serve as a title) so the UI can show what was
+/// ignored. `.m4b` drafts carry audiobook media-kind bits. A dropped
+/// DIRECTORY expands recursively (sorted by full path; hidden entries
+/// and non-audio files skipped) and every audio file inside becomes an
+/// audiobook (bits 8 — the owner's rule: directory = book); a
+/// directory with no audio lands in `skipped` by its full name.
 pub fn drafts_from_paths(paths: &[PathBuf]) -> (Vec<TrackDraft>, Vec<String>) {
     let mut drafts = Vec::new();
     let mut skipped = Vec::new();
+    let mut expanded: Vec<PathBuf> = Vec::new();
     for path in paths {
+        if path.is_dir() {
+            let mut collected = Vec::new();
+            collect_audio_files(path, &mut collected);
+            collected.sort();
+            if collected.is_empty() {
+                // «имя директории» per spec; the display fallback covers
+                // a root-like path without a file name.
+                skipped.push(
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| path.display().to_string()),
+                );
+            } else {
+                expanded.extend(collected);
+            }
+        } else {
+            expanded.push(path.clone());
+        }
+    }
+    let directory_drop = paths.iter().any(|path| path.is_dir());
+    for path in &expanded {
         let name = match path.file_name().and_then(|name| name.to_str()) {
             Some(name) => name.to_owned(),
             None => path.display().to_string(),
         };
-        let extension = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .map(|extension| extension.to_ascii_lowercase());
-        let is_audio = extension.is_some_and(|extension| AUDIO_EXTENSIONS.contains(&extension.as_str()));
+        let extension = path_extension(path);
+        let is_audio = !extension.is_empty()
+            && AUDIO_EXTENSIONS.contains(&extension.as_str());
         let stem = path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -483,11 +678,54 @@ pub fn drafts_from_paths(paths: &[PathBuf]) -> (Vec<TrackDraft>, Vec<String>) {
             .to_owned();
         match TrackDraft::new(path.clone(), stem) {
             // A blank stem fails title validation and lands in `skipped`.
-            Ok(draft) if is_audio => drafts.push(draft),
+            Ok(draft) if is_audio => {
+                // A file expanded from a dropped directory is always a
+                // part of the dropped book; a single dropped file keeps
+                // its own extension-based kind.
+                let draft = if directory_drop || extension == AUDIOBOOK_EXTENSION {
+                    draft.with_media_kind_bits(8)
+                } else {
+                    draft
+                };
+                drafts.push(draft);
+            }
             _ => skipped.push(name.to_owned()),
         }
     }
     (drafts, skipped)
+}
+
+/// Runs ffmpeg for one draft into the batch tempdir and returns a
+/// draft pointing at the transcoded file (the source draft and its
+/// path stay untouched). Failures surface as one-line honest reasons:
+/// a missing binary, or a non-zero exit with the first stderr line.
+fn transcode_draft(
+    draft: &TrackDraft,
+    batch_dir: &std::path::Path,
+    index: usize,
+) -> Result<TrackDraft, String> {
+    let target = batch_dir.join(format!(
+        "podlib-transcode-{index}.{}",
+        transcode_target_extension(draft.media_kind_bits)
+    ));
+    let output = std::process::Command::new("ffmpeg")
+        .args(ffmpeg_transcode_args(&draft.source_path, &target))
+        .output()
+        .map_err(|_| "ffmpeg не найден".to_owned())?;
+    if !output.status.success() {
+        let reason = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .next()
+            .unwrap_or("без вывода ffmpeg")
+            .to_owned();
+        return Err(format!("ffmpeg: {reason}"));
+    }
+    if !target.is_file() {
+        return Err("ffmpeg не создал целевой файл".to_owned());
+    }
+    let mut prepared = draft.clone();
+    prepared.source_path = target;
+    Ok(prepared)
 }
 
 /// Payload dragged from the track table: the ids of the dragged rows. A
@@ -704,9 +942,190 @@ mod tests {
         assert_eq!(drafts[0].title, "Song One");
         assert_eq!(drafts[0].artist, None, "tags are not parsed");
         assert_eq!(drafts[0].duration_ms, 0);
+        assert_eq!(drafts[0].media_kind_bits, 1, "songs default to song bits");
         assert_eq!(drafts[1].title, "UPPER", "extension match is case-insensitive");
         assert_eq!(drafts[2].source_path, dir.path().join("missing.flac"));
         assert_eq!(skipped, vec!["notes.txt", "noext"]);
+    }
+
+    #[test]
+    fn m4b_drafts_carry_audiobook_bits_case_insensitively() {
+        // Round 5.1: .m4b is the audiobook container — the draft must
+        // land in the device's «Аудиокниги» view, not in «Музыка».
+        let dir = TempDir::new().unwrap();
+        let (drafts, skipped) = drafts_from_paths(&[
+            write_file(dir.path(), "Song.m4b"),
+            write_file(dir.path(), "Book.S.M4B"),
+            write_file(dir.path(), "Plain.mp3"),
+        ]);
+        assert!(skipped.is_empty(), "all three are audio files");
+        assert_eq!(drafts.len(), 3);
+        assert_eq!(drafts[0].title, "Song");
+        assert_eq!(drafts[0].media_kind_bits, 8, "lowercase .m4b");
+        assert_eq!(drafts[1].media_kind_bits, 8, "uppercase .M4B");
+        assert_eq!(drafts[2].media_kind_bits, 1, "plain .mp3 stays a song");
+    }
+
+    // ---- round 5.2: directory drops + transcode ----
+
+    /// Owner's decision: a dropped DIRECTORY is one audiobook — every
+    /// audio file inside gets audiobook bits (8), regardless of its own
+    /// extension. Nested folders are walked, hidden entries and
+    /// non-audio files are skipped, paths sort deterministically.
+    #[test]
+    fn dropped_directory_expands_recursively_with_audiobook_bits() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("book/cd2")).unwrap();
+        std::fs::create_dir_all(dir.path().join("book/.hidden")).unwrap();
+        write_file(dir.path(), "book/01.flac");
+        write_file(dir.path(), "book/cd2/02.ogg");
+        write_file(dir.path(), "book/.hidden/secret.mp3");
+        write_file(dir.path(), "book/cover.png");
+
+        let (drafts, skipped) = drafts_from_paths(&[dir.path().join("book")]);
+        assert!(skipped.is_empty());
+        let full_paths: Vec<String> = drafts
+            .iter()
+            .map(|draft| draft.source_path.display().to_string())
+            .collect();
+        let mut sorted = full_paths.clone();
+        sorted.sort();
+        assert_eq!(full_paths, sorted, "paths are sorted by full path");
+        assert_eq!(drafts.len(), 2, "hidden dir and cover.png are skipped");
+        for draft in &drafts {
+            assert_eq!(
+                draft.media_kind_bits, 8,
+                "files from a dropped directory are audiobook bits"
+            );
+        }
+        assert_eq!(drafts[0].title, "01");
+        assert!(drafts[0].source_path.ends_with("01.flac"));
+        assert_eq!(drafts[1].title, "02");
+        assert!(drafts[1].source_path.ends_with("02.ogg"));
+    }
+
+    #[test]
+    fn directory_without_audio_lands_in_skipped() {
+        let dir = TempDir::new().unwrap();
+        write_file(dir.path(), "booklet.pdf");
+        let (drafts, skipped) = drafts_from_paths(&[dir.path().join("book")]);
+        assert!(drafts.is_empty());
+        assert_eq!(skipped, vec!["book".to_owned()], "the directory NAME lands in skipped");
+    }
+
+    #[test]
+    fn needs_transcode_matches_firmware_unplayable_formats() {
+        // Nano 7G firmware plays AAC (and mp3) only: flac/ogg/wav must
+        // be transcoded, the AAC-family passes through untouched.
+        for playable in ["mp3", "m4a", "m4b", "aac"] {
+            assert!(!needs_transcode(playable), "{playable} passes through");
+        }
+        for unplayable in ["flac", "ogg", "oga", "wav"] {
+            assert!(needs_transcode(unplayable), "{unplayable} needs transcode");
+        }
+        // Unknown extensions never reach the worker, but stay honest.
+        assert!(!needs_transcode("txt"));
+    }
+
+    #[test]
+    fn transcode_target_extension_follows_media_kind() {
+        assert_eq!(transcode_target_extension(8), "m4b", "audiobook container");
+        assert_eq!(transcode_target_extension(1), "m4a", "music container");
+        assert_eq!(transcode_target_extension(4), "m4a");
+    }
+
+    #[test]
+    fn ffmpeg_transcode_args_are_exact() {
+        let args = ffmpeg_transcode_args(
+            std::path::Path::new("/src/Skazka.flac"),
+            std::path::Path::new("/tmp/book.m4b"),
+        );
+        assert_eq!(
+            args,
+            [
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                "/src/Skazka.flac",
+                "-vn",
+                "-map_chapters",
+                "0",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-f",
+                "ipod",
+                "/tmp/book.m4b",
+            ]
+        );
+    }
+
+    #[test]
+    fn transcode_failures_summary_appends_an_honest_tail() {
+        assert_eq!(transcode_failures_summary(&[]), "");
+        assert_eq!(
+            transcode_failures_summary(&["«Книга»: ffmpeg не найден".to_owned()]),
+            "; транскод не удался: «Книга»: ffmpeg не найден"
+        );
+        assert_eq!(
+            transcode_failures_summary(&["a".to_owned(), "b".to_owned()]),
+            "; транскод не удался: a; b"
+        );
+    }
+
+    /// End-to-end transcode: a synthetic 16-bit PCM WAV is transcoded
+    /// into a real AAC file by the installed ffmpeg.
+    #[test]
+    fn transcode_draft_converts_wav_to_aac() {
+        let dir = TempDir::new().unwrap();
+        // Minimal 8 kHz mono 16-bit WAV: 0.1 s of silence.
+        let data_size: u32 = 1600;
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_size).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&8000u32.to_le_bytes());
+        wav.extend_from_slice(&16000u32.to_le_bytes()); // byte rate
+        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+        wav.extend_from_slice(&16u16.to_le_bytes()); // bits
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_size.to_le_bytes());
+        wav.extend(std::iter::repeat_n(0u8, data_size as usize));
+        let source = dir.path().join("chapter.wav");
+        std::fs::write(&source, &wav).unwrap();
+
+        let draft = TrackDraft::new(source, "Глава 1")
+            .unwrap()
+            .with_media_kind_bits(8);
+        let transcoded = transcode_draft(&draft, dir.path(), 0).expect("ffmpeg transcode");
+        assert_eq!(
+            transcoded.source_path.extension().and_then(|e| e.to_str()),
+            Some(transcode_target_extension(8)),
+        );
+        assert_eq!(transcoded.media_kind_bits, 8);
+        assert_eq!(transcoded.title, "Глава 1");
+        assert!(
+            transcoded.source_path.is_file(),
+            "ffmpeg must produce the target file"
+        );
+        assert_ne!(transcoded.source_path, draft.source_path, "in batch tempdir");
+    }
+
+    #[test]
+    fn transcode_draft_reports_failure_honestly() {
+        let dir = TempDir::new().unwrap();
+        let draft = TrackDraft::new(dir.path().join("garbage.flac"), "Book").unwrap();
+        // The garbage file exists but is not decodable: ffmpeg exits
+        // non-zero and the reason surfaces as a one-line honest error.
+        std::fs::write(&draft.source_path, b"not audio at all").unwrap();
+        let error = transcode_draft(&draft, dir.path(), 0).unwrap_err();
+        assert!(error.contains("ffmpeg"), "got: {error}");
     }
 
     #[test]

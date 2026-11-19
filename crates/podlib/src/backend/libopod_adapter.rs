@@ -188,13 +188,25 @@ fn map_track(track: &libopod::Track) -> Track {
     }
 }
 
-/// libopod `MediaKind` as raw iTunesDB bits. libopod's enum knows only
-/// songs and podcasts; other kinds (audiobooks, video) never appear in
-/// its track list — those come from the enrichment query instead.
+/// libopod `MediaKind` as raw iTunesDB bits. libopod's enum knows
+/// songs, podcasts and audiobooks; video kinds never appear in its
+/// track list — those come from the enrichment query instead.
 fn media_kind_bits(kind: MediaKind) -> u32 {
     match kind {
         MediaKind::Song => 1,
         MediaKind::Podcast => 4,
+        MediaKind::Audiobook => 8,
+    }
+}
+
+/// Raw iTunesDB bits → libopod `MediaKind` for the add-path: 8 =
+/// audiobook, 4 = podcast, everything else = song. Video bits (2/16/32)
+/// have no writable representation and fall back to song.
+fn media_kind_from_bits(bits: u32) -> MediaKind {
+    match bits {
+        8 => MediaKind::Audiobook,
+        4 => MediaKind::Podcast,
+        _ => MediaKind::Song,
     }
 }
 
@@ -330,7 +342,9 @@ fn track_to_add(draft: &TrackDraft) -> TrackToAdd {
         sample_rate: DEFAULT_SAMPLE_RATE,
         length_ms: draft.duration_ms,
         compilation: false,
-        media_kind: MediaKind::Song,
+        // The draft kind decides the Apple row form: songs stay songs,
+        // audiobooks land in the device's «Аудиокниги» view.
+        media_kind: media_kind_from_bits(draft.media_kind_bits),
         reuse_album_art: false,
         artwork_source: None,
     }
@@ -453,6 +467,7 @@ impl LibraryBackend for LibopodBackend {
             album_artist: merged.album_artist.clone(),
             genre: None, // genre is write-only and not preserved across edits
             duration_ms: merged.duration_ms,
+            media_kind_bits: merged.media_kind, // edits keep the kind
             track_number: merged.track_number,
             disc_number: merged.disc_number,
         };
@@ -609,6 +624,29 @@ mod tests {
     fn media_kind_maps_to_itunesdb_bits() {
         assert_eq!(media_kind_bits(MediaKind::Song), 1);
         assert_eq!(media_kind_bits(MediaKind::Podcast), 4);
+        assert_eq!(media_kind_bits(MediaKind::Audiobook), 8);
+    }
+
+    #[test]
+    fn bits_round_trip_to_the_writable_kinds() {
+        use crate::domain::TrackDraft;
+        // 8 → Audiobook (drag&drop of .m4b audiobooks), 4 → Podcast,
+        // everything else — including the unwritable video bits —
+        // falls back to song.
+        assert_eq!(media_kind_from_bits(8), MediaKind::Audiobook);
+        assert_eq!(media_kind_from_bits(4), MediaKind::Podcast);
+        assert_eq!(media_kind_from_bits(1), MediaKind::Song);
+        assert_eq!(media_kind_from_bits(2), MediaKind::Song);
+        assert_eq!(media_kind_from_bits(16), MediaKind::Song);
+        assert_eq!(media_kind_from_bits(32), MediaKind::Song);
+        // Draft → add-path kind stays consistent end to end.
+        let draft = TrackDraft::new(std::path::PathBuf::from("a.m4b"), "Book")
+            .unwrap()
+            .with_media_kind_bits(8);
+        assert_eq!(
+            media_kind_from_bits(draft.media_kind_bits),
+            MediaKind::Audiobook
+        );
     }
 
     // ---- enrichment mapping over the untyped schema (round 4.2) ----

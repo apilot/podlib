@@ -357,7 +357,7 @@ fn resolve_named_entity(
     Ok(pid)
 }
 
-fn resolve_album(
+pub(crate) fn resolve_album(
     transaction: &Transaction<'_>,
     path: &Path,
     album_name: Option<&str>,
@@ -425,14 +425,26 @@ fn resolve_album(
     Ok(pid)
 }
 
-fn artist_order_rank(transaction: &Transaction<'_>, path: &Path, artist_pid: i64) -> Result<i64> {
-    let name: String = transaction
+pub(crate) fn artist_order_rank(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    artist_pid: i64,
+) -> Result<i64> {
+    // NOTE(vendored patch): pid=0 is the documented «no artist»
+    // sentinel (see the guard in link_artwork_rows) — untagged
+    // additions create albums with artist_pid=0, and no artist row
+    // backs that sentinel. A missing row therefore means an empty
+    // name, not an error (round 5.4; sibling of the NULL-safe rank
+    // patch from upstream PR#1).
+    let name: Option<String> = transaction
         .query_row(
             "SELECT COALESCE(name, '') FROM artist WHERE pid = ?1",
             [artist_pid],
             |row| row.get(0),
         )
+        .optional()
         .map_err(|source| sqlite_error("look up album artist", path, source))?;
+    let name = name.as_deref().unwrap_or("");
     let rank =
         i64::try_from(insertion_rank(transaction, path, "SELECT name FROM artist WHERE name IS NOT NULL", &name)? * 100)
             .unwrap_or(i64::MAX);
@@ -612,17 +624,18 @@ fn compute_orders(
     })
 }
 
-struct ItemOrders {
-    title: i64,
-    artist: i64,
-    album: i64,
-    album_artist: i64,
-    composer: i64,
-    genre: i64,
+#[derive(Default)]
+pub(crate) struct ItemOrders {
+    pub(crate) title: i64,
+    pub(crate) artist: i64,
+    pub(crate) album: i64,
+    pub(crate) album_artist: i64,
+    pub(crate) composer: i64,
+    pub(crate) genre: i64,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn insert_item_row(
+pub(crate) fn insert_item_row(
     transaction: &Transaction<'_>,
     path: &Path,
     addition: &ResolvedAddition,
@@ -654,6 +667,7 @@ fn insert_item_row(
     let artwork_status = i64::from(addition.artwork.is_some());
     let artwork_cache_id = addition.artwork.as_ref().map_or(0, |art| art.image_id);
     let podcast = addition.media_kind == MediaKind::Podcast;
+    let audiobook = addition.media_kind == MediaKind::Audiobook;
 
     transaction
         .execute(
@@ -671,7 +685,7 @@ fn insert_item_row(
              album_artist_order, album_by_artist_order, series_name_order, comment, grouping, \
              description, description_long, collection_description, copyright, track_artist_pid, \
              physical_order, has_lyrics, date_released) \
-             VALUES (:pid, NULL, :media_kind, :is_song, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+             VALUES (:pid, NULL, :media_kind, :is_song, :is_audio_book, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
              :is_podcast, :modified, :year, 0, 0, :compilation, 0, :remember_bookmark, \
              :exclude_from_shuffle, 0, 0, :artwork_status, :artwork_cache_id, 0, 0, \
              :length, NULL, :track_number, \
@@ -684,12 +698,13 @@ fn insert_item_row(
             rusqlite::named_params! {
                 ":pid": pid,
                 ":media_kind": addition.media_kind.sqlite_value(),
-                ":is_song": i64::from(!podcast),
+                ":is_song": i64::from(!podcast && !audiobook),
+                ":is_audio_book": i64::from(audiobook),
                 ":is_podcast": i64::from(podcast),
                 ":modified": addition.date_coredata,
                 ":year": i64::from(addition.year),
-                ":remember_bookmark": i64::from(podcast),
-                ":exclude_from_shuffle": i64::from(podcast),
+                ":remember_bookmark": i64::from(podcast || audiobook),
+                ":exclude_from_shuffle": i64::from(podcast || audiobook),
                 ":compilation": i64::from(addition.compilation),
                 ":artwork_status": artwork_status,
                 ":artwork_cache_id": artwork_cache_id,

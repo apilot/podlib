@@ -508,7 +508,10 @@ mod tests {
 
     /// The host generation backup does not include media directories; the
     /// virtual device needs the allocated `Music/Fxx` parents to exist.
-    fn create_virtual_media_dirs(virtual_root: &Path, added_media: &[crate::IpodPath]) {
+    pub(super) fn create_virtual_media_dirs(
+        virtual_root: &Path,
+        added_media: &[crate::IpodPath],
+    ) {
         for media in added_media {
             let parent = virtual_root.join(media.as_str()).parent().unwrap().to_path_buf();
             std::fs::create_dir_all(&parent).unwrap();

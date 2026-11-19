@@ -8,18 +8,19 @@
 //! [`crate::library`] for why.
 
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
-use podlib::{Playlist, PlaylistId, Track, TrackId};
+use podlib::{Playlist, PlaylistId, Track, TrackDraft, TrackId};
 
 use crate::device::{self, DeviceCandidate, MountError};
 use crate::library::{
-    changes_from_track, drafts_from_paths, guard_playlist_mutation, panic_message, plural,
-    EditDialogFields, DraggedTracks, LibraryCommand, LibraryOutcome, LibrarySnapshot,
-    LibraryWorker,
+    changes_from_track, drafts_from_paths, guard_playlist_mutation, needs_transcode, panic_message,
+    path_extension, plural, EditDialogFields, DraggedTracks, LibraryCommand, LibraryOutcome,
+    LibrarySnapshot, LibraryWorker,
 };
 
 /// Row height of the track table rows, keeps the column grid aligned.
@@ -33,8 +34,10 @@ const DURATION_COLUMN: f32 = 64.0;
 
 /// Messages from worker threads to the UI.
 enum DeviceEvent {
-    /// Device mounted read-write; payload is the mount point.
-    Connected(Result<PathBuf, ConnectError>),
+    /// Device mounted read-write; payload is the mount point plus
+    /// whether THIS run performed the mount (round 5.3: only then does
+    /// app close unmount it).
+    Connected(Result<(PathBuf, bool), ConnectError>),
     Ejected(Result<(), String>),
 }
 
@@ -81,6 +84,28 @@ enum CloseDecision {
 /// corruption of the DB on the device), so the first close is cancelled
 /// and confirmed. After the user confirms, later close requests pass
 /// through — no confirm loop. While idle the window closes as usual.
+/// Round 5.3: what a confirmed window close does — a device mounted by
+/// this app run is ejected first (the window closes when the eject
+/// lands), anything else closes immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseAction {
+    EjectFirst,
+    CloseNow,
+}
+
+fn close_confirmation_action(mounted_by_us: bool) -> CloseAction {
+    if mounted_by_us {
+        CloseAction::EjectFirst
+    } else {
+        CloseAction::CloseNow
+    }
+}
+
+/// A deferred eject (close requested while the worker was busy) fires
+/// as soon as the app is idle again.
+fn deferred_eject_due(pending: bool, busy: bool, library_idle: bool) -> bool {
+    pending && !busy && library_idle
+}
 fn close_decision(
     close_requested: bool,
     operation_active: bool,
@@ -201,6 +226,10 @@ struct LibraryUi {
     /// Remaining rows of a multi-track delete (one in-flight worker
     /// command at a time; the chain continues on each Applied).
     delete_queue: Vec<TrackId>,
+    /// Expanded books in the «Аудиокниги» view (round 5), keyed by
+    /// album. All collapsed by default; stale keys (a book renamed or
+    /// gone) simply never render — no fix-up needed.
+    expanded_books: HashSet<String>,
     /// Toolbar search box; empty string = no filter.
     search_query: String,
 }
@@ -231,6 +260,18 @@ pub struct PodlibApp {
     /// Deferred «Убрать из плейлиста» from the toolbar (the request
     /// needs the worker free; collected during the render pass).
     pending_remove_from_playlist: Option<(PlaylistId, Vec<TrackId>)>,
+    /// True only when THIS app run performed the mount (round 5.3):
+    /// closing the app then unmounts the volume; a skipped idempotent
+    /// mount (already mounted externally) never sets it.
+    mounted_by_us: bool,
+    /// Open tag-review modal (round 5.5): an untagged batch is edited
+    /// here before the regular AddTracks dispatch; lives on the app so
+    /// it survives even while the library is opening.
+    tag_review: Option<TagReview>,
+    /// A confirmed close waits for the eject to finish before the
+    /// window actually closes (round 5.3: close = safe unmount when
+    /// the app created the mount).
+    pending_close_after_eject: bool,
 }
 
 impl PodlibApp {
@@ -256,6 +297,9 @@ impl PodlibApp {
             connected: None,
             library: None,
             pending_remove_from_playlist: None,
+            mounted_by_us: false,
+            pending_close_after_eject: false,
+            tag_review: None,
         };
         app.refresh_devices();
         app
@@ -301,7 +345,8 @@ impl PodlibApp {
     fn handle_event(&mut self, event: DeviceEvent) {
         self.busy = false;
         match event {
-            DeviceEvent::Connected(Ok(mount)) => {
+            DeviceEvent::Connected(Ok((mount, mounted_by_us))) => {
+                self.mounted_by_us = mounted_by_us;
                 let (block_dev, label) = self
                     .selected_entry()
                     .map(|entry| {
@@ -340,8 +385,16 @@ impl PodlibApp {
             DeviceEvent::Ejected(Ok(())) => {
                 self.connected = None;
                 self.error = None;
+                self.mounted_by_us = false;
                 self.status = "Устройство безопасно отключено".to_owned();
                 self.refresh_devices();
+                // Round 5.3: a close requested while the device was
+                // mounted completes after the eject lands.
+                if self.pending_close_after_eject {
+                    self.pending_close_after_eject = false;
+                    self.force_close = true;
+                    self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
             DeviceEvent::Ejected(Err(message)) => {
                 // The library was closed before the sequence ran, so the
@@ -389,6 +442,7 @@ impl PodlibApp {
             selected_tracks: Vec::new(),
             selection_anchor: None,
             delete_queue: Vec::new(),
+            expanded_books: HashSet::new(),
             search_query: String::new(),
         });
     }
@@ -557,7 +611,15 @@ impl PodlibApp {
 
     /// Sends one library command and remembers to drain its reply. One
     /// operation at a time; failures to send are surfaced as UI errors.
-    fn library_request(&mut self, command: LibraryCommand, kind: PendingKind, status: &str) {
+    /// Returns `true` only when the worker accepted the command, so a
+    /// caller can keep pre-send UI state (e.g. a modal with typed
+    /// input) on a visible refusal.
+    fn library_request(
+        &mut self,
+        command: LibraryCommand,
+        kind: PendingKind,
+        status: &str,
+    ) -> bool {
         // No library at all is not "busy" — the honest refusal points at
         // connecting a device instead of a wait that would never end.
         let Some(library) = self.library.as_ref() else {
@@ -566,7 +628,7 @@ impl PodlibApp {
                 hint: None,
                 stderr: None,
             });
-            return;
+            return false;
         };
         if library.pending.is_some() || library.opening.is_some() {
             // Never drop an action silently: buttons inside modals and
@@ -577,7 +639,7 @@ impl PodlibApp {
                 hint: None,
                 stderr: None,
             });
-            return;
+            return false;
         }
         match library.worker.request(command) {
             Ok(rx) => {
@@ -585,6 +647,7 @@ impl PodlibApp {
                     library.pending = Some((kind, rx));
                 }
                 self.status = status.to_owned();
+                true
             }
             Err(message) => {
                 self.error = Some(UiError {
@@ -592,6 +655,7 @@ impl PodlibApp {
                     hint: None,
                     stderr: None,
                 });
+                false
             }
         }
     }
@@ -640,7 +704,7 @@ impl PodlibApp {
             // catch_unwind: a worker panic must still produce an event,
             // otherwise the UI would silently stay busy forever.
             let result = run_worker_step(
-                || connect_device(password, steps, mount_path),
+                || connect_device(password, steps, mount_path, block_dev.clone()),
                 ConnectError::Internal,
             );
             let _ = tx.send(DeviceEvent::Connected(result));
@@ -652,11 +716,24 @@ impl PodlibApp {
         let Some(connected) = self.connected.as_ref() else {
             return;
         };
-        let steps = device::build_unmount_sequence(
-            &connected.mount,
-            &connected.block_dev,
-            Path::new("/sys/dev/block"),
-        );
+        // Round 5.3: sync → unmount (draining stacked mounts of the
+        // same devnode, up to five repeats while /proc/mounts still
+        // lists the source) → power off the whole disk.
+        let steps = {
+            let mut steps = vec![device::CommandSpec::new("sync", &[])];
+            steps.extend(
+                device::build_unmount_sequence(
+                    &connected.mount,
+                    &connected.block_dev,
+                    Path::new("/sys/dev/block"),
+                )
+                .into_iter()
+                .skip(1), // drop the sequence's own leading sync — the explicit sync above already flushed
+            );
+            steps.push(device::CommandSpec::new("sync", &[]));
+            steps
+        };
+        let block_dev = connected.block_dev.display().to_string();
         // Take the library out: the backend must be closed (and joined)
         // before the unmount sequence, on the eject thread itself.
         let library = self.library.take();
@@ -676,7 +753,23 @@ impl PodlibApp {
             // catch_unwind: a worker panic must still produce an event,
             // otherwise the UI would silently stay busy forever.
             let result = run_worker_step(
-                || device::run_sequence(&steps).map_err(|error| error.to_string()),
+                || {
+                    device::run_sequence(&steps).map_err(|error| error.to_string())?;
+                    // Drain stacked mounts: the first unmount may leave
+                    // sibling mounts of the same devnode alive.
+                    for _ in 0..5 {
+                        let mounts = std::fs::read_to_string("/proc/mounts")
+                            .map(|content| device::parse_proc_mounts(&content))
+                            .unwrap_or_default();
+                        if !device::mounts_contain_source(&mounts, Path::new(&block_dev)) {
+                            break;
+                        }
+                        let _ = std::process::Command::new("udisksctl")
+                            .args(["unmount", "-b", &block_dev])
+                            .status();
+                    }
+                    Ok(())
+                },
                 |message| format!("внутренняя ошибка: {message}"),
             );
             let _ = tx.send(DeviceEvent::Ejected(result));
@@ -789,6 +882,10 @@ impl PodlibApp {
                 ui.label(&self.status);
             } else if !self.status.is_empty() {
                 ui.label(&self.status);
+            } else if self.error.is_none() {
+                // Round 5.3 Ф1: the bar never looks empty/missing —
+                // a neutral text keeps its height and presence.
+                ui.label(egui::RichText::new("Готово").weak());
             }
             if let Some(error) = &self.error {
                 ui.colored_label(egui::Color32::LIGHT_RED, &error.message)
@@ -955,13 +1052,15 @@ impl PodlibApp {
             let ctx = ui.ctx().clone();
             toolbar = search_toolbar(
                 ui,
-                &ctx,
-                &mut library.search_query,
-                filtered.len(),
-                total,
-                idle,
-                library.selected_tracks.len(),
-                matches!(view, LibraryView::Playlist(_)),
+                SearchToolbarParams {
+                    ctx: &ctx,
+                    query: &mut library.search_query,
+                    shown: filtered.len(),
+                    total,
+                    idle,
+                    selection_len: library.selected_tracks.len(),
+                    playlist_context: matches!(view, LibraryView::Playlist(_)),
+                },
             );
             ui.add_space(4.0);
 
@@ -974,6 +1073,21 @@ impl PodlibApp {
                         empty_playlist,
                     )).weak());
                 });
+            } else if matches!(view, LibraryView::Media { distinguished: 5 }) {
+                // Round 5: audiobooks group into books — a flat
+                // collapsed-by-default list instead of a flat table.
+                actions.merge(books_view(
+                    ui,
+                    BooksViewParams {
+                        ctx: &ctx,
+                        tracks: &filtered,
+                        selected_tracks: &library.selected_tracks,
+                        cursor,
+                        menus_allowed,
+                        visible_ids: &visible_ids,
+                        expanded: &mut library.expanded_books,
+                    },
+                ));
             } else {
                 actions.merge(track_table(
                     ui,
@@ -1182,14 +1296,52 @@ impl PodlibApp {
         if dropped.is_empty() {
             return;
         }
+        // Round 5.1 diagnostics (permanent): does winit deliver
+        // Wayland drops at all, and how do they map to drafts? The
+        // output lands in podlib-gui.log when run redirected.
+        let names: Vec<String> = dropped
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        eprintln!("[dnd] dropped {} file(s): {:?}", dropped.len(), names);
         let (drafts, skipped) = drafts_from_paths(&dropped);
+        eprintln!(
+            "[dnd] drafts {} ({} for transcode), skipped {}",
+            drafts.len(),
+            drafts
+                .iter()
+                .filter(|draft| needs_transcode(&path_extension(&draft.source_path)))
+                .count(),
+            skipped.len()
+        );
+        // Round 5.5: while the review modal is open new drops are
+        // ignored (the user is mid-edit; dispatching behind their back
+        // would lose the reviewed tags).
+        if self.tag_review.is_some() {
+            return;
+        }
         if drafts.is_empty() {
             if !skipped.is_empty() {
                 self.status = format!("Пропущены не-аудио файлы: {}", skipped.join(", "));
             }
             return;
         }
-        let status = batch_add_status(drafts.len(), &skipped);
+        let transcodes = drafts
+            .iter()
+            .filter(|draft| needs_transcode(&path_extension(&draft.source_path)))
+            .count();
+        // Round 5.5: any untagged draft in the batch opens the review
+        // modal for the WHOLE batch instead of dispatching blind.
+        if drafts.iter().any(is_untagged) {
+            eprintln!(
+                "[dnd] tag review opened ({} untagged of {})",
+                drafts.iter().filter(|draft| is_untagged(draft)).count(),
+                drafts.len()
+            );
+            self.tag_review = Some(open_tag_review(drafts));
+            return;
+        }
+        let status = batch_add_status(drafts.len(), transcodes, &skipped);
         self.library_request(
             LibraryCommand::AddTracks(drafts),
             PendingKind::AddTracks,
@@ -1320,8 +1472,21 @@ impl PodlibApp {
             self.confirm_close = false;
         }
         if confirmed {
-            self.force_close = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            // Round 5.3: a device mounted by this app run is unmounted
+            // before the window closes (the owner's requirement); a
+            // busy worker defers the eject until the app goes idle.
+            match close_confirmation_action(self.mounted_by_us) {
+                CloseAction::EjectFirst => {
+                    self.pending_close_after_eject = true;
+                    if deferred_eject_due(true, self.busy, self.library_idle()) {
+                        self.start_eject = true;
+                    }
+                }
+                CloseAction::CloseNow => {
+                    self.force_close = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
         }
     }
 
@@ -1589,6 +1754,223 @@ impl PodlibApp {
         }
     }
 
+    /// Applies the reviewed tags (round 5.5): dispatches the edited
+    /// drafts through the regular AddTracks pipeline and closes the
+    /// modal. An empty book title keeps the modal open with the
+    /// near-field error (validation_attempted); an apply error lands
+    /// in the status bar honestly, and a refused request (busy, no
+    /// device) keeps the modal open with the typed tags.
+    fn commit_tag_review(&mut self) {
+        let Some(review) = self.tag_review.as_mut() else {
+            return;
+        };
+        review.validation_attempted = true;
+        if review.book_title.trim().is_empty() {
+            return; // near-field error is rendered by the modal
+        }
+        match apply_tag_review(
+            &review.drafts,
+            &review.book_title,
+            &review.author,
+            &review.rows,
+        ) {
+            Ok(drafts) => {
+                let transcodes = drafts
+                    .iter()
+                    .filter(|draft| needs_transcode(&path_extension(&draft.source_path)))
+                    .count();
+                let status = batch_add_status(drafts.len(), transcodes, &[]);
+                // Send first, close on success only: a refusal keeps
+                // the modal with the typed tags; the error itself is
+                // already shown by library_request.
+                if self.library_request(
+                    LibraryCommand::AddTracks(drafts),
+                    PendingKind::AddTracks,
+                    &status,
+                ) {
+                    self.tag_review = None;
+                }
+            }
+            Err(message) => {
+                self.tag_review = None;
+                self.error = Some(UiError {
+                    message,
+                    hint: None,
+                    stderr: None,
+                });
+            }
+        }
+    }
+
+    /// Round 5.5: the tag-review modal — common book/author fields and
+    /// an inline per-file table (№, editable title, file name), the
+    /// shared-prefix checkbox and honest near-field validation.
+    fn maybe_tag_review_modal(&mut self, ctx: &egui::Context) {
+        if self.tag_review.is_none() {
+            return;
+        }
+        let mut cancelled = false;
+        let mut committed = false;
+        let response = egui::Modal::new(egui::Id::unique("tag_review_modal")).show(ctx, |ui| {
+            let Some(review) = self.tag_review.as_mut() else {
+                return;
+            };
+            let title = if review.kind_bits == 8 {
+                format!(
+                    "Добавление книги: проверьте теги ({} файлов)",
+                    review.rows.len()
+                )
+            } else {
+                format!(
+                    "Добавление музыки: проверьте теги ({} файлов)",
+                    review.rows.len()
+                )
+            };
+            ui.set_width(560.0);
+            ui.heading(title);
+            ui.add_space(4.0);
+            ui.label("Общее для всех файлов");
+            let kind_field = if review.kind_bits == 8 {
+                "Название книги*"
+            } else {
+                "Альбом"
+            };
+            ui.horizontal(|ui| {
+                ui.label(kind_field);
+                ui.add(
+                    egui::TextEdit::singleline(&mut review.book_title)
+                        .desired_width(320.0),
+                );
+            });
+            if review.validation_attempted && review.book_title.trim().is_empty() {
+                ui.colored_label(egui::Color32::LIGHT_RED, "Укажите название книги");
+            }
+            ui.horizontal(|ui| {
+                ui.label("Автор");
+                ui.add(
+                    egui::TextEdit::singleline(&mut review.author).desired_width(320.0),
+                );
+            });
+            ui.add_space(6.0);
+            if let Some(prefix) = review.prefix.clone() {
+                if ui
+                    .checkbox(
+                        &mut review.strip_prefix,
+                        format!("Убрать общий префикс из названий: «{prefix}»"),
+                    )
+                    .changed()
+                {
+                    for (row, draft) in review.rows.iter_mut().zip(&review.drafts) {
+                        row.title = if review.strip_prefix {
+                            strip_prefix_in(&draft.title, &prefix)
+                        } else {
+                            draft.title.clone()
+                        };
+                    }
+                }
+            }
+            ui.label("Файлы — проверьте названия (Tab — переход между полями):");
+            // Round 5.7 bug 2: NO dnd wrapper here — an empty-payload
+            // drag source sat on top of the row and swallowed mouse
+            // clicks, so the title TextEdit could only be focused via
+            // Tab. Rows render directly; the focused TextEdit IS the
+            // row selection («файл за файлом»).
+            if review.row_rects.len() != review.rows.len()
+                || review.row_edit_ids.len() != review.rows.len()
+                || review.row_edit_rects.len() != review.rows.len()
+            {
+                review.row_rects = vec![egui::Rect::NOTHING; review.rows.len()];
+                review.row_edit_ids = vec![egui::Id::NULL; review.rows.len()];
+                review.row_edit_rects = vec![egui::Rect::NOTHING; review.rows.len()];
+            }
+            let focused_row: Cell<Option<usize>> = Cell::new(None);
+            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                for (index, row) in review.rows.iter_mut().enumerate() {
+                    let selected = review.selected_row == Some(index);
+                    let row_area = ui.allocate_ui(
+                        egui::vec2(ui.available_width(), 24.0),
+                        |ui| {
+                            if selected {
+                                ui.painter().rect_filled(
+                                    ui.max_rect(),
+                                    2.0,
+                                    ui.visuals().selection.bg_fill,
+                                );
+                            }
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{:>2}.", row.track_number));
+                                let title = ui.add(
+                                    egui::TextEdit::singleline(&mut row.title)
+                                        .desired_width(300.0)
+                                        .id_salt(("tag_review_title", index)),
+                                );
+                                review.row_edit_ids[index] = title.id;
+                                review.row_edit_rects[index] = title.rect;
+                                if title.has_focus() {
+                                    focused_row.set(Some(index));
+                                }
+                                let file = &review.files[index];
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(file).weak().small(),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(file);
+                            });
+                        },
+                    );
+                    review.row_rects[index] = row_area.response.rect;
+                    if row_area.response.clicked() {
+                        review.selected_row = Some(index);
+                    }
+                }
+            });
+            // Keyboard navigation («файл за файлом») keeps the row
+            // highlighted as long as its editor holds focus.
+            if let Some(index) = focused_row.get() {
+                review.selected_row = Some(index);
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Отмена").clicked() {
+                    cancelled = true;
+                    ui.close();
+                }
+                let add_label = if review.kind_bits == 8 {
+                    "Добавить книгу"
+                } else {
+                    "Добавить музыку"
+                };
+                if ui.button(add_label).clicked() {
+                    review.validation_attempted = true;
+                    if !review.book_title.trim().is_empty() {
+                        committed = true;
+                        ui.close();
+                    }
+                }
+            });
+        });
+        // Round 5.7 bug 1: «Добавить книгу» sets committed AND calls
+        // ui.close(), so should_close() is true in the SAME frame —
+        // the old cancel-first order cleared the review before the
+        // commit ran, and the dispatch never left the app. The commit
+        // branch must be processed first.
+        self.finish_tag_review_frame(committed, response.should_close(), cancelled);
+    }
+
+    /// Single decision point of the tag-review modal frame: a commit
+    /// outranks a cancel/close (a click on «Добавить книгу» closes the
+    /// modal in the same frame), otherwise any close/cancel drops the
+    /// draft edits intentionally.
+    fn finish_tag_review_frame(&mut self, committed: bool, should_close: bool, cancelled: bool) {
+        if committed {
+            self.commit_tag_review();
+        } else if cancelled || should_close {
+            self.tag_review = None;
+        }
+    }
+
     fn maybe_add_to_playlist_modal(&mut self, ctx: &egui::Context) {
         if !self
             .library
@@ -1676,16 +2058,23 @@ fn picker_close(
 }
 
 /// Status line shown while a batch add runs (P4). The worker protocol
-/// is one command → one reply, so per-file progress («Добавление i/N…»)
+/// is one command → one reply, so per-file progress («Перекодирую i/M…»)
 /// would require extending `LibraryCommand`/`LibraryOutcome` — and the
 /// backend trait contract is out of bounds. Instead the wait is
-/// announced honestly up front; meanwhile every button/menu is disabled
-/// by the idle gates and the spinner shows in the status area.
-fn batch_add_status(count: usize, skipped: &[String]) -> String {
+/// announced honestly up front — including how many files need an
+/// ffmpeg transcode (round 5.2) — meanwhile every button/menu is
+/// disabled by the idle gates and the spinner shows in the status area.
+fn batch_add_status(count: usize, transcode_count: usize, skipped: &[String]) -> String {
+    let transcode_note = if transcode_count > 0 {
+        format!(" ({transcode_count} с транскодом)")
+    } else {
+        String::new()
+    };
     let mut status = format!(
-        "Добавляется {} {}, это может занять время…",
+        "Добавляется {} {}{}, это может занять время…",
         count,
-        plural(count, "файл", "файла", "файлов")
+        plural(count, "файл", "файла", "файлов"),
+        transcode_note
     );
     if !skipped.is_empty() {
         status.push_str(&format!("; пропущены: {}", skipped.join(", ")));
@@ -1796,15 +2185,16 @@ fn apply_row_click(
     ctrl: bool,
     shift: bool,
 ) -> (Vec<usize>, Option<usize>) {
-    if shift && anchor.is_some() {
-        let start = anchor.unwrap();
-        let (from, to) = if start <= clicked {
-            (start, clicked)
-        } else {
-            (clicked, start)
-        };
-        let selected = (from..=to).collect();
-        return (selected, Some(start));
+    if shift {
+        if let Some(start) = anchor {
+            let (from, to) = if start <= clicked {
+                (start, clicked)
+            } else {
+                (clicked, start)
+            };
+            let selected = (from..=to).collect();
+            return (selected, Some(start));
+        }
     }
     if ctrl {
         let mut selected = selected.to_vec();
@@ -1853,6 +2243,314 @@ fn error_tooltip(error: &UiError) -> String {
     text
 }
 
+// ---- round 5: audiobook grouping (pure helpers, tested) ----
+
+/// One book inside the «Аудиокниги» view: the album is the book, the
+/// files are its members in display order. Duration/count are derived
+/// from `track_ids` + the snapshot at render time (single source of
+/// truth, KISS) — not stored here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BookGroup {
+    album: String,
+    author: String,
+    track_ids: Vec<TrackId>,
+}
+
+/// The album-as-book key: blank/missing tags collapse into one
+/// fallback group (pinned last by the sort — see `group_books`).
+const NO_ALBUM_GROUP: &str = "Без альбома";
+
+fn album_group_key(track: &Track) -> String {
+    track
+        .album
+        .as_deref()
+        .map(str::trim)
+        .filter(|album| !album.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| NO_ALBUM_GROUP.to_owned())
+}
+
+/// Sort key of a file inside its book: numbered discs/tracks first
+/// (0 = «no number» sorts last among equals), then title
+/// case-insensitively.
+fn book_file_sort_key(track: &Track) -> (bool, u32, bool, u32, String) {
+    (
+        track.disc_number == 0,
+        track.disc_number,
+        track.track_number == 0,
+        track.track_number,
+        track.title.to_lowercase(),
+    )
+}
+
+/// Groups the (already filtered) audiobook tracks into books.
+/// Groups sort by album case-insensitively; files inside a book by
+/// (disc, track, title) with «no number» last. The author is the first
+/// non-empty album_artist (Apple semantics: album artist outranks the
+/// track artist), then artist, in final file order; without any —
+/// «Неизвестный автор».
+fn group_books<'a>(tracks: impl IntoIterator<Item = &'a Track>) -> Vec<BookGroup> {
+    // Insertion-ordered buckets keep a stable start before sorting.
+    let mut buckets: Vec<(String, Vec<&Track>)> = Vec::new();
+    for track in tracks {
+        let album = album_group_key(track);
+        match buckets.iter_mut().find(|(name, _)| *name == album) {
+            Some((_, members)) => members.push(track),
+            None => buckets.push((album, vec![track])),
+        }
+    }
+    buckets.sort_by(|(album_a, _), (album_b, _)| {
+        // The synthetic fallback bucket («Без альбома») pins last:
+        // real books first, the catch-all below them (the spec only
+        // demands case-insensitive album sorting).
+        let a_last = album_a == NO_ALBUM_GROUP;
+        let b_last = album_b == NO_ALBUM_GROUP;
+        a_last.cmp(&b_last).then_with(|| {
+            album_a.to_lowercase().cmp(&album_b.to_lowercase())
+        })
+    });
+    buckets
+        .into_iter()
+        .map(|(album, mut members)| {
+            members.sort_by_key(|track| book_file_sort_key(track));
+            let author = members
+                .iter()
+                .filter_map(|track| {
+                    track
+                        .album_artist
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            track
+                                .artist
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|text| !text.is_empty())
+                                .map(str::to_owned)
+                        })
+                })
+                .next()
+                .unwrap_or_else(|| "Неизвестный автор".to_owned());
+            BookGroup {
+                album,
+                author,
+                track_ids: members.into_iter().map(|track| track.id).collect(),
+            }
+        })
+        .collect()
+}
+
+/// One rendered line of the «Аудиокниги» view: a collapsible book
+/// header or one of its files. A flat list so the proven index-based
+/// selection (`apply_row_click`, anchor, keyboard) keeps working.
+/// Total book duration as «H:MM» (sub-minute books show «0:00»).
+fn format_total_duration(duration_ms: u64) -> String {
+    let minutes = duration_ms / 60_000;
+    format!("{}:{:02}", minutes / 60, minutes % 60)
+}
+
+// ---- round 5.5: tag review before add (pure helpers, tested) ----
+
+/// A dropped draft has no artist AND no album — it needs the review
+/// modal before it can land in the library with honest tags.
+fn is_untagged(draft: &TrackDraft) -> bool {
+    let empty = |text: &Option<String>| -> bool {
+        text.as_deref().map(str::trim).unwrap_or("").is_empty()
+    };
+    empty(&draft.artist) && empty(&draft.album)
+}
+
+/// Longest common stem prefix (≥2 stems), trimmed back to a « - » or
+/// space boundary, and only if at least 3 characters survive —
+/// otherwise None and the prefix checkbox is not shown.
+fn common_prefix(stems: &[String]) -> Option<String> {
+    if stems.len() < 2 {
+        return None;
+    }
+    let first = stems.first()?.chars().collect::<Vec<_>>();
+    let mut shared = first.len();
+    for stem in &stems[1..] {
+        shared = shared.min(stem.chars().count());
+        for (index, ch) in stem.chars().enumerate().take(shared) {
+            if first[index] != ch {
+                shared = index;
+                break;
+            }
+        }
+    }
+    let prefix: String = first[..shared].iter().collect();
+    let trimmed = match prefix.rfind(" - ") {
+        Some(index) => prefix[..index].to_owned(),
+        None => match prefix.rfind(' ') {
+            Some(index) => prefix[..index].to_owned(),
+            None => prefix.clone(),
+        },
+    };
+    (trimmed.chars().count() >= 3).then_some(trimmed)
+}
+
+/// Trailing digits of a stem = the track number («… - 3» → 3,
+/// «12» → 12, «12a»/«intro» → None).
+fn trailing_number(stem: &str) -> Option<u32> {
+    let digits: String = stem
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
+/// Removes the shared prefix (with its « - »/space tail) from a title.
+fn strip_prefix_in(title: &str, prefix: &str) -> String {
+    title
+        .strip_prefix(prefix)
+        .map(|rest| {
+            rest.trim_start_matches([' ', '-'])
+                .trim_start()
+                .to_owned()
+        })
+        .unwrap_or_else(|| title.to_owned())
+}
+
+/// Applies the reviewed tags to the drafts: album/book title for all,
+/// author as album_artist (when non-empty), per-row title (an empty
+/// edit falls back to the file stem) and track number.
+fn apply_tag_review(
+    drafts: &[TrackDraft],
+    book_title: &str,
+    author: &str,
+    rows: &[TagRow],
+) -> Result<Vec<TrackDraft>, String> {
+    let book = book_title.trim();
+    if book.is_empty() {
+        return Err("Укажите название книги".to_owned());
+    }
+    let author = author.trim();
+    Ok(drafts
+        .iter()
+        .zip(rows)
+        .map(|(draft, row)| {
+            let mut prepared = draft.clone();
+            prepared.album = Some(book.to_owned());
+            if !author.is_empty() {
+                prepared.album_artist = Some(author.to_owned());
+            }
+            let title = row.title.trim();
+            prepared.title = if title.is_empty() {
+                draft.title.clone()
+            } else {
+                title.to_owned()
+            };
+            prepared.track_number = row.track_number;
+            prepared
+        })
+        .collect())
+}
+
+/// Prefill of the book title: the common parent directory name of the
+/// batch (a dropped directory = the book); single stray files and
+/// mixed parents prefill nothing.
+fn prefill_book_title(drafts: &[TrackDraft]) -> String {
+    if drafts.len() < 2 {
+        return String::new();
+    }
+    let parent = drafts[0].source_path.parent();
+    let Some(parent) = parent else {
+        return String::new();
+    };
+    let same_parent = drafts
+        .iter()
+        .all(|draft| draft.source_path.parent() == Some(parent));
+    if same_parent {
+        parent
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned()
+    } else {
+        String::new()
+    }
+}
+
+/// One editable file line of the review modal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TagRow {
+    title: String,
+    track_number: u32,
+}
+
+/// State of the tag-review modal (round 5.5): the drafts are edited
+/// here first and dispatched through the regular AddTracks pipeline on
+/// «Добавить».
+struct TagReview {
+    drafts: Vec<TrackDraft>,
+    kind_bits: u32,
+    book_title: String,
+    author: String,
+    strip_prefix: bool,
+    prefix: Option<String>,
+    /// Display names of the source files (stable for the file column).
+    files: Vec<String>,
+    /// Screen rects of the rendered file rows (stable modal id), used
+    /// by tests to simulate clicks on a row.
+    row_rects: Vec<egui::Rect>,
+    /// Widget ids of the per-row title edits (focus targeting in tests
+    /// and keyboard routing).
+    row_edit_ids: Vec<egui::Id>,
+    /// Screen rects of the per-row title edits (click targeting).
+    row_edit_rects: Vec<egui::Rect>,
+    rows: Vec<TagRow>,
+    selected_row: Option<usize>,
+    validation_attempted: bool,
+}
+
+/// Opens the review modal for a batch: rows prefill from the file
+/// stems (trailing digits become track numbers, otherwise the 1-based
+/// position), the book title prefills from the common parent
+/// directory, and the shared-prefix checkbox is pre-enabled when a
+/// prefix was found.
+fn open_tag_review(drafts: Vec<TrackDraft>) -> TagReview {
+    let kind_bits = drafts.first().map(|d| d.media_kind_bits).unwrap_or(1);
+    let rows: Vec<TagRow> = drafts
+        .iter()
+        .enumerate()
+        .map(|(index, draft)| TagRow {
+            title: draft.title.clone(),
+            track_number: trailing_number(&draft.title)
+                .unwrap_or(index as u32 + 1),
+        })
+        .collect();
+    let stems: Vec<String> = drafts.iter().map(|d| d.title.clone()).collect();
+    let prefix = common_prefix(&stems);
+    TagReview {
+        kind_bits,
+        book_title: prefill_book_title(&drafts),
+        author: String::new(),
+        strip_prefix: prefix.is_some(),
+        prefix,
+        files: drafts
+            .iter()
+            .map(|d| d.source_path.display().to_string())
+            .collect(),
+        row_rects: Vec::new(),
+        row_edit_ids: Vec::new(),
+        row_edit_rects: Vec::new(),
+        rows,
+        selected_row: None,
+        validation_attempted: false,
+        drafts,
+    }
+}
+
 /// Actions requested from the table toolbar in one frame.
 #[derive(Default)]
 struct ToolbarActions {
@@ -1862,21 +2560,33 @@ struct ToolbarActions {
     remove: bool,
 }
 
-/// Toolbar above the track table: search box (Ctrl+F focuses it when
-/// nothing else holds focus), row counter and the selection actions —
-/// always visible, enabled only for a non-empty selection (round 4.1
-/// Ф3). In a playlist context the delete button becomes
-/// «Убрать из плейлиста» (existing RemoveFromPlaylist command).
-fn search_toolbar(
-    ui: &mut egui::Ui,
-    ctx: &egui::Context,
-    query: &mut String,
+/// Aggregated arguments for [`search_toolbar`] (UI chrome above the
+/// track table); `ui` stays a plain argument per egui convention.
+struct SearchToolbarParams<'a> {
+    ctx: &'a egui::Context,
+    query: &'a mut String,
     shown: usize,
     total: usize,
     idle: bool,
     selection_len: usize,
     playlist_context: bool,
-) -> ToolbarActions {
+}
+
+/// Toolbar above the track table: search box (Ctrl+F focuses it when
+/// nothing else holds focus), row counter and the selection actions —
+/// always visible, enabled only for a non-empty selection (round 4.1
+/// Ф3). In a playlist context the delete button becomes
+/// «Убрать из плейлиста» (existing RemoveFromPlaylist command).
+fn search_toolbar(ui: &mut egui::Ui, params: SearchToolbarParams<'_>) -> ToolbarActions {
+    let SearchToolbarParams {
+        ctx,
+        query,
+        shown,
+        total,
+        idle,
+        selection_len,
+        playlist_context,
+    } = params;
     let mut toolbar = ToolbarActions::default();
     ui.horizontal(|ui| {
         // A stable root id (not id_salt) so Ctrl+F can request focus on
@@ -1946,6 +2656,237 @@ fn track_table_builder<'a>(ui: &'a mut egui::Ui, table_id: egui::Id) -> TableBui
         .column(Column::exact(ARTIST_COLUMN).clip(true).resizable(false))
         .column(Column::exact(ALBUM_COLUMN).clip(true).resizable(false))
         .column(Column::exact(DURATION_COLUMN).resizable(false))
+}
+
+/// Aggregated arguments for [`books_view`] («Аудиокниги» table);
+/// `ui` stays a plain argument per egui convention.
+struct BooksViewParams<'a> {
+    ctx: &'a egui::Context,
+    tracks: &'a [&'a Track],
+    selected_tracks: &'a [TrackId],
+    cursor: Option<TrackId>,
+    menus_allowed: bool,
+    visible_ids: &'a [TrackId],
+    expanded: &'a mut HashSet<String>,
+}
+
+/// The «Аудиокниги» view (round 5): books (albums) collapsed by
+/// default; a header click toggles the book; an expanded book shows an
+/// info line (author · files · total duration) and its file list.
+/// File rows reuse the proven selection machinery: clicks report their
+/// index in `visible_ids` (headers are not selectable — they toggle),
+/// so apply_row_click / anchor / toolbar / keyboard all work unchanged.
+fn books_view(ui: &mut egui::Ui, params: BooksViewParams<'_>) -> TrackRowActions {
+    let BooksViewParams {
+        ctx,
+        tracks,
+        selected_tracks,
+        cursor,
+        menus_allowed,
+        visible_ids,
+        expanded,
+    } = params;
+    let mut actions = TrackRowActions::default();
+    if !expanded.is_empty() && ui.button("Свернуть все").clicked() {
+        expanded.clear();
+    }
+    let groups = group_books(tracks.iter().copied());
+    // Durations and titles for the infoblock/file rows; the groups
+    // carry ids only (single source of truth, see BookGroup).
+    let by_id: HashMap<TrackId, &Track> =
+        tracks.iter().map(|track| (track.id, *track)).collect();
+    egui::ScrollArea::vertical()
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            for group in &groups {
+                let is_expanded = expanded.contains(&group.album);
+                let arrow = if is_expanded { "▾" } else { "▸" };
+                let total_ms: u64 = group
+                    .track_ids
+                    .iter()
+                    .filter_map(|id| by_id.get(id).map(|t| u64::from(t.duration_ms)))
+                    .sum();
+                // First-class clickable row: ONE widget senses the
+                // whole line and the content is painted directly —
+                // child labels intercept clicks (and select as text),
+                // retroactive .interact() does not win over them.
+                let (rect, response) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), ROW_HEIGHT),
+                    egui::Sense::click(),
+                );
+                let painter = ui.painter();
+                let visuals = ui.visuals();
+                if is_expanded {
+                    painter.rect_filled(rect, 4.0, visuals.widgets.inactive.bg_fill);
+                }
+                if response.hovered() {
+                    painter.rect_filled(rect, 4.0, visuals.widgets.hovered.bg_fill);
+                }
+                let inner = rect.shrink2(egui::vec2(8.0, 0.0));
+                let middle = rect.center().y;
+                painter.text(
+                    egui::pos2(inner.left(), middle),
+                    egui::Align2::LEFT_CENTER,
+                    format!("{arrow} {}", group.album),
+                    egui::FontId::proportional(14.0),
+                    visuals.strong_text_color(),
+                );
+                painter.text(
+                    egui::pos2(inner.right(), middle),
+                    egui::Align2::RIGHT_CENTER,
+                    format!(
+                        "{} · {}",
+                        group.track_ids.len(),
+                        format_total_duration(total_ms)
+                    ),
+                    egui::FontId::proportional(12.0),
+                    visuals.weak_text_color(),
+                );
+                if response.clicked() {
+                    // Insert-else-remove = toggle.
+                    if !expanded.insert(group.album.clone()) {
+                        expanded.remove(&group.album);
+                    }
+                }
+                if is_expanded {
+                    // One framed block: info line + file list (owner:
+                    // «автор и сводка по книге — в одном выделенном
+                    // блоке»); faint fill reads as a single card.
+                    egui::Frame::default()
+                        .fill(ui.visuals().extreme_bg_color)
+                        .corner_radius(4.0)
+                        .inner_margin(egui::Margin::same(6))
+                        .show(ui, |ui| {
+                            let files_text = format!(
+                                "{} {}",
+                                group.track_ids.len(),
+                                plural(group.track_ids.len(), "файл", "файла", "файлов")
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Автор: {} · {} · {}",
+                                    group.author,
+                                    files_text,
+                                    format_total_duration(total_ms)
+                                ))
+                                .weak()
+                                .size(13.0),
+                            );
+                            ui.add_space(2.0);
+                            for (file_idx, track_id) in group.track_ids.iter().enumerate() {
+                                let Some(track) = by_id.get(track_id) else {
+                                    continue;
+                                };
+                                book_file_row(
+                                    ui,
+                                    ctx,
+                                    selected_tracks,
+                                    cursor,
+                                    menus_allowed,
+                                    visible_ids,
+                                    file_idx,
+                                    track,
+                                    &mut actions,
+                                );
+                            }
+                        });
+                }
+            }
+        });
+    actions
+}
+
+/// One audio file inside an expanded book: a painted row that senses
+/// click/dblclick (selection machinery via visible_ids indices), ПКМ
+/// menu, and drag — the payload is set manually on drag start.
+#[allow(clippy::too_many_arguments)]
+fn book_file_row(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    selected_tracks: &[TrackId],
+    cursor: Option<TrackId>,
+    menus_allowed: bool,
+    visible_ids: &[TrackId],
+    file_idx: usize,
+    track: &Track,
+    actions: &mut TrackRowActions,
+) {
+    let track_id = track.id;
+    let selected = selected_tracks.contains(&track_id) || cursor == Some(track_id);
+    let payload = DraggedTracks(vec![track_id]);
+    let mut clicked = false;
+    let mut double_clicked = false;
+    // Manual drag source: sense click+drag on the painted row and set
+    // the payload on drag start. `dnd_drag_source` re-renders the row
+    // into a screen-space tooltip layer and translates by
+    // `pointer - rect.center()` — panel coords vs screen coords mix,
+    // throwing the row to the left screen edge (owner artifact).
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), ROW_HEIGHT),
+        egui::Sense::click() | egui::Sense::drag(),
+    );
+    let painter = ui.painter();
+    let visuals = ui.visuals();
+    if selected {
+        painter.rect_filled(rect, 2.0, visuals.selection.bg_fill);
+    } else if response.hovered() {
+        painter.rect_filled(rect, 2.0, visuals.widgets.hovered.bg_fill);
+    }
+    let inner = rect.shrink2(egui::vec2(4.0, 0.0));
+    let middle = rect.center().y;
+    painter.text(
+        egui::pos2(inner.left(), middle),
+        egui::Align2::LEFT_CENTER,
+        format!("{}. {}", file_idx + 1, track.title),
+        egui::FontId::proportional(14.0),
+        visuals.text_color(),
+    );
+    painter.text(
+        egui::pos2(inner.right(), middle),
+        egui::Align2::RIGHT_CENTER,
+        format_duration(track.duration_ms),
+        egui::FontId::proportional(12.0),
+        visuals.weak_text_color(),
+    );
+    let response = response.on_hover_cursor(egui::CursorIcon::Grab);
+    if response.drag_started() {
+        egui::DragAndDrop::set_payload(ctx, payload);
+    }
+    if response.clicked() {
+        clicked = true;
+    }
+    if response.double_clicked() {
+        double_clicked = true;
+    }
+    // Double-click wins over plain click (round 4).
+    if double_clicked {
+        actions.edit = Some(track_id);
+        actions.select = Some(track_id);
+    } else if clicked {
+        let (ctrl, shift) = ctx.input(|input| (input.modifiers.ctrl, input.modifiers.shift));
+        if let Some(index) = visible_ids.iter().position(|&candidate| candidate == track_id) {
+            actions.row_click = Some((index, ctrl, shift));
+        }
+    }
+    if menus_allowed {
+        let mut choice = TrackRowActions::default();
+        response.context_menu(|ui| {
+            if ui.button("Изменить…").clicked() {
+                choice.edit = Some(track_id);
+                ui.close();
+            }
+            if ui.button("Добавить в плейлист…").clicked() {
+                choice.add_to_playlist = Some(vec![track_id]);
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Удалить…").clicked() {
+                choice.delete = Some(track_id);
+                ui.close();
+            }
+        });
+        actions.merge(choice);
+    }
 }
 
 /// The track table (round 4): `egui_extras::TableBuilder` with striped
@@ -2329,17 +3270,45 @@ fn draw_drop_overlay(ui: &egui::Ui, names: &[String]) {
 }
 
 /// Worker-thread body: run the sudo mount sequence (`mkdir -p`, then
-/// rw-mount) and report the mount point. The library is NOT opened here:
+/// rw-mount) and report the mount point plus whether THIS run actually
+/// performed the mount (round 5.3: an already-mounted target is skipped
+/// — idempotent connect — and then the mount is not ours, so closing
+/// the app must not unmount it). The library is NOT opened here:
 /// `Box<dyn LibraryBackend>` is not `Send`, so it is opened on the library
 /// worker thread instead (see library.rs).
 fn connect_device(
     password: String, // owned: dropped right after the last command (W3)
     steps: Vec<device::CommandSpec>,
     mount_path: PathBuf,
-) -> Result<PathBuf, ConnectError> {
+    block_dev: PathBuf,
+) -> Result<(PathBuf, bool), ConnectError> {
     // WHY the password lives across the whole loop: every sudo step
     // consumes its own copy from stdin; it is dropped only after the
     // last step, never stored anywhere.
+    // Idempotent mount (round 5.3): /proc/mounts decides whether the
+    // target is already ours (skip the mount step — and remember the
+    // mount is NOT ours, so closing will not unmount it), mounted from
+    // another device (honest refusal), or free (mount as usual).
+    let mounts = std::fs::read_to_string("/proc/mounts")
+        .map(|content| device::parse_proc_mounts(&content))
+        .unwrap_or_default();
+    match device::decide_mount(&mounts, &block_dev, &mount_path) {
+        device::MountDecision::AlreadyMounted => {
+            drop(password);
+            return Ok((mount_path, false));
+        }
+        device::MountDecision::ConflictsWith(other) => {
+            drop(password);
+            return Err(ConnectError::Mount {
+                stderr: format!(
+                    "{mount_path_display} уже смонтирован с {other} — подключение отменено.",
+                    mount_path_display = mount_path.display()
+                ),
+                error: MountError::AlreadyMounted,
+            });
+        }
+        device::MountDecision::Free => {}
+    }
     for spec in &steps {
         let output =
             device::run_sudo_mount(&password, spec).map_err(|error| ConnectError::Mount {
@@ -2351,7 +3320,7 @@ fn connect_device(
             .map_err(|error| ConnectError::Mount { error, stderr })?;
     }
     drop(password);
-    Ok(mount_path)
+    Ok((mount_path, true))
 }
 
 /// Runs a worker body, converting a panic into an honest error value.
@@ -2371,6 +3340,11 @@ impl eframe::App for PodlibApp {
         self.drain_library();
         self.guard_close_request(ui);
         self.collect_dropped_files(ui);
+        // A close requested mid-operation ejects the device as soon as
+        // the app becomes idle (round 5.3).
+        if deferred_eject_due(self.pending_close_after_eject, self.busy, self.library_idle()) {
+            self.start_eject = true;
+        }
         // A selected view deleted from the device falls back to the
         // master view (checked once per frame, before panels).
         if let Some(library) = self.library.as_mut() {
@@ -2406,7 +3380,17 @@ impl eframe::App for PodlibApp {
                     self.device_panel(ui);
                 }
             });
-        // 3) Central panel: the selected playlist context (master = the
+        // 3) Status bar BEFORE the central panel (round 5.3 Ф1): a
+        //    bottom panel declared after the central one shrinks to
+        //    nothing — the central panel already claimed the space and
+        //    the owner lost all feedback. egui lays panels out in
+        //    declaration order; the central panel takes what remains.
+        egui::Panel::bottom("status_bar")
+            .default_size(34.0)
+            .min_size(26.0) // round 5.3 Ф1: never collapses below one row
+            .resizable(false)
+            .show(ui, |ui| self.status_bar(ui));
+        // 4) Central panel: the selected playlist context (master = the
         //    whole library), or a plain hint while disconnected.
         egui::CentralPanel::default().show(ui, |ui| {
             if self.connected.is_none() {
@@ -2430,11 +3414,6 @@ impl eframe::App for PodlibApp {
                 self.library_view(ui);
             }
         });
-        // 4) Status bar: progress / last result / error + DnD hint.
-        egui::Panel::bottom("status_bar")
-            .default_size(34.0)
-            .resizable(false)
-            .show(ui, |ui| self.status_bar(ui));
         // Hover preview above everything while files are dragged over us.
         let hovered: Vec<String> = ui
             .input(|input| {
@@ -2456,6 +3435,7 @@ impl eframe::App for PodlibApp {
         self.maybe_mount_modal(&ctx);
         self.maybe_eject_modal(&ctx);
         self.maybe_close_confirm_modal(&ctx);
+        self.maybe_tag_review_modal(&ctx);
         self.maybe_delete_track_modal(&ctx);
         self.maybe_delete_playlist_modal(&ctx);
         self.maybe_create_playlist_modal(&ctx);
@@ -2570,7 +3550,7 @@ mod tests {
         app.busy = true;
         let (tx, rx) = channel();
         app.rx = Some(rx);
-        let error: Result<PathBuf, ConnectError> =
+        let error: Result<(PathBuf, bool), ConnectError> =
             run_worker_step(|| panic!("worker exploded"), ConnectError::Internal);
         tx.send(DeviceEvent::Connected(error)).unwrap();
         drop(tx); // the panicking worker is gone: the channel closes
@@ -2583,13 +3563,13 @@ mod tests {
 
     #[test]
     fn worker_without_panic_passes_result_through() {
-        let result: Result<PathBuf, ConnectError> = run_worker_step(
-            || Ok(PathBuf::from("/run/media/ipod")),
+        let result: Result<(PathBuf, bool), ConnectError> = run_worker_step(
+            || Ok((PathBuf::from("/run/media/ipod"), true)),
             |_| unreachable!(),
         );
         assert_eq!(
             result.unwrap(),
-            PathBuf::from("/run/media/ipod")
+            (PathBuf::from("/run/media/ipod"), true)
         );
     }
 
@@ -2599,7 +3579,7 @@ mod tests {
     fn connected_event_opens_library_and_loads_snapshot() {
         let dir = fixture_mount();
         let mut app = test_app();
-        app.handle_event(DeviceEvent::Connected(Ok(dir.path().to_owned())));
+        app.handle_event(DeviceEvent::Connected(Ok((dir.path().to_owned(), true))));
         assert!(app.connected.is_some());
         assert!(app.library.is_some());
         let loaded = pump(&mut app, |app| {
@@ -2626,7 +3606,7 @@ mod tests {
     fn open_failure_reports_mounted_volume_and_drops_library() {
         let dir = TempDir::new().unwrap(); // no library inside
         let mut app = test_app();
-        app.handle_event(DeviceEvent::Connected(Ok(dir.path().to_owned())));
+        app.handle_event(DeviceEvent::Connected(Ok((dir.path().to_owned(), true))));
         let dropped = pump(&mut app, |app| app.library.is_none());
         assert!(dropped, "failed open must drop the library UI");
         let error = app.error.expect("open failure must be shown");
@@ -2640,7 +3620,7 @@ mod tests {
     fn app_with_open_library() -> (PodlibApp, TempDir) {
         let dir = fixture_mount();
         let mut app = test_app();
-        app.handle_event(DeviceEvent::Connected(Ok(dir.path().to_owned())));
+        app.handle_event(DeviceEvent::Connected(Ok((dir.path().to_owned(), true))));
         let settled = pump(&mut app, |app| {
             app.library
                 .as_ref()
@@ -2901,6 +3881,69 @@ mod tests {
         assert_eq!(close_decision(false, false, true), CloseDecision::Allow);
     }
 
+    // ---- close = safe unmount for app-created mounts (round 5.3 Ф3) ----
+
+    #[test]
+    fn confirmed_close_ejects_first_only_for_app_created_mounts() {
+        assert_eq!(
+            close_confirmation_action(true),
+            CloseAction::EjectFirst,
+            "the app created the mount: unmount before closing"
+        );
+        assert_eq!(
+            close_confirmation_action(false),
+            CloseAction::CloseNow,
+            "an externally mounted volume is not our responsibility"
+        );
+    }
+
+    #[test]
+    fn deferred_eject_fires_only_when_idle() {
+        assert!(deferred_eject_due(true, false, true), "idle → eject now");
+        assert!(!deferred_eject_due(true, true, false), "busy → wait");
+        assert!(!deferred_eject_due(false, false, true), "no pending close");
+    }
+
+    // ---- status bar visibility (round 5.3 Ф1) ----
+
+    /// Регрессия живого прогона 5.2: bottom-панель, объявленная ПОСЛЕ
+    /// CentralPanel, схлопывалась до нуля (центральная забирала всё
+    /// оставшееся место) и владелец терял все статусы и ошибки. Новый
+    /// порядок (bottom до central) обязан держать высоту ≥ 26px.
+    #[test]
+    fn status_bar_panel_stays_visible_when_declared_before_central() {
+        // The regression of live run 5.2: a bottom panel declared AFTER
+        // the central one collapsed to nothing (the central panel had
+        // already claimed the remaining space) and the owner lost every
+        // status and error. The new order (bottom before central) must
+        // keep the full panel height — animations disabled so a single
+        // frame measures the settled layout.
+        egui::__run_test_ui(|ui| {
+            ui.style_mut().animation_time = 0.0;
+            egui::Panel::top("r53_top").default_size(40.0).show(ui, |ui| {
+                ui.label("podlib");
+            });
+            egui::Panel::left("r53_left").default_size(120.0).show(ui, |ui| {
+                ui.label("sidebar");
+            });
+            let bottom = egui::Panel::bottom("r53_bottom")
+                .default_size(34.0)
+                .min_size(26.0)
+                .resizable(false)
+                .show(ui, |ui| {
+                    ui.label("Готово");
+                });
+            assert!(
+                bottom.response.rect.height() >= 26.0,
+                "status bar collapsed: {} px",
+                bottom.response.rect.height()
+            );
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.label("central");
+            });
+        });
+    }
+
     // ---- pure UI helpers ----
 
     #[test]
@@ -2923,21 +3966,25 @@ mod tests {
     #[test]
     fn batch_add_status_announces_the_wait_and_skips() {
         assert_eq!(
-            batch_add_status(1, &[]),
+            batch_add_status(1, 0, &[]),
             "Добавляется 1 файл, это может занять время…"
         );
         assert_eq!(
-            batch_add_status(2, &[]),
+            batch_add_status(2, 0, &[]),
             "Добавляется 2 файла, это может занять время…"
         );
         assert_eq!(
-            batch_add_status(30, &[]),
+            batch_add_status(30, 0, &[]),
             "Добавляется 30 файлов, это может занять время…"
         );
         assert_eq!(
-            batch_add_status(3, &["notes.txt".to_owned(), "noext".to_owned()]),
+            batch_add_status(3, 0, &["notes.txt".to_owned(), "noext".to_owned()]),
             "Добавляется 3 файла, это может занять время…; \
              пропущены: notes.txt, noext"
+        );
+        assert_eq!(
+            batch_add_status(5, 2, &[]),
+            "Добавляется 5 файлов (2 с транскодом), это может занять время…"
         );
     }
 
@@ -3104,6 +4151,436 @@ mod tests {
         assert_eq!(activated(&visible, Some(TrackId::from_bits(99))), None);
         let empty: Vec<TrackId> = Vec::new();
         assert_eq!(activated(&empty, Some(TrackId::from_bits(10))), None);
+    }
+
+    // ---- round 5.5: tag review modal ----
+
+    fn tag_draft(
+        stem: &str,
+        artist: Option<&str>,
+        album: Option<&str>,
+        bits: u32,
+    ) -> TrackDraft {
+        let mut draft =
+            TrackDraft::new(PathBuf::from(format!("/drop/{stem}.mp3")), stem).unwrap();
+        draft.artist = artist.map(str::to_owned);
+        draft.album = album.map(str::to_owned);
+        draft.media_kind_bits = bits;
+        draft
+    }
+
+    #[test]
+    fn is_untagged_flags_only_artist_and_album_absence() {
+        assert!(is_untagged(&tag_draft("a", None, None, 1)));
+        assert!(is_untagged(&tag_draft("a", Some("  "), Some(""), 1)));
+        assert!(!is_untagged(&tag_draft("a", Some("Artist"), None, 1)));
+        assert!(!is_untagged(&tag_draft("a", None, Some("Album"), 1)));
+    }
+
+    #[test]
+    fn common_prefix_trims_to_a_boundary_and_needs_3_chars() {
+        // The live case: directory «Skazka o ribake i ribki» with files
+        // «… - 1..5» → the whole repeating prefix is stripped.
+        let stems: Vec<String> = (1..=5)
+            .map(|n| format!("Skazka o ribake i ribki - {n}"))
+            .collect();
+        assert_eq!(
+            common_prefix(&stems).as_deref(),
+            Some("Skazka o ribake i ribki")
+        );
+        // No shared prefix at all.
+        assert_eq!(common_prefix(&["alpha".to_owned(), "beta".to_owned()]), None);
+        // Shared but too short.
+        assert_eq!(common_prefix(&["ab1".to_owned(), "ab2".to_owned()]), None);
+        // A single stem never shows the checkbox.
+        assert_eq!(common_prefix(&["Skazka o ribake i ribki - 1".to_owned()]), None);
+    }
+
+    #[test]
+    fn trailing_number_reads_the_stem_tail() {
+        assert_eq!(
+            trailing_number("Skazka o ribake i ribki - 1"),
+            Some(1)
+        );
+        assert_eq!(trailing_number("Chapter 12"), Some(12));
+        assert_eq!(trailing_number("12"), Some(12));
+        assert_eq!(trailing_number("track-07"), Some(7));
+        assert_eq!(trailing_number("12a"), None);
+        assert_eq!(trailing_number("intro"), None);
+    }
+
+    #[test]
+    fn apply_tag_review_fills_fields_validates_and_falls_back_to_stem() {
+        let drafts = vec![
+            tag_draft("Skazka - 1", None, None, 8),
+            tag_draft("Skazka - 2", None, None, 8),
+        ];
+        let rows = vec![
+            TagRow { title: "Глава 1".to_owned(), track_number: 1 },
+            TagRow { title: String::new(), track_number: 2 }, // empty → stem
+        ];
+        // Empty book title is rejected with the near-field text.
+        assert_eq!(
+            apply_tag_review(&drafts, "   ", "Пушкин", &rows).unwrap_err(),
+            "Укажите название книги"
+        );
+        let applied = apply_tag_review(&drafts, "Сказка о рыбаке", "Пушкин", &rows).unwrap();
+        assert_eq!(applied.len(), 2);
+        for draft in &applied {
+            assert_eq!(draft.album.as_deref(), Some("Сказка о рыбаке"));
+            assert_eq!(draft.album_artist.as_deref(), Some("Пушкин"));
+        }
+        assert_eq!(applied[0].title, "Глава 1");
+        assert_eq!(applied[0].track_number, 1);
+        assert_eq!(applied[1].title, "Skazka - 2", "empty edit falls back to stem");
+        assert_eq!(applied[1].track_number, 2);
+        // An empty author must NOT overwrite the draft's artist field.
+        let no_author = apply_tag_review(&drafts, "Книга", "", &rows).unwrap();
+        assert_eq!(no_author[0].album_artist, None);
+    }
+
+    #[test]
+    fn open_tag_review_prefills_rows_prefix_and_book_title() {
+        let drafts = vec![
+            tag_draft("Skazka o ribake i ribki - 1", None, None, 8),
+            tag_draft("Skazka o ribake i ribki - 2", None, None, 8),
+            tag_draft("Skazka o ribake i ribki - 3", None, None, 8),
+        ];
+        let review = open_tag_review(drafts);
+        assert_eq!(review.kind_bits, 8);
+        assert_eq!(review.rows[0].title, "Skazka o ribake i ribki - 1");
+        assert_eq!(review.rows[0].track_number, 1, "trailing digits win");
+        assert_eq!(review.rows[2].track_number, 3);
+        assert_eq!(
+            review.prefix.as_deref(),
+            Some("Skazka o ribake i ribki")
+        );
+        assert!(review.strip_prefix, "found prefix → checkbox pre-enabled");
+        assert_eq!(review.book_title, "drop", "common parent dir name prefills");
+    }
+
+    #[derive(Debug)]
+    struct TestDroppedFile(PathBuf);
+
+    impl egui::DroppedFile for TestDroppedFile {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            std::fs::read(&self.0).map_err(|error| error.to_string())
+        }
+    }
+
+    /// Round 5.5 end-to-end (headless): an untagged directory drop
+    /// opens the review modal INSTEAD of dispatching; after editing the
+    /// common fields and one row, «Добавить» dispatches the edited
+    /// drafts through the regular AddTracks pipeline.
+    #[test]
+    fn untagged_drop_opens_review_modal_then_dispatches_edited_drafts() {
+        let (mut app, _dir) = app_with_open_library();
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("book")).unwrap();
+        let first = dir.path().join("book/01.mp3");
+        let second = dir.path().join("book/02.mp3");
+        std::fs::write(&first, b"x").unwrap();
+        std::fs::write(&second, b"x").unwrap();
+
+        // Frame 1: the directory drop.
+        egui::__run_test_ui(|ui| {
+            ui.input_mut(|input| {
+                input.raw.dropped_files = vec![
+                    std::sync::Arc::new(TestDroppedFile(first.clone()))
+                        as std::sync::Arc<dyn egui::DroppedFile + Send + Sync>,
+                    std::sync::Arc::new(TestDroppedFile(second.clone()))
+                        as std::sync::Arc<dyn egui::DroppedFile + Send + Sync>,
+                ];
+            });
+            app.collect_dropped_files(ui);
+        });
+        let review = app
+            .tag_review
+            .as_ref()
+            .expect("an untagged drop must open the review modal");
+        assert_eq!(review.rows.len(), 2);
+        assert_eq!(review.book_title, "book", "the directory name prefills");
+        assert!(
+            app.library
+                .as_ref()
+                .unwrap()
+                .pending
+                .is_none(),
+            "nothing is dispatched until the review is applied"
+        );
+
+        // Frame 2: the user edits fields (modal body)…
+        let review = app.tag_review.as_mut().unwrap();
+        review.book_title = "Сказка о рыбаке".to_owned();
+        review.author = "Пушкин".to_owned();
+        review.rows[1].title = "Глава 2".to_owned();
+        review.rows[1].track_number = 2;
+        // …and presses «Добавить книгу»: the button marks the frame
+        // committed AND closes the modal, so the frame ends with
+        // committed=true AND should_close=true (round 5.7 bug 1 — the
+        // old cancel-first order swallowed exactly this combination).
+        egui::__run_test_ui(|ui| {
+            app.maybe_tag_review_modal(&ui.ctx().clone());
+        });
+        app.finish_tag_review_frame(true, true, false);
+
+        let pending = app
+            .library
+            .as_ref()
+            .unwrap()
+            .pending
+            .as_ref()
+            .expect("AddTracks must be dispatched after the review");
+        assert!(matches!(pending.0, PendingKind::AddTracks));
+        let settled = pump(&mut app, |app| {
+            app.library
+                .as_ref()
+                .is_some_and(|library| library.pending.is_none())
+        });
+        assert!(settled, "the batch must complete");
+        let library = app.library.as_ref().unwrap();
+        assert_eq!(library.snapshot.tracks.len(), 3, "fixture Alpha + 2 files");
+        let chapter_two = library
+            .snapshot
+            .tracks
+            .iter()
+            .find(|track| track.title == "Глава 2")
+            .expect("the edited title must land");
+        assert_eq!(chapter_two.album.as_deref(), Some("Сказка о рыбаке"));
+        // NOTE: the classic fixture parser never returns album_artist
+        // (project.rs keeps it None), so it is asserted in
+        // apply_tag_review_fills_fields… on the drafts themselves; on
+        // the 7G device libopod stores and returns it.
+        assert_eq!(chapter_two.track_number, 2);
+        assert!(app.tag_review.is_none(), "the modal closes after applying");
+        let library = app.library.take().unwrap();
+        library.worker.close_and_join();
+    }
+
+    #[test]
+    fn finish_frame_commit_outranks_same_frame_close() {
+        // Round 5.7 bug 1: a real «Добавить книгу» click closes the
+        // modal in the same frame (should_close=true) — the commit must
+        // still win. Without a library the dispatched request answers
+        // with the honest «подключите устройство» error, which proves
+        // the request actually REACHED the dispatch path (the old
+        // cancel-first order swallowed it silently). The refusal keeps
+        // the modal with the typed tags: user input is not lost to a
+        // busy/no-device worker (minor-5).
+        let mut app = test_app();
+        let draft = tag_draft("Skazka - 1", None, None, 8);
+        let mut review = open_tag_review(vec![draft]);
+        review.book_title = "Книга".to_owned(); // valid title → commit dispatches
+        app.tag_review = Some(review);
+        app.finish_tag_review_frame(true, true, false);
+        let error = app
+            .error
+            .as_ref()
+            .expect("committed request must reach the dispatch path");
+        assert!(error.message.contains("подключите"), "got: {}", error.message);
+        assert!(app.tag_review.is_some(), "refusal keeps the typed modal open");
+    }
+
+    #[test]
+    fn finish_frame_cancel_drops_the_draft() {
+        let mut app = test_app();
+        let draft = tag_draft("Skazka - 1", None, None, 8);
+        app.tag_review = Some(open_tag_review(vec![draft]));
+        app.finish_tag_review_frame(false, true, false);
+        assert!(app.tag_review.is_none(), "cancel drops the draft");
+        assert!(app.error.is_none(), "cancel dispatches nothing");
+    }
+
+    #[test]
+    fn focused_title_edit_selects_its_row() {
+        // Round 5.7 bug 2 regression: the row title is a plain TextEdit
+        // now (no drag wrapper swallowing clicks); whatever way the
+        // user focuses it — mouse click (standard egui behavior, no
+        // interceptor anymore) or Tab — the FOCUSED edit selects its
+        // row. Focus is simulated programmatically here (headless).
+        let draft = tag_draft("Skazka - 1", None, None, 8);
+        let mut app = test_app();
+        app.tag_review = Some(open_tag_review(vec![
+            draft,
+            tag_draft("Skazka - 2", None, None, 8),
+        ]));
+        let ctx = egui::Context::default();
+        // Frame 1: render the modal — row edit ids become known.
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            ui.style_mut().animation_time = 0.0;
+            app.maybe_tag_review_modal(&ui.ctx().clone());
+        });
+        output.textures_delta.clear();
+        let title_id = app.tag_review.as_ref().unwrap().row_edit_ids[1];
+        assert_ne!(title_id, egui::Id::NULL, "row edit id must be recorded");
+        assert_ne!(
+            ctx.memory(|memory| memory.focused()),
+            Some(title_id),
+            "no focus before focusing"
+        );
+
+        // Frame 2: focus row 1's editor (as a mouse click / Tab would).
+        ctx.memory_mut(|memory| memory.request_focus(title_id));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            ui.style_mut().animation_time = 0.0;
+            app.maybe_tag_review_modal(&ui.ctx().clone());
+        });
+        output.textures_delta.clear();
+        assert_eq!(
+            ctx.memory(|memory| memory.focused()),
+            Some(title_id),
+            "the title TextEdit keeps focus"
+        );
+        assert_eq!(
+            app.tag_review.as_ref().unwrap().selected_row,
+            Some(1),
+            "the focused row is the selected row"
+        );
+    }
+
+    #[test]
+    fn commit_without_book_title_keeps_modal_and_sets_validation() {
+        let (mut app, _dir) = app_with_open_library();
+        let draft = tag_draft("Skazka - 1", None, None, 8);
+        app.tag_review = Some(open_tag_review(vec![draft]));
+        app.commit_tag_review();
+        let review = app.tag_review.as_ref().expect("modal stays open");
+        assert!(review.validation_attempted, "near-field error is shown");
+        assert!(
+            app.library.as_ref().unwrap().pending.is_none(),
+            "nothing dispatched on an empty book title"
+        );
+        app.library.take().unwrap().worker.close_and_join();
+    }
+
+    // ---- audiobook grouping (round 5) ----
+
+    /// Book-file constructor: album/author/disk/track/duration per field.
+    #[allow(clippy::too_many_arguments)]
+    fn book_track(
+        id: u64,
+        title: &str,
+        album: Option<&str>,
+        album_artist: Option<&str>,
+        artist: Option<&str>,
+        disc: u32,
+        number: u32,
+        duration_ms: u32,
+    ) -> Track {
+        Track {
+            id: TrackId::from_bits(id),
+            title: title.to_owned(),
+            artist: artist.map(str::to_owned),
+            album: album.map(str::to_owned),
+            album_artist: album_artist.map(str::to_owned),
+            duration_ms,
+            track_number: number,
+            disc_number: disc,
+            size_bytes: 1024,
+            has_artwork: false,
+            media_kind: 8,
+        }
+    }
+
+    #[test]
+    fn books_group_by_album_with_author_fallbacks() {
+        let tracks = vec![
+            book_track(1, "Глава 1", Some("Сказки"), Some("Народ"), Some("Иной"), 1, 1, 60_000),
+            book_track(2, "Глава 2", Some("Сказки"), Some("  "), Some("Иной"), 1, 2, 60_000),
+            book_track(3, "Песня", Some("   "), None, Some("Певец"), 1, 1, 30_000),
+        ];
+        let groups = group_books(&tracks);
+        assert_eq!(groups.len(), 2);
+        // Album artist wins over the track artist; blank cells are skipped.
+        assert_eq!(groups[0].album, "Сказки");
+        assert_eq!(groups[0].author, "Народ");
+        assert_eq!(
+            groups[0].track_ids,
+            [TrackId::from_bits(1), TrackId::from_bits(2)]
+        );
+        // A blank album is its own group.
+        assert_eq!(groups[1].album, "Без альбома");
+        assert_eq!(groups[1].author, "Певец");
+    }
+
+    #[test]
+    fn books_and_files_sort_deterministically() {
+        let tracks = vec![
+            book_track(1, "глава", Some("Б"), None, None, 1, 3, 60_000),
+            book_track(2, "пролог", Some("а"), None, None, 0, 5, 60_000),
+            book_track(3, "эпилог", Some("Б"), None, None, 2, 1, 60_000),
+            // No disc → after all discs; no number → after numbered ones.
+            book_track(4, "без номера", Some("а"), None, None, 0, 0, 60_000),
+            // Equal disc+number: title decides, case-insensitively.
+            book_track(5, "Бета", Some("Б"), None, None, 1, 1, 60_000),
+            book_track(6, "альфа", Some("Б"), None, None, 1, 1, 60_000),
+        ];
+        let groups = group_books(&tracks);
+        let albums: Vec<&str> = groups.iter().map(|g| g.album.as_str()).collect();
+        assert_eq!(albums, ["а", "Б"], "groups sort case-insensitively");
+        // Group «а»: no-disc file after… actually both files are
+        // disc-less: numbered (#5) before unnumbered.
+        assert_eq!(groups[0].track_ids, [TrackId::from_bits(2), TrackId::from_bits(4)]);
+        // Group «Б»: disc 1 before disc 2; equal disc+number → title
+        // case-insensitively («альфа» < «Бета» < «глава»).
+        assert_eq!(
+            groups[1].track_ids,
+            [
+                TrackId::from_bits(6),
+                TrackId::from_bits(5),
+                TrackId::from_bits(1),
+                TrackId::from_bits(3),
+            ]
+        );
+        // Author: first non-empty album_artist/artist in file order —
+        // here nobody has any → the honest placeholder.
+        assert_eq!(groups[0].author, "Неизвестный автор");
+    }
+
+    #[test]
+    fn no_album_group_pins_last_after_real_books() {
+        let tracks = vec![
+            book_track(1, "Файл", Some("Ясно"), None, None, 1, 1, 60_000),
+            book_track(2, "Файл", None, None, None, 1, 1, 60_000),
+        ];
+        let groups = group_books(&tracks);
+        let albums: Vec<&str> = groups.iter().map(|g| g.album.as_str()).collect();
+        assert_eq!(albums, ["Ясно", "Без альбома"], "the catch-all group goes last");
+    }
+
+    #[test]
+    fn book_without_any_artist_is_unknown() {
+        let tracks = vec![book_track(1, "Файл", None, None, None, 1, 1, 60_000)];
+        let groups = group_books(&tracks);
+        assert_eq!(groups[0].album, "Без альбома");
+        assert_eq!(groups[0].author, "Неизвестный автор");
+    }
+
+    #[test]
+    fn total_duration_formats_hours_minutes() {
+        assert_eq!(format_total_duration(0), "0:00");
+        assert_eq!(format_total_duration(47_000), "0:00", "sub-minute stays 0:00");
+        assert_eq!(format_total_duration(60_000), "0:01");
+        assert_eq!(format_total_duration(3_600_000), "1:00");
+        assert_eq!(format_total_duration(3_780_000), "1:03");
     }
 
     // ---- toolbar counter and empty-states (round 4 UX) ----

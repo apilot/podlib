@@ -21,7 +21,7 @@ pub struct CommandSpec {
 }
 
 impl CommandSpec {
-    fn new(program: &str, args: &[&str]) -> Self {
+    pub(crate) fn new(program: &str, args: &[&str]) -> Self {
         Self {
             program: program.to_owned(),
             args: args.iter().map(|arg| (*arg).to_owned()).collect(),
@@ -172,18 +172,36 @@ pub fn merge_candidates(
     user: &str,
 ) -> Vec<(DeviceCandidate, Option<PathBuf>)> {
     let mut out: Vec<(DeviceCandidate, Option<PathBuf>)> = Vec::new();
-    let mut mounted_devs: Vec<Option<&Path>> = Vec::new();
-    for (candidate, dev) in &mounted {
-        mounted_devs.push(dev.as_deref());
-        out.push((candidate.clone(), dev.clone()));
-    }
-    for disk in disks {
-        if mounted_devs
-            .iter()
-            .any(|dev| *dev == Some(disk.partition.as_path()))
-        {
+    let mut seen_devs: Vec<Option<PathBuf>> = Vec::new();
+    for (candidate, dev) in mounted {
+        // Stacked mounts of one devnode (repeated «Подключить» over an
+        // existing mount) collapse into one row: the first target wins.
+        // A mounted candidate without a resolvable devnode is a stale
+        // mount of an unplugged device — shown as Unmounted instead of
+        // crashing or pretending it is usable.
+        if seen_devs.contains(&dev) {
             continue;
         }
+        seen_devs.push(dev.clone());
+        let candidate = match candidate.kind {
+            CandidateKind::Mounted if dev.is_none() => DeviceCandidate {
+                mount: default_mount_path(&candidate.label, user),
+                label: candidate.label,
+                kind: CandidateKind::Unmounted,
+            },
+            kind_state => DeviceCandidate {
+                mount: candidate.mount,
+                label: candidate.label,
+                kind: kind_state,
+            },
+        };
+        out.push((candidate, dev));
+    }
+    for disk in disks {
+        if seen_devs.iter().any(|dev| dev.as_deref() == Some(disk.partition.as_path())) {
+            continue;
+        }
+        seen_devs.push(Some(disk.partition.clone()));
         out.push((
             DeviceCandidate {
                 mount: default_mount_path(&disk.label, user),
@@ -195,6 +213,73 @@ pub fn merge_candidates(
     }
     out.sort_by(|a, b| a.0.mount.cmp(&b.0.mount));
     out
+}
+
+/// Parsed `/proc/mounts` entry: (source device, mount point), with the
+/// kernel's octal escapes (`\040` space, `\011` tab, `\012` newline,
+/// `\134` backslash) decoded.
+pub fn parse_proc_mounts(content: &str) -> Vec<(String, String)> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let source = fields.next()?;
+            let target = fields.next()?;
+            Some((unescape_mount(source), unescape_mount(target)))
+        })
+        .collect()
+}
+
+/// Decodes the kernel's octal escapes in `/proc/mounts` fields.
+fn unescape_mount(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escape = bytes[index] == b'\\'
+            && index + 4 <= bytes.len()
+            && bytes[index + 1..index + 4].iter().all(u8::is_ascii_digit);
+        if escape {
+            let byte = u8::from_str_radix(&text[index + 1..index + 4], 8).unwrap_or(b'\\');
+            out.push(byte);
+            index += 4;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Mount-time decision for a planned (source, target) pair: the target
+/// may already carry the same source (skip the mount — idempotent), a
+/// different one (honest refusal), or be free.
+pub enum MountDecision {
+    AlreadyMounted,
+    ConflictsWith(String),
+    Free,
+}
+
+pub fn decide_mount(mounts: &[(String, String)], source: &Path, target: &Path) -> MountDecision {
+    let target = target.display().to_string();
+    let source = source.display().to_string();
+    for (mounted_source, mounted_target) in mounts {
+        if mounted_target == &target {
+            return if mounted_source == &source {
+                MountDecision::AlreadyMounted
+            } else {
+                MountDecision::ConflictsWith(mounted_source.clone())
+            };
+        }
+    }
+    MountDecision::Free
+}
+
+/// True while any mount of `source` still exists (the eject loop drains
+/// stacked mounts until this goes false, at most a few repeats).
+pub fn mounts_contain_source(mounts: &[(String, String)], source: &Path) -> bool {
+    let source = source.display().to_string();
+    mounts.iter().any(|(mounted_source, _)| *mounted_source == source)
 }
 
 /// Full discovery, the «Обновить» button body: mounted iPod volumes plus
@@ -614,6 +699,124 @@ mod tests {
         assert_eq!(candidate.label, "Apple iPod");
         // The partition comes straight from sysfs — no mount stat needed.
         assert_eq!(dev.as_deref(), Some(Path::new("/dev/sda2")));
+    }
+
+    #[test]
+    fn merge_dedupes_stacked_mounts_of_one_devnode() {
+        // Round 5.3: repeated connects stack mounts of the same sda2;
+        // the sidebar must show ONE row (first target), not N.
+        let mounted = vec![
+            (
+                DeviceCandidate {
+                    mount: PathBuf::from("/run/media/user/iPod"),
+                    label: "iPod".to_owned(),
+                    kind: CandidateKind::Mounted,
+                },
+                Some(PathBuf::from("/dev/sda2")),
+            ),
+            (
+                DeviceCandidate {
+                    mount: PathBuf::from("/run/media/user/iPod1"),
+                    label: "iPod1".to_owned(),
+                    kind: CandidateKind::Mounted,
+                },
+                Some(PathBuf::from("/dev/sda2")),
+            ),
+        ];
+        let disks = vec![AppleDisk {
+            partition: PathBuf::from("/dev/sda2"),
+            label: "Apple iPod".to_owned(),
+        }];
+        let merged = merge_candidates(mounted, disks, "user");
+        assert_eq!(merged.len(), 1, "one devnode — one candidate");
+        assert_eq!(merged[0].0.kind, CandidateKind::Mounted);
+        assert_eq!(merged[0].0.mount, PathBuf::from("/run/media/user/iPod"));
+        assert_eq!(merged[0].1.as_deref(), Some(Path::new("/dev/sda2")));
+    }
+
+    #[test]
+    fn stale_mount_without_devnode_shows_as_unmounted() {
+        let mounted = vec![(
+            DeviceCandidate {
+                mount: PathBuf::from("/run/media/user/iPod"),
+                label: "iPod".to_owned(),
+                kind: CandidateKind::Mounted,
+            },
+            None,
+        )];
+        let merged = merge_candidates(mounted, Vec::new(), "user");
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].0.kind, CandidateKind::Unmounted);
+        assert_eq!(
+            merged[0].0.mount,
+            PathBuf::from("/run/media/user/iPod"),
+            "planned mount path"
+        );
+        assert_eq!(merged[0].1, None);
+    }
+
+    #[test]
+    fn proc_mounts_parses_fields_and_octal_escapes() {
+        let mounts = parse_proc_mounts(
+            "/dev/sda2 /run/media/user/iPod hfsplus ro 0 0\n"
+                .replace("\\n", "\n")
+                .as_str(),
+        );
+        assert_eq!(
+            mounts,
+            vec![(
+                "/dev/sda2".to_owned(),
+                "/run/media/user/iPod".to_owned(),
+            )
+        ]);
+        let escaped = "/dev/sda\\0402 /run/media/user/iPod\\0402 hfsplus ro 0 0\\n";
+        let mounts = parse_proc_mounts(escaped);
+        assert_eq!(
+            mounts,
+            vec![(
+                "/dev/sda 2".to_owned(),
+                "/run/media/user/iPod 2".to_owned(),
+            )
+        ]);
+    }
+
+    #[test]
+    fn mount_decision_is_idempotent_or_honest() {
+        let mounts = vec![
+            (
+                "/dev/sda2".to_owned(),
+                "/run/media/user/iPod".to_owned(),
+            ),
+            (
+                "/dev/sdb1".to_owned(),
+                "/run/media/user/other".to_owned(),
+            ),
+        ];
+        let source = Path::new("/dev/sda2");
+        let target = Path::new("/run/media/user/iPod");
+        assert!(matches!(
+            decide_mount(&mounts, source, target),
+            MountDecision::AlreadyMounted
+        ));
+        assert!(matches!(
+            decide_mount(&mounts, Path::new("/dev/sdc1"), target),
+            MountDecision::ConflictsWith(ref other) if other == "/dev/sda2"
+        ));
+        assert!(matches!(
+            decide_mount(&mounts, Path::new("/dev/sda2"), Path::new("/run/media/user/new")),
+            MountDecision::Free
+        ));
+    }
+
+    #[test]
+    fn mounts_contain_source_tracks_the_eject_loop() {
+        let mounts = vec![
+            ("/dev/sda2".to_owned(), "/run/media/user/iPod".to_owned()),
+            ("/dev/sda2".to_owned(), "/run/media/user/iPod1".to_owned()),
+        ];
+        assert!(mounts_contain_source(&mounts, Path::new("/dev/sda2")));
+        assert!(!mounts_contain_source(&mounts, Path::new("/dev/sdb1")));
+        assert!(!mounts_contain_source(&[], Path::new("/dev/sda2")));
     }
 
     #[test]

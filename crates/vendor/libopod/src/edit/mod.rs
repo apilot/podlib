@@ -792,9 +792,28 @@ impl<'device> EditSession<'device> {
         progress(ProgressEvent::Phase("Copying SQLite databases to staging"));
         copy_sqlite_set(&source, &destination)?;
 
-        let before = self.device.library().ok_or_else(|| Error::Unsupported {
+        // Round 5.6b: `before` must live in the same universe as the
+        // verification reparse of `after` — the public device snapshot
+        // filters out audiobooks (is_song=0, media_kind=8), so the
+        // expected track count was off by every pre-existing hidden
+        // item and EVERY audiobook addition failed verification with
+        // «reparsed track set differs from the requested edit». Re-read
+        // the device databases directly with the verification filter
+        // (superset is harmless: removals and the artwork/media
+        // accounting key off pids/locations). The device.library()
+        // cache stays untouched — the GUI pipeline keeps its filtered
+        // view and its own companion read for hidden items.
+        let before_itlp = self
+            .device
+            .mount()
+            .resolve_existing(&IpodPath::new(ITLP_PATH)?)?;
+        let before = Library::read_sqlite_for_verification(
+            &before_itlp.join("Library.itdb"),
+            &before_itlp.join("Locations.itdb"),
+        )
+        .map_err(|source| Error::Unsupported {
             feature: "SQLite staging",
-            reason: "the source library is unavailable".to_owned(),
+            reason: format!("the source library re-read failed: {source}"),
         })?;
         let resolved = self.resolve_additions(&destination, progress)?;
         if !self.removals.is_empty() {
@@ -846,12 +865,16 @@ impl<'device> EditSession<'device> {
         progress(ProgressEvent::Phase("Verifying staged databases"));
         validate_staged_set(&destination)?;
 
-        let after = Library::read_sqlite(
+        // Round 5.6: the verification reparse must see everything the
+        // edit wrote (audiobooks: is_song=0, media_kind=8 are excluded
+        // from the public read path). The podlib GUI pipeline keeps
+        // reading the filtered view elsewhere.
+        let after = Library::read_sqlite_for_verification(
             &destination.join(SqliteLibraryFile::Library.file_name()),
             &destination.join(SqliteLibraryFile::Locations.file_name()),
         )?;
         validate_semantics(
-            before,
+            &before,
             &after,
             &self.removals,
             &resolved,

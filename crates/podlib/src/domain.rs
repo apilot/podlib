@@ -92,10 +92,16 @@ pub struct TrackDraft {
     pub duration_ms: u32,
     pub track_number: u32,
     pub disc_number: u32,
+    /// Raw iTunesDB media-kind bits (1 = song, 4 = podcast, 8 =
+    /// audiobook; u32, not a backend enum — the domain stays backend
+    /// independent). Defaults to song bits.
+    pub media_kind_bits: u32,
 }
 
 impl TrackDraft {
-    /// Creates a draft, validating the title at the boundary.
+    /// Creates a draft, validating the title at the boundary. The kind
+    /// defaults to song (1); audiobook flows chain
+    /// [`TrackDraft::with_media_kind_bits`].
     pub fn new(source_path: PathBuf, title: impl Into<String>) -> Result<Self, DomainError> {
         let title = title.into();
         if title.trim().is_empty() {
@@ -111,7 +117,16 @@ impl TrackDraft {
             duration_ms: 0,
             track_number: 0,
             disc_number: 0,
+            media_kind_bits: 1,
         })
+    }
+
+    /// Sets the media-kind bits (chainable): 1 = song, 4 = podcast,
+    /// 8 = audiobook.
+    #[must_use]
+    pub fn with_media_kind_bits(mut self, bits: u32) -> Self {
+        self.media_kind_bits = bits;
+        self
     }
 }
 
@@ -222,6 +237,11 @@ mod tests {
         let draft = TrackDraft::new(PathBuf::from("a.mp3"), "Song").unwrap();
         assert_eq!(draft.title, "Song");
         assert_eq!(draft.duration_ms, 0);
+        // New drafts are songs unless stated otherwise.
+        assert_eq!(draft.media_kind_bits, 1);
+        let chained = draft.clone().with_media_kind_bits(8);
+        assert_eq!(chained.media_kind_bits, 8);
+        assert_eq!(draft.media_kind_bits, 1, "the setter is chainable, not in-place");
     }
 
     #[test]

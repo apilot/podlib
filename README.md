@@ -23,7 +23,9 @@ podlib is built on [libopod](https://github.com/koriwi/libopod) (vendored, see b
 Requirements:
 
 - Rust 1.95 or newer (via [rustup](https://rustup.rs) recommended)
-- No system libraries required — SQLite is bundled via libopod
+- A C compiler (gcc/clang) — SQLite is bundled via libopod and compiled at build time
+- [ffmpeg](https://ffmpeg.org) — runtime, used by the GUI to transcode FLAC/OGG/WAV files to AAC on add
+- The GUI (`podlib-gui`) additionally needs a desktop GL stack (Wayland or X11 client libraries) — present on any regular desktop installation
 
 ```sh
 git clone https://github.com/apilot/podlib.git
@@ -31,11 +33,11 @@ cd podlib
 cargo build --release
 ```
 
-The `podlib` binary lands in `target/release/`.
+The `podlib` CLI binary lands in `target/release/`; `podlib-gui` is the desktop app.
 
 ### Distro notes
 
-podlib needs only the Rust toolchain — SQLite is bundled, no system libraries required.
+The CLI needs only the Rust toolchain — SQLite is bundled, no system libraries required.
 
 | Distro | Command | Note |
 |---|---|---|
@@ -44,7 +46,16 @@ podlib needs only the Rust toolchain — SQLite is bundled, no system libraries 
 | Gentoo | `emerge --ask dev-lang/rust` | current enough |
 | Debian / Ubuntu | use [rustup](https://rustup.rs) | distro packages are often older than the required 1.95 |
 
-A GUI is planned for phase 4 and may add system dependencies (see the roadmap); packaging per distro will follow that.
+GUI extras (ffmpeg for transcoding; a C compiler for the bundled SQLite):
+
+| Distro | Command |
+|---|---|
+| Arch | `pacman -S ffmpeg base-devel` |
+| Fedora | `dnf install ffmpeg gcc` (ffmpeg via [RPM Fusion](https://rpmfusion.org)) |
+| Gentoo | `emerge --ask media-video/ffmpeg` |
+| Debian / Ubuntu | `sudo apt install ffmpeg build-essential` |
+
+Mounting from the GUI uses `sudo`; `udisksctl` (part of udisks2) is recommended for the safe eject flow.
 
 ## Usage
 
@@ -75,7 +86,7 @@ udisksctl unmount -b /dev/sdX2
 udisksctl power-off -b /dev/sdX
 ```
 
-A GUI with one-click connect (including this mount flow) is planned — see [Roadmap](#roadmap).
+A GUI (`podlib-gui`) ships with one-click connect (this mount flow is automated inside the app).
 
 ## How it works
 
@@ -88,9 +99,9 @@ Writes never touch the live database directly: an edit session is staged in a te
 ## Roadmap
 
 1. ✅ Core library + CLI (iPod Nano 7G)
-2. Classic iPod database (iTunesDB) backend
+2. ✅ Classic iPod database (iTunesDB) backend
 3. Smart playlists, artwork, ratings and play counts, import/export, orphan and duplicate detection
-4. Graphical interface (drag & drop, one-click connect)
+4. ✅ Graphical interface (drag & drop, one-click connect)
 
 ## License
 
