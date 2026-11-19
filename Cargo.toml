@@ -27,6 +27,9 @@ plist = "1.7"
 # eframe/egui ecosystem releases in lockstep — keep all egui-family deps
 # on the same 0.37 line. wgpu is the default renderer since 0.34.
 eframe = "0.37"
+# TableBuilder for the track table (round 4 UX revision). Underscore
+# name: the ustc mirror does not resolve the dashed alias.
+egui_extras = "0.37"
 
 [profile.dev]
 # Bundled SQLite (via libopod) optimizes poorly at O0 and slows test loops.

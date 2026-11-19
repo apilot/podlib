@@ -10,3 +10,7 @@ libopod = { workspace = true }
 thiserror = { workspace = true }
 tempfile = { workspace = true }
 plist = { workspace = true }
+# Companion media-kind query over the same Library.itdb (see
+# `hidden_items` in the libopod adapter); version and bundled feature
+# match the vendored libopod so one SQLite build serves both.
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }

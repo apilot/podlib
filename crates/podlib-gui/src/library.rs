@@ -731,6 +731,7 @@ mod tests {
             disc_number: 2,
             size_bytes: 1024,
             has_artwork: false,
+            media_kind: 0,
         }
     }
 
@@ -802,6 +803,7 @@ mod tests {
             track_ids: Vec::new(),
             is_master: true,
             is_smart: false,
+            distinguished_kind: 0,
         };
         let user = Playlist {
             id: PlaylistId::from_bits(2),
@@ -809,6 +811,7 @@ mod tests {
             track_ids: Vec::new(),
             is_master: false,
             is_smart: false,
+            distinguished_kind: 0,
         };
         let error = guard_playlist_mutation(&master).unwrap_err();
         assert!(error.contains("встроенный"));

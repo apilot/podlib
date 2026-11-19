@@ -433,6 +433,7 @@ mod tests {
             track_ids: vec![],
             is_master: master,
             is_smart: false,
+            distinguished_kind: 0,
         };
         FakeBackend {
             playlists: vec![

@@ -7,28 +7,29 @@
 //! backend itself lives on its own persistent worker thread — see
 //! [`crate::library`] for why.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 
 use eframe::egui;
+use egui_extras::{Column, TableBuilder};
 use podlib::{Playlist, PlaylistId, Track, TrackId};
 
-use crate::device::{self, DeviceCandidate, MountError, MountSpec};
+use crate::device::{self, DeviceCandidate, MountError};
 use crate::library::{
     changes_from_track, drafts_from_paths, guard_playlist_mutation, panic_message, plural,
     EditDialogFields, DraggedTracks, LibraryCommand, LibraryOutcome, LibrarySnapshot,
     LibraryWorker,
 };
 
-/// Row height of the track table cells, keeps the column grid aligned.
-const ROW_HEIGHT: f32 = 20.0;
-/// Fixed column widths of the track table: title/artist/album/duration.
-const COLUMN_WIDTHS: [(f32, &str); 4] = [
-    (260.0, "Название"),
-    (180.0, "Исполнитель"),
-    (180.0, "Альбом"),
-    (70.0, "Длит."),
-];
+/// Row height of the track table rows, keeps the column grid aligned.
+/// 26px (round 4 UX): a touch taller for a comfortable click/hover target.
+const ROW_HEIGHT: f32 = 26.0;
+/// Fixed column widths of the track table: artist/album/duration. The
+/// title column takes the remainder (see `track_table`).
+const ARTIST_COLUMN: f32 = 180.0;
+const ALBUM_COLUMN: f32 = 200.0;
+const DURATION_COLUMN: f32 = 64.0;
 
 /// Messages from worker threads to the UI.
 enum DeviceEvent {
@@ -39,9 +40,6 @@ enum DeviceEvent {
 
 #[derive(Debug)]
 enum ConnectError {
-    /// Preflight failure (before any command ran): the volume is
-    /// untouched, so the message must not claim it was mounted.
-    Preflight(String),
     Mount { error: MountError, stderr: String },
     /// Worker thread panicked mid-operation; operation state is unknown.
     Internal(String),
@@ -57,6 +55,9 @@ struct DeviceEntry {
 struct ConnectedDevice {
     mount: PathBuf,
     block_dev: PathBuf,
+    /// Hardware label from sysfs (e.g. «Apple iPod»), frozen at connect
+    /// time so the app bar stays stable even if the scan list changes.
+    label: String,
 }
 
 /// Error prepared for display: message + optional advice + raw tool output.
@@ -121,6 +122,13 @@ struct TrackRowActions {
     edit: Option<TrackId>,
     add_to_playlist: Option<Vec<TrackId>>,
     delete: Option<TrackId>,
+    /// Keyboard cursor move (the last touched row).
+    select: Option<TrackId>,
+    /// Click on a visible row: (index, ctrl, shift) — resolved by the
+    /// caller against the visible list (apply_row_click).
+    row_click: Option<(usize, bool, bool)>,
+    /// «Убрать из плейлиста» in a playlist view: (playlist, member).
+    remove_from_playlist: Option<(PlaylistId, TrackId)>,
 }
 
 impl TrackRowActions {
@@ -128,6 +136,11 @@ impl TrackRowActions {
         self.edit = other.edit.or(self.edit.take());
         self.add_to_playlist = other.add_to_playlist.or(self.add_to_playlist.take());
         self.delete = other.delete.or(self.delete.take());
+        self.select = other.select.or(self.select.take());
+        self.row_click = other.row_click.or(self.row_click.take());
+        self.remove_from_playlist = other
+            .remove_from_playlist
+            .or(self.remove_from_playlist.take());
     }
 }
 
@@ -139,16 +152,21 @@ struct PlaylistPanelActions {
     add_drop: Option<(PlaylistId, Vec<TrackId>)>,
     /// Tracks dropped onto the master playlist: refused with a hint.
     master_drop: Option<String>,
+    /// Tracks dropped onto a built-in device view: refused with a hint.
+    view_drop: Option<String>,
+    /// «Удалить…» chosen on the master row: refused honestly, no
+    /// round trip to the device.
+    master_delete: Option<String>,
     delete_playlist: Option<PlaylistId>,
-    remove_member: Option<(PlaylistId, TrackId)>,
 }
 
 impl PlaylistPanelActions {
     fn merge(&mut self, other: Self) {
         self.add_drop = other.add_drop.or(self.add_drop.take());
         self.master_drop = other.master_drop.or(self.master_drop.take());
+        self.view_drop = other.view_drop.or(self.view_drop.take());
+        self.master_delete = other.master_delete.or(self.master_delete.take());
         self.delete_playlist = other.delete_playlist.or(self.delete_playlist.take());
-        self.remove_member = other.remove_member.or(self.remove_member.take());
     }
 }
 
@@ -162,13 +180,29 @@ struct LibraryUi {
     /// The single operation in flight, with its reply channel.
     pending: Option<(PendingKind, Receiver<LibraryOutcome>)>,
     // Dialog/confirm state (modal flags live here so they survive frames).
-    confirm_delete_track: Option<TrackId>,
+    /// Rows awaiting the delete confirmation: one or many (Ф3).
+    confirm_delete_track: Option<Vec<TrackId>>,
     purge_media: bool,
     confirm_delete_playlist: Option<PlaylistId>,
     create_open: bool,
     new_playlist_name: String,
     edit_dialog: Option<EditDialogState>,
     picker_tracks: Option<Vec<TrackId>>,
+    /// Sidebar view context (round 4.1 Ф2): master, a built-in device
+    /// view or a user playlist.
+    view: LibraryView,
+    /// Keyboard cursor (the last touched row); arrows and Enter work
+    /// through it without disturbing the multi-selection.
+    selected_track: Option<TrackId>,
+    /// Multi-selection in the central table, in click order.
+    selected_tracks: Vec<TrackId>,
+    /// Anchor row (index into the visible list) for shift-range clicks.
+    selection_anchor: Option<usize>,
+    /// Remaining rows of a multi-track delete (one in-flight worker
+    /// command at a time; the chain continues on each Applied).
+    delete_queue: Vec<TrackId>,
+    /// Toolbar search box; empty string = no filter.
+    search_query: String,
 }
 
 pub struct PodlibApp {
@@ -194,10 +228,16 @@ pub struct PodlibApp {
     connected: Option<ConnectedDevice>,
     /// Present while a device is connected and its library worker is open.
     library: Option<LibraryUi>,
+    /// Deferred «Убрать из плейлиста» from the toolbar (the request
+    /// needs the worker free; collected during the render pass).
+    pending_remove_from_playlist: Option<(PlaylistId, Vec<TrackId>)>,
 }
 
 impl PodlibApp {
     pub fn new(ctx: egui::Context) -> Self {
+        // WHY the theme follows the system: owner requirement (round 4
+        // UX) — the app must not impose dark/light on the desktop.
+        ctx.set_theme(egui::ThemePreference::System);
         let mut app = Self {
             ctx,
             devices: Vec::new(),
@@ -215,16 +255,17 @@ impl PodlibApp {
             rx: None,
             connected: None,
             library: None,
+            pending_remove_from_playlist: None,
         };
         app.refresh_devices();
         app
     }
 
     fn refresh_devices(&mut self) {
-        self.devices = device::scan_candidates()
+        self.devices = device::discover_devices()
             .into_iter()
-            .map(|candidate| DeviceEntry {
-                block_dev: device::resolve_block_device(&candidate.mount),
+            .map(|(candidate, block_dev)| DeviceEntry {
+                block_dev,
                 candidate,
             })
             .collect();
@@ -261,13 +302,19 @@ impl PodlibApp {
         self.busy = false;
         match event {
             DeviceEvent::Connected(Ok(mount)) => {
-                let block_dev = self
+                let (block_dev, label) = self
                     .selected_entry()
-                    .and_then(|entry| entry.block_dev.clone())
-                    .unwrap_or_default();
+                    .map(|entry| {
+                        (
+                            entry.block_dev.clone().unwrap_or_default(),
+                            entry.candidate.label.clone(),
+                        )
+                    })
+                    .unwrap_or_else(|| (Default::default(), "устройство".to_owned()));
                 self.connected = Some(ConnectedDevice {
                     mount: mount.clone(),
                     block_dev,
+                    label,
                 });
                 self.status = "Открываю библиотеку…".to_owned();
                 self.start_library(mount);
@@ -278,13 +325,6 @@ impl PodlibApp {
                         message: error.to_string(),
                         hint: error.hint().map(str::to_owned),
                         stderr: Some(stderr),
-                    },
-                    // Preflight happens before any mount command, so
-                    // claiming a mounted volume here would be a lie.
-                    ConnectError::Preflight(message) => UiError {
-                        message: format!("Монтирование не выполнено: {message}"),
-                        hint: None,
-                        stderr: None,
                     },
                     ConnectError::Internal(message) => UiError {
                         message: format!("Внутренняя ошибка операции: {message}"),
@@ -344,6 +384,12 @@ impl PodlibApp {
             new_playlist_name: String::new(),
             edit_dialog: None,
             picker_tracks: None,
+            view: LibraryView::Master,
+            selected_track: None,
+            selected_tracks: Vec::new(),
+            selection_anchor: None,
+            delete_queue: Vec::new(),
+            search_query: String::new(),
         });
     }
 
@@ -437,6 +483,11 @@ impl PodlibApp {
                         library.snapshot = snapshot;
                     }
                     self.status = summary;
+                    // Multi-delete chaining: fire the next queued
+                    // RemoveTrack once the previous one landed.
+                    if matches!(kind, PendingKind::RemoveTrack) {
+                        self.continue_delete_chain();
+                    }
                 }
                 Ok(LibraryOutcome::Failed { message, hint }) => {
                     self.error = Some(UiError {
@@ -445,6 +496,11 @@ impl PodlibApp {
                         stderr: None,
                     });
                     self.status.clear();
+                    // A failed step stops the delete chain: the error
+                    // must be resolved before removing more rows.
+                    if let Some(library) = self.library.as_mut() {
+                        library.delete_queue.clear();
+                    }
                 }
                 Err(TryRecvError::Empty) => {
                     if let Some(library) = self.library.as_mut() {
@@ -464,6 +520,38 @@ impl PodlibApp {
                     self.library = None;
                 }
             }
+        }
+    }
+
+    /// Sends one library command and remembers to drain its reply. One
+    /// operation at a time; failures to send are surfaced as UI errors.
+    /// Multi-delete chaining (Ф3): the worker protocol allows one
+    /// command in flight, so the remaining ids queue and fire as each
+    /// RemoveTrack lands. The purge flag is read fresh per step (the
+    /// dialog keeps it in state). A failed step cleared the queue
+    /// before this runs — the error must be resolved first.
+    fn continue_delete_chain(&mut self) {
+        let next = self
+            .library
+            .as_ref()
+            .and_then(|library| library.delete_queue.first().copied());
+        let purge = self
+            .library
+            .as_ref()
+            .map(|library| library.purge_media)
+            .unwrap_or(false);
+        if let Some(id) = next {
+            if let Some(library) = self.library.as_mut() {
+                library.delete_queue.remove(0);
+            }
+            self.library_request(
+                LibraryCommand::RemoveTrack {
+                    id,
+                    purge_media: purge,
+                },
+                PendingKind::RemoveTrack,
+                "Удаляю трек…",
+            );
         }
     }
 
@@ -517,12 +605,30 @@ impl PodlibApp {
         let Some(block_dev) = entry.block_dev.clone() else {
             self.error = Some(UiError {
                 message: "Не удалось определить блочное устройство по sysfs".to_owned(),
-                hint: Some("Проверьте, что том смонтирован, и нажмите «Обновить».".to_owned()),
+                hint: Some("Нажмите «Обновить» и выберите устройство заново.".to_owned()),
                 stderr: None,
             });
             return;
         };
         let mount_path = entry.candidate.mount.clone();
+        let Some((uid, gid)) = device::current_uid_gid() else {
+            // W4: nothing has run yet, so the UI error must not claim a
+            // mounted volume — surfaced locally, worker never spawned.
+            self.error = Some(UiError {
+                message: "не удалось определить uid/gid процесса".to_owned(),
+                hint: None,
+                stderr: None,
+            });
+            return;
+        };
+        // mkdir -p + rw-mount: one sequence for mounted and unmounted
+        // candidates alike (mkdir -p on an existing path is a no-op).
+        let steps = device::build_mount_sequence(&device::MountSpec {
+            block_dev: block_dev.clone(),
+            mount_path: mount_path.clone(),
+            uid,
+            gid,
+        });
         let password = std::mem::take(&mut self.password);
         let ctx = self.ctx.clone();
         let (tx, rx) = channel();
@@ -534,7 +640,7 @@ impl PodlibApp {
             // catch_unwind: a worker panic must still produce an event,
             // otherwise the UI would silently stay busy forever.
             let result = run_worker_step(
-                || connect_device(password, block_dev, mount_path),
+                || connect_device(password, steps, mount_path),
                 ConnectError::Internal,
             );
             let _ = tx.send(DeviceEvent::Connected(result));
@@ -592,8 +698,8 @@ impl PodlibApp {
         ui.separator();
         if self.devices.is_empty() {
             ui.label(
-                "Устройства не найдены. Подключите устройство по USB — \
-                 система смонтирует его в /run/media.",
+                "Устройства не найдены. Подключите устройство по USB и нажмите \
+                 «Обновить» — podlib находит iPod по sysfs даже без automount.",
             );
             return;
         }
@@ -609,12 +715,16 @@ impl PodlibApp {
                     .as_deref()
                     .map(|dev| dev.display().to_string())
                     .unwrap_or_else(|| "блочное устройство не определено".to_owned());
-                let text = format!(
-                    "{}\n{}\n{}",
-                    entry.candidate.label,
-                    entry.candidate.mount.display(),
-                    dev
-                );
+                // Unmounted candidates show the planned mount point so
+                // the user knows where «Подключить» will put the volume.
+                let place = match entry.candidate.kind {
+                    device::CandidateKind::Mounted => entry.candidate.mount.display().to_string(),
+                    device::CandidateKind::Unmounted => format!(
+                        "не смонтирован → будет в {}",
+                        entry.candidate.mount.display()
+                    ),
+                };
+                let text = format!("{}\n{}\n{}", entry.candidate.label, place, dev);
                 ui.selectable_value(&mut self.selected, Some(index), text);
             }
         });
@@ -629,93 +739,357 @@ impl PodlibApp {
         }
     }
 
-    fn status_area(&mut self, ui: &mut egui::Ui) {
-        ui.heading("podlib");
-        ui.add_space(8.0);
-        if self.busy || self.library_busy() {
-            ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new());
-                ui.label(&self.status);
+    /// Top app bar: app name left; device state and the eject button
+    /// right. Replaces the old in-panel «podlib» heading.
+    fn app_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("podlib");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                match self.connected.as_ref() {
+                    Some(connected) => {
+                        let ready = !self.busy && self.library_idle();
+                        if ui
+                            .add_enabled(ready, egui::Button::new("Безопасно отключить"))
+                            .clicked()
+                        {
+                            self.confirm_eject = true;
+                        }
+                        // WHY a painted circle: there is no stock dot
+                        // widget; a 4px filled circle reads as a status dot.
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                        ui.painter()
+                            .circle_filled(rect.center(), 4.0, egui::Color32::LIGHT_GREEN);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} · {}",
+                                connected.label,
+                                connected.block_dev.display()
+                            ))
+                            .weak(),
+                        );
+                    }
+                    None => {
+                        ui.label(egui::RichText::new("Нет устройства").weak());
+                    }
+                }
             });
-            ui.add_space(4.0);
-        } else if !self.status.is_empty() {
-            ui.label(&self.status);
-        }
-        if let Some(error) = &self.error {
-            ui.add_space(4.0);
-            ui.colored_label(egui::Color32::LIGHT_RED, &error.message);
-            if let Some(hint) = &error.hint {
-                ui.label(hint);
-            }
-            if let Some(stderr) = &error.stderr {
-                if !stderr.trim().is_empty() {
-                    egui::ScrollArea::vertical()
-                        .max_height(120.0)
-                        .show(ui, |ui| ui.monospace(stderr));
-                }
-            }
-        }
-        ui.add_space(8.0);
-        ui.separator();
-        match &self.connected {
-            Some(connected) => {
-                ui.colored_label(
-                    egui::Color32::LIGHT_GREEN,
-                    format!(
-                        "Подключено: {} ({})",
-                        connected.mount.display(),
-                        connected.block_dev.display()
-                    ),
-                );
-                if self.library.is_none() && !self.busy {
-                    ui.colored_label(
-                        egui::Color32::LIGHT_RED,
-                        "Библиотека недоступна: воркер закрылся. Отключите и подключите \
-                         устройство заново.",
-                    );
-                }
-                ui.add_space(8.0);
-                let ready = !self.busy && self.library_idle();
-                if ui
-                    .add_enabled(ready, egui::Button::new("Безопасно отключить"))
-                    .clicked()
-                {
-                    self.confirm_eject = true;
-                }
-            }
-            None => {
-                ui.label(
-                    "Выберите устройство слева и нажмите «Подключить». \
-                     После подключения здесь появится статус, а справа — плейлисты.",
-                );
-            }
-        }
+        });
     }
 
-    /// Central panel: toolbar + track table with drag-and-drop rows.
-    fn library_view(&mut self, ui: &mut egui::Ui) {
-        library_toolbar(self, ui);
-        ui.separator();
+    /// Bottom status bar: operation progress / last result on the left
+    /// (spinner while busy), the error in red — visible until replaced,
+    /// with the full text + advice + stderr on hover — and the
+    /// add-files hint moved here from the old toolbar.
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let busy = self.busy || self.library_busy();
+            if busy {
+                ui.add(egui::Spinner::new());
+                ui.label(&self.status);
+            } else if !self.status.is_empty() {
+                ui.label(&self.status);
+            }
+            if let Some(error) = &self.error {
+                ui.colored_label(egui::Color32::LIGHT_RED, &error.message)
+                    .on_hover_text(error_tooltip(error));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new("Перетащите аудиофайлы в окно, чтобы добавить")
+                        .weak(),
+                );
+            });
+        });
+    }
 
-        // Immutable borrow for rendering; mutating choices are applied
-        // after the loop, when the unique borrow is free again.
-        let Some(library) = self.library.as_ref() else {
-            return;
-        };
-        if library.snapshot.tracks.is_empty() {
-            ui.label("Библиотека пуста. Перетащите аудиофайлы в окно.");
-            return;
-        }
-
-        // Menus stay closed while an operation is in flight: their
-        // choices fire library requests a busy worker would refuse.
+    /// Left sidebar once a device is connected: the master row, the
+    /// built-in device views (media-kind filters) and user playlists,
+    /// each selectable, with «+ Новый плейлист» at the bottom.
+    /// Collects row choices (drop/delete/ПКМ) for post-frame applying.
+    fn playlists_sidebar(&mut self, ui: &mut egui::Ui) -> PlaylistPanelActions {
         let menus_allowed = context_menu_allowed(self);
-        let actions = track_table(ui, &library.snapshot, menus_allowed);
+        let Some(library) = self.library.as_mut() else {
+            return PlaylistPanelActions::default();
+        };
+        ui.heading("Плейлисты");
+        ui.add_space(4.0);
+        let ordered = master_first(&library.snapshot.playlists);
+        let master = ordered.iter().find(|playlist| playlist.is_master).copied();
+        let views: Vec<&Playlist> = ordered
+            .iter()
+            .copied()
+            .filter(|playlist| !playlist.is_master && playlist.distinguished_kind != 0)
+            .collect();
+        let user: Vec<&Playlist> = ordered
+            .iter()
+            .copied()
+            .filter(|playlist| !playlist.is_master && playlist.distinguished_kind == 0)
+            .collect();
+        let mut actions = PlaylistPanelActions::default();
+        let view_before = library.view;
+        // auto_shrink(false): the list reserves the full height so the
+        // button below lands at the panel bottom.
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                if let Some(playlist) = master {
+                    actions.merge(playlist_row(
+                        ui,
+                        &library.snapshot,
+                        playlist,
+                        &mut library.view,
+                        menus_allowed,
+                    ));
+                }
+                if !views.is_empty() {
+                    ui.label(egui::RichText::new("Устройство").weak().small());
+                    for playlist in &views {
+                        actions.merge(playlist_row(
+                            ui,
+                            &library.snapshot,
+                            playlist,
+                            &mut library.view,
+                            menus_allowed,
+                        ));
+                    }
+                }
+                if !user.is_empty() {
+                    ui.label(egui::RichText::new("Плейлисты").weak().small());
+                    for playlist in &user {
+                        actions.merge(playlist_row(
+                            ui,
+                            &library.snapshot,
+                            playlist,
+                            &mut library.view,
+                            menus_allowed,
+                        ));
+                    }
+                }
+            });
+        // A context switch must not drag the old table selection along.
+        if library.view != view_before {
+            library.selected_tracks.clear();
+            library.selection_anchor = None;
+            library.selected_track = None;
+        }
+        ui.separator();
+        if ui.button("+ Новый плейлист").clicked() {
+            library.create_open = true;
+            library.new_playlist_name.clear();
+        }
+        actions
+    }
+
+    /// Central panel: toolbar (search + counter + selection actions)
+    /// and the track table for the selected sidebar context. Applies
+    /// everything it collects itself (borrow discipline: the render
+    /// pass holds the library borrow, requests fire afterwards).
+    fn library_view(&mut self, ui: &mut egui::Ui) {
+        let menus_allowed = context_menu_allowed(self);
+        let mut actions = TrackRowActions::default();
+        let toolbar;
+        {
+            let Some(library) = self.library.as_mut() else {
+                return;
+            };
+            let query = library.search_query.clone();
+            let view = library.view;
+            let cursor = library.selected_track;
+
+            // Visible rows for the selected context: master → the whole
+            // library listing, device view → tracks matching its media
+            // kinds, user playlist → its members in order (rows that
+            // vanished from the library are skipped).
+            let (table_id, total, visible): (egui::Id, usize, Vec<&Track>) = match view {
+                LibraryView::Master => (
+                    egui::Id::unique(("track_table", 0u64)),
+                    library.snapshot.tracks.len(),
+                    library.snapshot.tracks.iter().collect(),
+                ),
+                LibraryView::Media { distinguished } => {
+                    let kinds = view_media_kinds(distinguished);
+                    let matches: Vec<&Track> = library
+                        .snapshot
+                        .tracks
+                        .iter()
+                        .filter(|track| kinds.contains(&track.media_kind))
+                        .collect();
+                    (
+                        // id per view context: switching sections starts
+                        // a fresh scroll position.
+                        egui::Id::unique(("track_table", u64::try_from(distinguished.max(0)).unwrap_or(0))),
+                        matches.len(),
+                        matches,
+                    )
+                }
+                LibraryView::Playlist(id) => {
+                    let members: Vec<&Track> = library
+                        .snapshot
+                        .playlist(id)
+                        .map(|playlist| {
+                            playlist
+                                .unique_track_ids()
+                                .into_iter()
+                                .filter_map(|member| library.snapshot.track(member))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (
+                        egui::Id::unique(("track_table", id.to_bits())),
+                        members.len(),
+                        members,
+                    )
+                }
+            };
+            let filtered: Vec<&Track> = visible
+                .iter()
+                .copied()
+                .filter(|track| matches_query(track, &query))
+                .collect();
+            let visible_ids: Vec<TrackId> = filtered.iter().map(|track| track.id).collect();
+            let empty_view = matches!(view, LibraryView::Media { .. }) && total == 0;
+            let empty_playlist = matches!(view, LibraryView::Playlist(_)) && total == 0;
+
+            let idle = library.pending.is_none() && library.opening.is_none();
+            let ctx = ui.ctx().clone();
+            toolbar = search_toolbar(
+                ui,
+                &ctx,
+                &mut library.search_query,
+                filtered.len(),
+                total,
+                idle,
+                library.selected_tracks.len(),
+                matches!(view, LibraryView::Playlist(_)),
+            );
+            ui.add_space(4.0);
+
+            if filtered.is_empty() {
+                ui.centered_and_justified(|ui| {
+                    ui.label(egui::RichText::new(empty_state_text(
+                        library.snapshot.tracks.is_empty(),
+                        &query,
+                        empty_view,
+                        empty_playlist,
+                    )).weak());
+                });
+            } else {
+                actions.merge(track_table(
+                    ui,
+                    &filtered,
+                    &library.selected_tracks,
+                    cursor,
+                    view,
+                    menus_allowed,
+                    table_id,
+                ));
+            }
+
+            // A click on a visible row resolves through apply_row_click
+            // (plain/ctrl/shift) against the current visible list. A
+            // stale anchor (list shrank since the anchored click) is
+            // dropped here: shift degenerates to a plain click.
+            if let Some((index, ctrl, shift)) = actions.row_click.take() {
+                let anchor = library.selection_anchor.filter(|&a| a < visible_ids.len());
+                let selected_idx: Vec<usize> = library
+                    .selected_tracks
+                    .iter()
+                    .filter_map(|id| visible_ids.iter().position(|candidate| candidate == id))
+                    .collect();
+                let (new_indices, anchor) =
+                    apply_row_click(&selected_idx, anchor, index, ctrl, shift);
+                library.selected_tracks = new_indices
+                    .iter()
+                    .filter_map(|&index| visible_ids.get(index).copied())
+                    .collect();
+                library.selection_anchor = anchor;
+                library.selected_track = library.selected_tracks.last().copied();
+            }
+
+            // Toolbar actions over the multi-selection.
+            let selected = library.selected_tracks.clone();
+            if toolbar.edit && selected.len() == 1 {
+                let id = selected[0];
+                if let Some(track) = library.snapshot.track(id) {
+                    library.edit_dialog = Some(EditDialogState {
+                        id,
+                        fields: EditDialogFields::from_track(track),
+                        error: None,
+                    });
+                }
+            }
+            if toolbar.add && !selected.is_empty() {
+                library.picker_tracks = Some(selected.clone());
+            }
+            if toolbar.remove && !selected.is_empty() {
+                if let LibraryView::Playlist(playlist_id) = view {
+                    self.pending_remove_from_playlist = Some((playlist_id, selected.clone()));
+                } else {
+                    library.confirm_delete_track = Some(selected.clone());
+                    library.purge_media = false;
+                }
+            }
+            drop(selected);
+
+            // Keyboard navigation over the visible (filtered) rows.
+            // WHY the focus gate: arrows/Enter in the search box or in
+            // a modal TextEdit must keep their native meaning.
+            let focused = ui.ctx().memory(|m| m.focused().is_some());
+            if !focused {
+                let (up, down, enter) = ui.ctx().input(|input| {
+                    (
+                        input.key_pressed(egui::Key::ArrowUp),
+                        input.key_pressed(egui::Key::ArrowDown),
+                        input.key_pressed(egui::Key::Enter),
+                    )
+                });
+                if down {
+                    if let Some(id) = next_selection(&visible_ids, cursor, 1) {
+                        actions.select = Some(id);
+                    }
+                }
+                if up {
+                    if let Some(id) = next_selection(&visible_ids, cursor, -1) {
+                        actions.select = Some(id);
+                    }
+                }
+                if enter {
+                    if let Some(id) = activated(&visible_ids, cursor) {
+                        actions.edit = Some(id);
+                    }
+                }
+            }
+        }
+        // Deferred worker requests (borrow discipline): refresh and the
+        // playlist-member removal collected above.
+        if toolbar.refresh {
+            self.library_request(
+                LibraryCommand::Refresh,
+                PendingKind::Refresh,
+                "Обновляю список…",
+            );
+        }
+        if let Some((playlist, track_ids)) = self.pending_remove_from_playlist.take() {
+            self.library_request(
+                LibraryCommand::RemoveFromPlaylist {
+                    playlist,
+                    track_ids,
+                },
+                PendingKind::RemoveFromPlaylist,
+                "Убираю из плейлиста…",
+            );
+        }
         self.apply_track_actions(actions);
     }
 
     /// Applies the row choices collected by [`track_table`].
     fn apply_track_actions(&mut self, actions: TrackRowActions) {
+        if let Some(id) = actions.select {
+            if let Some(library) = self.library.as_mut() {
+                library.selected_track = Some(id);
+            }
+        }
         if let Some(id) = actions.edit {
             if let Some(library) = self.library.as_mut() {
                 if let Some(track) = library.snapshot.track(id) {
@@ -734,31 +1108,20 @@ impl PodlibApp {
         }
         if let Some(id) = actions.delete {
             if let Some(library) = self.library.as_mut() {
-                library.confirm_delete_track = Some(id);
+                library.confirm_delete_track = Some(vec![id]);
                 library.purge_media = false;
             }
         }
-    }
-
-    /// Right panel: playlists, each header a drop target for dragged tracks.
-    fn playlists_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Плейлисты");
-        let Some(library) = self.library.as_ref() else {
-            return;
-        };
-        // Menus stay closed while an operation is in flight: their
-        // choices fire library requests a busy worker would refuse.
-        let menus_allowed = context_menu_allowed(self);
-        let mut actions = PlaylistPanelActions::default();
-        for playlist in &library.snapshot.playlists {
-            actions.merge(playlist_block(
-                ui,
-                &library.snapshot,
-                playlist,
-                menus_allowed,
-            ));
+        if let Some((playlist, member)) = actions.remove_from_playlist {
+            self.library_request(
+                LibraryCommand::RemoveFromPlaylist {
+                    playlist,
+                    track_ids: vec![member],
+                },
+                PendingKind::RemoveFromPlaylist,
+                "Убираю из плейлиста…",
+            );
         }
-        self.apply_playlist_actions(actions);
     }
 
     /// Applies the panel choices collected during the frame.
@@ -769,6 +1132,18 @@ impl PodlibApp {
                 hint: Some(
                     "Создайте пользовательский плейлист («+ Плейлист») и бросьте трек на него."
                         .to_owned(),
+                ),
+                stderr: None,
+            });
+        }
+        if let Some(name) = actions.master_delete {
+            // Same honest-refusal pattern as master_drop: the master is
+            // the mirror of the library, deletion is a user-playlist
+            // operation — explained up front, no round trip to the device.
+            self.error = Some(UiError {
+                message: format!("«{name}» — мастер-плейлист: его нельзя удалить"),
+                hint: Some(
+                    "Удалять можно только пользовательские плейлисты.".to_owned(),
                 ),
                 stderr: None,
             });
@@ -787,16 +1162,6 @@ impl PodlibApp {
             if let Some(library) = self.library.as_mut() {
                 library.confirm_delete_playlist = Some(id);
             }
-        }
-        if let Some((playlist, member)) = actions.remove_member {
-            self.library_request(
-                LibraryCommand::RemoveFromPlaylist {
-                    playlist,
-                    track_ids: vec![member],
-                },
-                PendingKind::RemoveFromPlaylist,
-                "Убираю из плейлиста…",
-            );
         }
     }
 
@@ -960,33 +1325,52 @@ impl PodlibApp {
         }
     }
 
+    /// Delete confirmation for one row or a multi-selection (Ф3).
+    /// Confirming queues every id: the worker protocol allows one
+    /// command in flight, so the chain continues on each Applied
+    /// outcome (see `continue_delete_chain`).
     fn maybe_delete_track_modal(&mut self, ctx: &egui::Context) {
-        let Some(track_id) = self
+        let Some(track_ids) = self
             .library
             .as_ref()
-            .and_then(|library| library.confirm_delete_track)
+            .and_then(|library| library.confirm_delete_track.clone())
         else {
             return;
         };
-        let title = self
-            .library
-            .as_ref()
-            .and_then(|library| library.snapshot.track(track_id))
-            .map(|track| track.title.clone())
-            .unwrap_or_default();
+        let title_line = if track_ids.len() == 1 {
+            let title = self
+                .library
+                .as_ref()
+                .and_then(|library| library.snapshot.track(track_ids[0]))
+                .map(|track| track.title.clone())
+                .unwrap_or_default();
+            format!("Удалить трек «{title}»?")
+        } else {
+            let count = track_ids.len();
+            format!(
+                "Удалить {} {}?",
+                count,
+                plural(count, "трек", "трека", "треков")
+            )
+        };
         let mut confirmed = false;
         let response = egui::Modal::new(egui::Id::unique("confirm_delete_track")).show(ctx, |ui| {
             ui.set_width(440.0);
-            ui.heading(format!("Удалить трек «{title}»?"));
+            ui.heading(title_line);
             ui.add_space(4.0);
-            ui.label("Трек исчезнет из библиотеки и всех плейлистов.");
+            ui.label("Треки исчезнут из библиотеки и всех плейлистов.");
             if let Some(library) = self.library.as_mut() {
                 // The checkbox lives in the state so it survives frames.
-                ui.checkbox(&mut library.purge_media, "Удалить и медиа-файл с устройства");
+                let label = if track_ids.len() == 1 {
+                    "Удалить и медиа-файл с устройства"
+                } else {
+                    "Удалить и медиа-файлы с устройства"
+                };
+                ui.checkbox(&mut library.purge_media, label);
             }
             ui.label(
                 egui::RichText::new(
-                    "Без галочки аудиофайл останется на диске как «осиротевший».",
+                    "Без галочки аудиофайлы останутся на диске как «осиротевшие».",
                 )
                 .weak(),
             );
@@ -1012,9 +1396,16 @@ impl PodlibApp {
                 .as_ref()
                 .map(|library| library.purge_media)
                 .unwrap_or(false);
+            let (first, rest) = match track_ids.split_first() {
+                Some((first, rest)) => (*first, rest.to_vec()),
+                None => return,
+            };
+            if let Some(library) = self.library.as_mut() {
+                library.delete_queue = rest;
+            }
             self.library_request(
                 LibraryCommand::RemoveTrack {
-                    id: track_id,
+                    id: first,
                     purge_media: purge,
                 },
                 PendingKind::RemoveTrack,
@@ -1302,188 +1693,490 @@ fn batch_add_status(count: usize, skipped: &[String]) -> String {
     status
 }
 
-/// Toolbar above the track table: refresh, new playlist, DnD hint.
-fn library_toolbar(app: &mut PodlibApp, ui: &mut egui::Ui) {
-    ui.horizontal(|ui| {
-        let idle = app.library_idle();
-        if ui
-            .add_enabled(idle, egui::Button::new("Обновить"))
-            .clicked()
-        {
-            app.library_request(
-                LibraryCommand::Refresh,
-                PendingKind::Refresh,
-                "Обновляю список…",
-            );
-        }
-        if ui
-            .add_enabled(idle, egui::Button::new("+ Плейлист"))
-            .clicked()
-        {
-            if let Some(library) = app.library.as_mut() {
-                library.create_open = true;
-                library.new_playlist_name.clear();
-            }
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(
-                egui::RichText::new("Перетащите аудиофайлы в окно, чтобы добавить")
-                    .weak(),
-            );
-        });
-    });
+// ---- round 4 UX: pure helpers (tested) ----
+
+/// Case-insensitive substring search over title/artist/album. An empty
+/// or blank query matches everything (the filter is off).
+fn matches_query(track: &Track, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    [track.title.as_str()]
+        .into_iter()
+        .chain(track.artist.iter().map(String::as_str))
+        .chain(track.album.iter().map(String::as_str))
+        .any(|field| field.to_lowercase().contains(&query))
 }
 
-/// Renders the track table and collects context-menu choices without
-/// holding a borrow on app state (the caller applies them afterwards).
+/// Sidebar ordering: the master playlist first, everything else keeps
+/// its snapshot order (stable sort).
+fn master_first(playlists: &[Playlist]) -> Vec<&Playlist> {
+    let mut ordered: Vec<&Playlist> = playlists.iter().collect();
+    ordered.sort_by_key(|playlist| !playlist.is_master);
+    ordered
+}
+
+/// Next selection moving `delta` rows through the visible (filtered)
+/// list, clamped at the edges. A stale or missing selection restarts
+/// from the first row; an empty list selects nothing.
+fn next_selection(visible: &[TrackId], current: Option<TrackId>, delta: isize) -> Option<TrackId> {
+    if visible.is_empty() {
+        return None;
+    }
+    let index = current
+        .and_then(|id| visible.iter().position(|&candidate| candidate == id))
+        .map_or(0, |index| {
+            (index as isize + delta).clamp(0, visible.len() as isize - 1) as usize
+        });
+    Some(visible[index])
+}
+
+/// Enter activation: works only when the selection is actually visible.
+fn activated(visible: &[TrackId], current: Option<TrackId>) -> Option<TrackId> {
+    match current {
+        Some(id) if visible.contains(&id) => Some(id),
+        _ => None,
+    }
+}
+
+/// Toolbar counter: «{N} треков», or «{N} из {total}» while filtering.
+fn tracks_counter(shown: usize, total: usize, query: &str) -> String {
+    if query.trim().is_empty() {
+        format!(
+            "{} {}",
+            total,
+            plural(total, "трек", "трека", "треков")
+        )
+    } else {
+        format!("{} из {}", shown, total)
+    }
+}
+
+// ---- round 4.1: view contexts and selection (pure helpers, tested) ----
+
+/// What the central table shows (round 4.1 Ф2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LibraryView {
+    /// Whole library listing (master view) — the default.
+    #[default]
+    Master,
+    /// Built-in device view (firmware section) by `distinguished_kind`.
+    Media { distinguished: i64 },
+    /// A user playlist.
+    Playlist(PlaylistId),
+}
+
+/// Raw iTunesDB media-kind bits covered by a built-in device view.
+/// Kinds follow the firmware: 1 = music, 2 = movie, 4 = podcast,
+/// 8 = audiobook, 16 = TV show, 32 = music video. The rentals view
+/// (7) is not representable as a media kind — it filters to nothing.
+fn view_media_kinds(distinguished_kind: i64) -> &'static [u32] {
+    match distinguished_kind {
+        1 => &[2, 16, 32], // «Видео»: movies + TV + music videos
+        2 => &[2],         // «Фильмы»
+        3 => &[16],        // «Телешоу»
+        4 => &[1],         // «Музыка»
+        5 => &[8],         // «Аудиокниги»
+        _ => &[],          // 0 (not a view), 7 («Прокат»), anything unknown
+    }
+}
+
+/// One click on a visible table row resolved to selection state, in
+/// index domain (indices into the current visible list). Plain click
+/// resets to a single row; ctrl toggles the row; shift selects the
+/// range from the anchor. The caller passes the anchor already
+/// validated against the visible list length (a stale anchor — the
+/// list shrank since the anchored click — is dropped there, so shift
+/// degenerates to a plain click).
+fn apply_row_click(
+    selected: &[usize],
+    anchor: Option<usize>,
+    clicked: usize,
+    ctrl: bool,
+    shift: bool,
+) -> (Vec<usize>, Option<usize>) {
+    if shift && anchor.is_some() {
+        let start = anchor.unwrap();
+        let (from, to) = if start <= clicked {
+            (start, clicked)
+        } else {
+            (clicked, start)
+        };
+        let selected = (from..=to).collect();
+        return (selected, Some(start));
+    }
+    if ctrl {
+        let mut selected = selected.to_vec();
+        if let Some(position) = selected.iter().position(|&index| index == clicked) {
+            selected.remove(position);
+        } else {
+            selected.push(clicked);
+            selected.sort_unstable();
+        }
+        return (selected, anchor.or(Some(clicked)));
+    }
+    (vec![clicked], Some(clicked))
+}
+
+/// Central-panel empty-state text: empty library, empty filter result,
+/// empty device view or empty playlist — in that priority order.
+fn empty_state_text(library_empty: bool, query: &str, empty_view: bool, empty_playlist: bool) -> String {
+    if library_empty {
+        "Перетащите аудиофайлы в окно, чтобы добавить".to_owned()
+    } else if !query.trim().is_empty() {
+        format!("Ничего не найдено по „{}“", query.trim())
+    } else if empty_view {
+        "В этом разделе устройства нет записей".to_owned()
+    } else if empty_playlist {
+        "Пустой плейлист. Перетащите треки из таблицы".to_owned()
+    } else {
+        // Unreachable with a non-empty library, but keep an honest text.
+        "Перетащите аудиофайлы в окно, чтобы добавить".to_owned()
+    }
+}
+
+/// Full error text for the status-bar tooltip: the one-line bar clips,
+/// so message + advice + raw tool output live on hover.
+fn error_tooltip(error: &UiError) -> String {
+    let mut text = error.message.clone();
+    if let Some(hint) = &error.hint {
+        text.push('\n');
+        text.push_str(hint);
+    }
+    if let Some(stderr) = &error.stderr {
+        if !stderr.trim().is_empty() {
+            text.push_str("\n\n");
+            text.push_str(stderr);
+        }
+    }
+    text
+}
+
+/// Actions requested from the table toolbar in one frame.
+#[derive(Default)]
+struct ToolbarActions {
+    refresh: bool,
+    edit: bool,
+    add: bool,
+    remove: bool,
+}
+
+/// Toolbar above the track table: search box (Ctrl+F focuses it when
+/// nothing else holds focus), row counter and the selection actions —
+/// always visible, enabled only for a non-empty selection (round 4.1
+/// Ф3). In a playlist context the delete button becomes
+/// «Убрать из плейлиста» (existing RemoveFromPlaylist command).
+fn search_toolbar(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    query: &mut String,
+    shown: usize,
+    total: usize,
+    idle: bool,
+    selection_len: usize,
+    playlist_context: bool,
+) -> ToolbarActions {
+    let mut toolbar = ToolbarActions::default();
+    ui.horizontal(|ui| {
+        // A stable root id (not id_salt) so Ctrl+F can request focus on
+        // the exact box regardless of where the toolbar lands.
+        let search_box_id = egui::Id::unique("podlib_search");
+        if ctx.input(|input| input.key_pressed(egui::Key::F) && input.modifiers.ctrl)
+            && ctx.memory(|memory| memory.focused().is_none())
+        {
+            ctx.memory_mut(|memory| memory.request_focus(search_box_id));
+        }
+        let query_before = query.clone();
+        ui.add(
+            egui::TextEdit::singleline(query)
+                .hint_text("Поиск…")
+                .id(search_box_id)
+                .desired_width(240.0),
+        );
+        ui.label(tracks_counter(shown, total, &query_before));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let enabled = idle && selection_len > 0;
+            if playlist_context {
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Убрать из плейлиста"))
+                    .clicked()
+                {
+                    toolbar.remove = true;
+                }
+            } else if ui.add_enabled(enabled, egui::Button::new("Удалить…")).clicked() {
+                toolbar.remove = true;
+            }
+            if ui
+                .add_enabled(enabled, egui::Button::new("Добавить в плейлист…"))
+                .clicked()
+            {
+                toolbar.add = true;
+            }
+            if ui
+                .add_enabled(idle && selection_len == 1, egui::Button::new("Изменить…"))
+                .clicked()
+            {
+                toolbar.edit = true;
+            }
+            if ui
+                .add_enabled(idle, egui::Button::new("Обновить"))
+                .clicked()
+            {
+                toolbar.refresh = true;
+            }
+        });
+    });
+    toolbar
+}
+
+/// Column setup of the track table, shared with the layout test
+/// (round 4.1 Ф4): title takes the remainder with a 120px floor, the
+/// other three are exact widths. WHY the floor: with `remainder` +
+/// fixed columns in a narrow panel the remainder can collapse to 0
+/// (`Sizing::to_lengths` clamps negative remainders to 0) and the row
+/// loses its title entirely; the floor keeps it readable.
+fn track_table_builder<'a>(ui: &'a mut egui::Ui, table_id: egui::Id) -> TableBuilder<'a> {
+    TableBuilder::new(ui)
+        .id_salt(table_id)
+        .striped(true)
+        .vscroll(true)
+        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+        .column(Column::remainder().clip(true).resizable(false).at_least(120.0))
+        .column(Column::exact(ARTIST_COLUMN).clip(true).resizable(false))
+        .column(Column::exact(ALBUM_COLUMN).clip(true).resizable(false))
+        .column(Column::exact(DURATION_COLUMN).resizable(false))
+}
+
+/// The track table (round 4): `egui_extras::TableBuilder` with striped
+/// rows, per-context scroll state, clip + hover-tooltips, a right
+/// aligned duration column, multi-row selection (Ф3: plain/ctrl/shift
+/// clicks, toolbar actions) and full-row drag. Collects row choices
+/// without holding an app-state borrow.
 fn track_table(
     ui: &mut egui::Ui,
-    snapshot: &LibrarySnapshot,
+    tracks: &[&Track],
+    selected_tracks: &[TrackId],
+    cursor: Option<TrackId>,
+    view: LibraryView,
     menus_allowed: bool,
+    table_id: egui::Id,
 ) -> TrackRowActions {
     let mut actions = TrackRowActions::default();
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        table_header(ui);
-        ui.separator();
-        for track in &snapshot.tracks {
-            let row_id = egui::Id::unique(("track_row", track.id.to_bits()));
-            let response = ui
-                .dnd_drag_source(row_id, DraggedTracks(vec![track.id]), |ui| {
-                    track_row(ui, track);
-                })
-                .response;
-            let mut choice = TrackRowActions::default();
-            if menus_allowed {
-                response.context_menu(|ui| {
-                    if ui.button("Изменить…").clicked() {
-                        choice.edit = Some(track.id);
-                        ui.close();
+    // Modifiers at click time are the current input state: egui
+    // processes clicks within their frame.
+    let ctx = ui.ctx().clone();
+    track_table_builder(ui, table_id)
+        .header(ROW_HEIGHT, |mut header| {
+            header.col(|ui| {
+                ui.strong("Название");
+            });
+            header.col(|ui| {
+                ui.strong("Исполнитель");
+            });
+            header.col(|ui| {
+                ui.strong("Альбом");
+            });
+            header.col(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.strong("Длит.");
+                });
+            });
+        })
+        .body(|mut body| {
+            for (index, track) in tracks.iter().enumerate() {
+                let track = *track;
+                body.row(ROW_HEIGHT, |mut row| {
+                    // Selection highlight straight from TableBuilder:
+                    // every row of the multi-selection plus the cursor.
+                    row.set_selected(selected_tracks.contains(&track.id) || cursor == Some(track.id));
+                    // WHY the same id for every cell: egui keys the drag
+                    // payload by id; identical ids + identical payloads
+                    // make all four cells drag the one row.
+                    let row_id = egui::Id::unique(("track_row", track.id.to_bits()));
+                    let payload = DraggedTracks(vec![track.id]);
+                    let clicked = Cell::new(false);
+                    let double_clicked = Cell::new(false);
+                    row.col(|ui| {
+                        draggable_cell(ui, row_id, &payload, &clicked, &double_clicked, |ui| {
+                            ui.label(egui::RichText::new(&track.title).strong());
+                        });
+                    });
+                    row.col(|ui| {
+                        draggable_cell(ui, row_id, &payload, &clicked, &double_clicked, |ui| {
+                            tooltip_label(ui, &track.artist);
+                        });
+                    });
+                    row.col(|ui| {
+                        draggable_cell(ui, row_id, &payload, &clicked, &double_clicked, |ui| {
+                            tooltip_label(ui, &track.album);
+                        });
+                    });
+                    row.col(|ui| {
+                        draggable_cell(ui, row_id, &payload, &clicked, &double_clicked, |ui| {
+                            // Table numbers read better right-aligned to
+                            // the column edge.
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| ui.label(format_duration(track.duration_ms)),
+                            );
+                        });
+                    });
+                    // Double-click wins over plain click: the second
+                    // click of a double-click also registers as clicked.
+                    if double_clicked.get() {
+                        actions.edit = Some(track.id);
+                        actions.select = Some(track.id);
+                    } else if clicked.get() {
+                        let (ctrl, shift) =
+                            ctx.input(|input| (input.modifiers.ctrl, input.modifiers.shift));
+                        actions.row_click = Some((index, ctrl, shift));
                     }
-                    if ui.button("Добавить в плейлист…").clicked() {
-                        choice.add_to_playlist = Some(vec![track.id]);
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("Удалить…").clicked() {
-                        choice.delete = Some(track.id);
-                        ui.close();
+                    if menus_allowed {
+                        let mut choice = TrackRowActions::default();
+                        // Union of the cell responses: the menu opens on
+                        // a right-click anywhere in the row. Menu actions
+                        // stay single-row (round 4.1: ПКМ unchanged).
+                        row.response().context_menu(|ui| {
+                            if ui.button("Изменить…").clicked() {
+                                choice.edit = Some(track.id);
+                                ui.close();
+                            }
+                            if ui.button("Добавить в плейлист…").clicked() {
+                                choice.add_to_playlist = Some(vec![track.id]);
+                                ui.close();
+                            }
+                            if let LibraryView::Playlist(playlist_id) = view {
+                                ui.separator();
+                                if ui.button("Убрать из плейлиста").clicked() {
+                                    choice.remove_from_playlist =
+                                        Some((playlist_id, track.id));
+                                    ui.close();
+                                }
+                            }
+                            ui.separator();
+                            if ui.button("Удалить…").clicked() {
+                                choice.delete = Some(track.id);
+                                ui.close();
+                            }
+                        });
+                        actions.merge(choice);
                     }
                 });
             }
-            actions.merge(choice);
-        }
-    });
+        });
     actions
 }
 
-/// Header row, same column geometry as the data rows.
-fn table_header(ui: &mut egui::Ui) {
-    ui.horizontal(|ui| {
-        for (width, name) in COLUMN_WIDTHS {
-            ui.add_sized(
-                [width, ROW_HEIGHT],
-                egui::Label::new(egui::RichText::new(name).strong()),
-            );
-        }
-    });
+/// One draggable table cell: drag payload + click/double-click flags.
+/// WHY per-cell drag sources: TableBuilder splits the row into cells,
+/// so wrapping each cell keeps the whole row draggable.
+fn draggable_cell(
+    ui: &mut egui::Ui,
+    row_id: egui::Id,
+    payload: &DraggedTracks,
+    clicked: &Cell<bool>,
+    double_clicked: &Cell<bool>,
+    add: impl FnOnce(&mut egui::Ui),
+) {
+    let response = ui
+        .dnd_drag_source(row_id, payload.clone(), |ui| {
+            ui.set_min_height(ROW_HEIGHT);
+            add(ui);
+        })
+        .response;
+    if response.clicked() {
+        clicked.set(true);
+    }
+    if response.double_clicked() {
+        double_clicked.set(true);
+    }
 }
 
-/// One playlist block: drop zone, collapsing header, member rows.
-/// Collects this playlist's choices; no app-state borrow held.
-fn playlist_block(
+/// Artist/album cell: clipped by the column, hovering shows the full text.
+fn tooltip_label(ui: &mut egui::Ui, value: &Option<String>) {
+    let response = ui.label(optional_text(value));
+    if let Some(full) = value.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
+        response.on_hover_text(full);
+    }
+}
+
+/// One sidebar row: name + weak count («Все треки» only on the master),
+/// selectable (click = the central table context). Built-in device
+/// views accept no drops and offer no ПКМ: the firmware owns them.
+fn playlist_row(
     ui: &mut egui::Ui,
     snapshot: &LibrarySnapshot,
     playlist: &Playlist,
+    view: &mut LibraryView,
     menus_allowed: bool,
 ) -> PlaylistPanelActions {
     let mut actions = PlaylistPanelActions::default();
-    let is_master = playlist.is_master;
-    let header_text = if is_master {
-        format!("{} (мастер)", playlist.name)
+    let is_view = playlist.distinguished_kind != 0;
+    let count_text = if playlist.is_master {
+        "Все треки".to_owned()
+    } else if is_view {
+        let kinds = view_media_kinds(playlist.distinguished_kind);
+        let count = snapshot
+            .tracks
+            .iter()
+            .filter(|track| kinds.contains(&track.media_kind))
+            .count();
+        format!("{} {}", count, plural(count, "трек", "трека", "треков"))
     } else {
-        playlist.name.clone()
+        let count = playlist.unique_track_ids().len();
+        format!("{} {}", count, plural(count, "трек", "трека", "треков"))
     };
-    let header_id = egui::Id::unique(("playlist_header", playlist.id.to_bits()));
-    let (_, dropped) = ui.dnd_drop_zone::<DraggedTracks, _>(
+    let row_view = if playlist.is_master {
+        LibraryView::Master
+    } else if is_view {
+        LibraryView::Media {
+            distinguished: playlist.distinguished_kind,
+        }
+    } else {
+        LibraryView::Playlist(playlist.id)
+    };
+    let (_, dropped) = ui.dnd_drop_zone::<DraggedTracks, ()>(
         egui::Frame::default().inner_margin(egui::Margin::same(2)),
         |ui| {
-            let collapsing = egui::CollapsingHeader::new(header_text.as_str())
-                .id_salt(header_id)
-                .default_open(true)
-                .show(ui, |ui| {
-                    actions.remove_member =
-                        playlist_members(ui, snapshot, playlist, menus_allowed);
-                });
-            if !is_master && menus_allowed {
-                let mut delete = false;
-                collapsing.header_response.context_menu(|ui| {
-                    if ui.button("Удалить плейлист…").clicked() {
-                        delete = true;
+            let name = ui.selectable_value(
+                view,
+                row_view,
+                (
+                    egui::RichText::new(playlist.name.as_str()),
+                    egui::RichText::new(format!("  {count_text}")).weak(),
+                ),
+            );
+            if menus_allowed && !is_view {
+                let mut refused_master = false;
+                name.context_menu(|ui| {
+                    if ui.button("Удалить…").clicked() {
+                        if playlist.is_master {
+                            refused_master = true;
+                        } else {
+                            actions.delete_playlist = Some(playlist.id);
+                        }
                         ui.close();
                     }
                 });
-                if delete {
-                    actions.delete_playlist = Some(playlist.id);
+                if refused_master {
+                    actions.master_delete = Some(playlist.name.clone());
                 }
             }
         },
     );
     if let Some(dragged) = dropped {
-        // WHY the UI refuses master drops instead of trusting the
-        // backend: the 7G adapter rejects master-member mutations,
-        // but the classic backend allows them on purpose (firmware
-        // parity) — where they are pointless anyway: the master is
-        // the mirror of the whole library and duplicates are
-        // ignored. One consistent rule, explained without a round
-        // trip to the device.
-        if is_master {
+        if playlist.is_master {
             actions.master_drop = Some(playlist.name.clone());
+        } else if is_view {
+            // The firmware owns built-in views: drops are refused
+            // up front instead of a failed round trip.
+            actions.view_drop = Some(playlist.name.clone());
         } else {
             actions.add_drop = Some((playlist.id, dragged.0.clone()));
         }
     }
     actions
-}
-
-/// Member rows inside one playlist header; returns an «Убрать» choice.
-fn playlist_members(
-    ui: &mut egui::Ui,
-    snapshot: &LibrarySnapshot,
-    playlist: &Playlist,
-    menus_allowed: bool,
-) -> Option<(PlaylistId, TrackId)> {
-    let mut remove_member = None;
-    let is_master = playlist.is_master;
-    for member_id in playlist.unique_track_ids() {
-        let title = snapshot
-            .track(member_id)
-            .map(|track| track.title.as_str())
-            .unwrap_or("<нет в библиотеке>");
-        let mut remove = false;
-        let row = ui
-            .horizontal(|ui| {
-                ui.add_sized(
-                    [ui.available_width() - 8.0, ROW_HEIGHT - 4.0],
-                    egui::Label::new(egui::RichText::new(title).weak()),
-                );
-            })
-            .response;
-        if !is_master && menus_allowed {
-            row.context_menu(|ui| {
-                if ui.button("Убрать из плейлиста").clicked() {
-                    remove = true;
-                    ui.close();
-                }
-            });
-        }
-        if remove {
-            remove_member = Some((playlist.id, member_id));
-        }
-    }
-    if playlist.track_ids.is_empty() {
-        ui.label(egui::RichText::new("— пусто —").weak());
-    }
-    remove_member
 }
 
 /// Field editors of the edit-track dialog; returns true on «Сохранить».
@@ -1546,26 +2239,45 @@ fn edit_track_dialog_fields(ui: &mut egui::Ui, dialog: &mut EditDialogState) -> 
     save
 }
 
-/// Renders one track-table row: four fixed-width cells (drag source body).
-fn track_row(ui: &mut egui::Ui, track: &Track) {
-    ui.horizontal(|ui| {
-        ui.add_sized(
-            [COLUMN_WIDTHS[0].0, ROW_HEIGHT],
-            egui::Label::new(egui::RichText::new(track.title.as_str()).strong()),
-        );
-        ui.add_sized(
-            [COLUMN_WIDTHS[1].0, ROW_HEIGHT],
-            egui::Label::new(optional_text(&track.artist)),
-        );
-        ui.add_sized(
-            [COLUMN_WIDTHS[2].0, ROW_HEIGHT],
-            egui::Label::new(optional_text(&track.album)),
-        );
-        ui.add_sized(
-            [COLUMN_WIDTHS[3].0, ROW_HEIGHT],
-            egui::Label::new(format_duration(track.duration_ms)),
-        );
-    });
+/// Headless table render for the Ф4 layout test: same builder config
+/// as production, header cells measured via allocated rects.
+#[cfg(test)]
+fn render_measured_table(ui: &mut egui::Ui) -> Vec<egui::Rect> {
+    let rects: [std::rc::Rc<std::cell::RefCell<Option<egui::Rect>>>; 4] =
+        Default::default();
+    let sinks = rects.clone();
+    track_table_builder(ui, egui::Id::unique("test_table"))
+        .header(ROW_HEIGHT, move |mut header| {
+            for sink in sinks {
+                header.col(move |ui| {
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 16.0),
+                        egui::Sense::hover(),
+                    );
+                    *sink.borrow_mut() = Some(rect);
+                });
+            }
+        })
+        .body(|mut body| {
+            body.row(ROW_HEIGHT, |mut row| {
+                row.col(|ui| {
+                    ui.label("Alpha");
+                });
+                row.col(|ui| {
+                    ui.label("Artist");
+                });
+                row.col(|ui| {
+                    ui.label("Album");
+                });
+                row.col(|ui| {
+                    ui.label("2:03");
+                });
+            });
+        });
+    rects
+        .iter()
+        .map(|cell| cell.borrow().expect("header cell must render"))
+        .collect()
 }
 
 /// Missing tags render as an em dash instead of nothing.
@@ -1616,33 +2328,29 @@ fn draw_drop_overlay(ui: &egui::Ui, names: &[String]) {
     );
 }
 
-/// Worker-thread body: sudo rw-mount only. The library is NOT opened here:
+/// Worker-thread body: run the sudo mount sequence (`mkdir -p`, then
+/// rw-mount) and report the mount point. The library is NOT opened here:
 /// `Box<dyn LibraryBackend>` is not `Send`, so it is opened on the library
 /// worker thread instead (see library.rs).
 fn connect_device(
-    password: String, // owned: dropped right after the mount command (W3)
-    block_dev: PathBuf,
+    password: String, // owned: dropped right after the last command (W3)
+    steps: Vec<device::CommandSpec>,
     mount_path: PathBuf,
 ) -> Result<PathBuf, ConnectError> {
-    let (uid, gid) = device::current_uid_gid().ok_or_else(|| {
-        ConnectError::Preflight("не удалось определить uid/gid процесса".to_owned())
-    })?;
-    let spec = device::build_mount_command(&MountSpec {
-        block_dev: block_dev.clone(),
-        mount_path: mount_path.clone(),
-        uid,
-        gid,
-    });
-    let output = device::run_sudo_mount(&password, &spec).map_err(|error| ConnectError::Mount {
-        stderr: String::new(),
-        error: MountError::Io(error),
-    })?;
-    // WHY: the password lives only for the duration of the command. sudo
-    // has already consumed it (stdin is closed at this point), so it is
-    // dropped before returning instead of staying alive in the worker.
+    // WHY the password lives across the whole loop: every sudo step
+    // consumes its own copy from stdin; it is dropped only after the
+    // last step, never stored anywhere.
+    for spec in &steps {
+        let output =
+            device::run_sudo_mount(&password, spec).map_err(|error| ConnectError::Mount {
+                stderr: String::new(),
+                error: MountError::Io(error),
+            })?;
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        device::classify_mount_output(&output)
+            .map_err(|error| ConnectError::Mount { error, stderr })?;
+    }
     drop(password);
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    device::classify_mount_output(&output).map_err(|error| ConnectError::Mount { error, stderr })?;
     Ok(mount_path)
 }
 
@@ -1663,21 +2371,70 @@ impl eframe::App for PodlibApp {
         self.drain_library();
         self.guard_close_request(ui);
         self.collect_dropped_files(ui);
+        // A selected view deleted from the device falls back to the
+        // master view (checked once per frame, before panels).
+        if let Some(library) = self.library.as_mut() {
+            let stale = match library.view {
+                LibraryView::Master => false,
+                LibraryView::Media { distinguished } => !library
+                    .snapshot
+                    .playlists
+                    .iter()
+                    .any(|playlist| playlist.distinguished_kind == distinguished),
+                LibraryView::Playlist(id) => library.snapshot.playlist(id).is_none(),
+            };
+            if stale {
+                library.view = LibraryView::Master;
+            }
+        }
+        // 1) App bar: name + device state + eject.
+        egui::Panel::top("app_bar")
+            .default_size(48.0)
+            .show(ui, |ui| self.app_bar(ui));
+        // 2) Left sidebar: device list while disconnected, playlists
+        //    once connected (the old right playlists panel is gone —
+        //    it duplicated the central table). 240px (Ф4): leaves the
+        //    table enough width for all four columns at ≥900px windows.
         egui::Panel::left("device_panel")
-            .default_size(340.0)
+            .default_size(240.0)
             .resizable(true)
-            .show(ui, |ui| self.device_panel(ui));
-        egui::Panel::right("playlists_panel")
-            .default_size(280.0)
-            .resizable(true)
-            .show(ui, |ui| self.playlists_panel(ui));
+            .show(ui, |ui| {
+                if self.connected.is_some() {
+                    let actions = self.playlists_sidebar(ui);
+                    self.apply_playlist_actions(actions);
+                } else {
+                    self.device_panel(ui);
+                }
+            });
+        // 3) Central panel: the selected playlist context (master = the
+        //    whole library), or a plain hint while disconnected.
         egui::CentralPanel::default().show(ui, |ui| {
-            self.status_area(ui);
-            if self.library.is_some() {
-                ui.separator();
+            if self.connected.is_none() {
+                ui.centered_and_justified(|ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "Подключите устройство, чтобы работать с библиотекой",
+                        )
+                        .weak(),
+                    );
+                });
+            } else if self.library.is_none() {
+                ui.centered_and_justified(|ui| {
+                    ui.colored_label(
+                        egui::Color32::LIGHT_RED,
+                        "Библиотека недоступна: воркер закрылся. Отключите и подключите \
+                         устройство заново.",
+                    );
+                });
+            } else {
                 self.library_view(ui);
             }
         });
+        // 4) Status bar: progress / last result / error + DnD hint.
+        egui::Panel::bottom("status_bar")
+            .default_size(34.0)
+            .resizable(false)
+            .show(ui, |ui| self.status_bar(ui));
         // Hover preview above everything while files are dragged over us.
         let hovered: Vec<String> = ui
             .input(|input| {
@@ -1745,6 +2502,7 @@ mod tests {
             disc_number: 1,
             size_bytes: 1024,
             has_artwork: false,
+            media_kind: 1,
         }
     }
 
@@ -1783,19 +2541,6 @@ mod tests {
     }
 
     // ---- device round-1 behaviour (kept) ----
-
-    #[test]
-    fn preflight_error_does_not_claim_mounted_volume() {
-        let mut app = test_app();
-        app.handle_event(DeviceEvent::Connected(Err(ConnectError::Preflight(
-            "не удалось определить uid/gid процесса".to_owned(),
-        ))));
-        let error = app.error.expect("preflight failure must be shown");
-        // W4: the failure happens before the mount command — the UI must
-        // not state that the volume is mounted.
-        assert!(error.message.contains("Монтирование не выполнено"));
-        assert!(!error.message.contains("смонтирован"));
-    }
 
     #[test]
     fn panic_message_handles_common_payloads() {
@@ -2194,5 +2939,309 @@ mod tests {
             "Добавляется 3 файла, это может занять время…; \
              пропущены: notes.txt, noext"
         );
+    }
+
+    // ---- search filter (round 4 UX) ----
+
+    fn searchable_track(title: &str, artist: Option<&str>, album: Option<&str>) -> Track {
+        Track {
+            id: TrackId::from_bits(1),
+            title: title.to_owned(),
+            artist: artist.map(str::to_owned),
+            album: album.map(str::to_owned),
+            album_artist: None,
+            duration_ms: 90_000,
+            track_number: 1,
+            disc_number: 1,
+            size_bytes: 1024,
+            has_artwork: false,
+            media_kind: 1,
+        }
+    }
+
+    #[test]
+    fn empty_or_blank_query_matches_everything() {
+        let track = searchable_track("Anything", Some("Whoever"), Some("Whatever"));
+        assert!(matches_query(&track, ""));
+        assert!(matches_query(&track, "   "));
+    }
+
+    #[test]
+    fn query_matches_title_case_insensitively() {
+        let track = searchable_track("Moonlight Sonata", None, None);
+        assert!(matches_query(&track, "moon"));
+        assert!(matches_query(&track, "SONATA"));
+        assert!(matches_query(&track, "light son"));
+        // Latin vs Cyrillic differs — no accidental matches.
+        assert!(!matches_query(&track, "лунная"));
+    }
+
+    #[test]
+    fn query_matches_cyrillic_case_insensitively() {
+        let track = searchable_track("Лунная соната", None, None);
+        assert!(matches_query(&track, "лунная"));
+        assert!(matches_query(&track, "Соната"));
+        assert!(!matches_query(&track, "moon"));
+    }
+
+    #[test]
+    fn query_matches_artist_and_album_too() {
+        let track = searchable_track("Title", Some("Beethoven"), Some("Classics"));
+        assert!(matches_query(&track, "beeth"));
+        assert!(matches_query(&track, "class"));
+        assert!(!matches_query(&track, "mozart"));
+    }
+
+    #[test]
+    fn missing_tags_are_not_searched_and_do_not_panic() {
+        let track = searchable_track("Title", None, None);
+        // «—» is a render artifact of empty tags, never part of the data:
+        // it must not match a track whose tags are missing.
+        assert!(!matches_query(&track, "—"));
+        assert!(!matches_query(&track, "beeth"));
+    }
+
+    // ---- sidebar ordering: master first (round 4 UX) ----
+
+    fn playlist_of(id: u64, name: &str, is_master: bool) -> Playlist {
+        Playlist {
+            id: PlaylistId::from_bits(id),
+            name: name.to_owned(),
+            track_ids: Vec::new(),
+            is_master,
+            is_smart: false,
+            distinguished_kind: 0,
+        }
+    }
+
+    #[test]
+    fn master_first_keeps_master_first_and_rest_in_order() {
+        let playlists = vec![
+            playlist_of(1, "Медиатека", true),
+            playlist_of(2, "Джаз", false),
+            playlist_of(3, "Рок", false),
+        ];
+        let ordered: Vec<String> = master_first(&playlists)
+            .into_iter()
+            .map(|playlist| playlist.name.clone())
+            .collect();
+        assert_eq!(ordered, ["Медиатека", "Джаз", "Рок"]);
+    }
+
+    #[test]
+    fn master_first_moves_master_from_the_middle_to_front() {
+        let playlists = vec![
+            playlist_of(2, "Джаз", false),
+            playlist_of(1, "Медиатека", true),
+            playlist_of(3, "Рок", false),
+        ];
+        let ordered: Vec<String> = master_first(&playlists)
+            .into_iter()
+            .map(|playlist| playlist.name.clone())
+            .collect();
+        assert_eq!(ordered, ["Медиатека", "Джаз", "Рок"]);
+    }
+
+    #[test]
+    fn master_first_handles_empty_and_masterless_lists() {
+        let empty: Vec<Playlist> = Vec::new();
+        assert!(master_first(&empty).is_empty());
+        let playlists = vec![playlist_of(2, "Джаз", false), playlist_of(3, "Рок", false)];
+        let ordered: Vec<String> = master_first(&playlists)
+            .into_iter()
+            .map(|playlist| playlist.name.clone())
+            .collect();
+        assert_eq!(ordered, ["Джаз", "Рок"]);
+    }
+
+    // ---- keyboard navigation over the visible rows (round 4 UX) ----
+
+    fn ids(bits: &[u64]) -> Vec<TrackId> {
+        bits.iter().map(|&b| TrackId::from_bits(b)).collect()
+    }
+
+    #[test]
+    fn navigation_on_empty_list_selects_nothing() {
+        let visible: Vec<TrackId> = Vec::new();
+        assert_eq!(next_selection(&visible, None, 1), None);
+        assert_eq!(next_selection(&visible, None, -1), None);
+    }
+
+    #[test]
+    fn navigation_without_selection_starts_at_first_row() {
+        let visible = ids(&[10, 20, 30]);
+        assert_eq!(next_selection(&visible, None, 1), Some(TrackId::from_bits(10)));
+        assert_eq!(next_selection(&visible, None, -1), Some(TrackId::from_bits(10)));
+    }
+
+    #[test]
+    fn navigation_moves_to_the_neighbour_and_clamps_at_edges() {
+        let visible = ids(&[10, 20, 30]);
+        let first = TrackId::from_bits(10);
+        let middle = TrackId::from_bits(20);
+        let last = TrackId::from_bits(30);
+        assert_eq!(next_selection(&visible, Some(first), 1), Some(middle));
+        assert_eq!(next_selection(&visible, Some(middle), -1), Some(first));
+        assert_eq!(next_selection(&visible, Some(first), -1), Some(first), "up from top clamps");
+        assert_eq!(next_selection(&visible, Some(last), 1), Some(last), "down from bottom clamps");
+    }
+
+    #[test]
+    fn navigation_of_stale_selection_starts_over() {
+        // e.g. the selected row was filtered out or removed: arrows
+        // restart from the top instead of jumping anywhere.
+        let visible = ids(&[10, 20, 30]);
+        let stale = TrackId::from_bits(99);
+        assert_eq!(next_selection(&visible, Some(stale), 1), Some(TrackId::from_bits(10)));
+        assert_eq!(next_selection(&visible, Some(stale), -1), Some(TrackId::from_bits(10)));
+    }
+
+    #[test]
+    fn activation_requires_a_visible_selection() {
+        let visible = ids(&[10, 20]);
+        assert_eq!(activated(&visible, Some(TrackId::from_bits(20))), Some(TrackId::from_bits(20)));
+        assert_eq!(activated(&visible, None), None);
+        assert_eq!(activated(&visible, Some(TrackId::from_bits(99))), None);
+        let empty: Vec<TrackId> = Vec::new();
+        assert_eq!(activated(&empty, Some(TrackId::from_bits(10))), None);
+    }
+
+    // ---- toolbar counter and empty-states (round 4 UX) ----
+
+    #[test]
+    fn counter_shows_total_without_query_and_ratio_with_it() {
+        assert_eq!(tracks_counter(3, 3, ""), "3 трека");
+        assert_eq!(tracks_counter(3, 5, ""), "5 треков");
+        assert_eq!(tracks_counter(3, 1, ""), "1 трек");
+        assert_eq!(tracks_counter(3, 5, "abc"), "3 из 5");
+        // Whitespace counts as «no query»: the total is shown.
+        assert_eq!(tracks_counter(0, 5, "   "), "5 треков");
+    }
+
+    #[test]
+    fn empty_state_texts_follow_the_spec() {
+        assert_eq!(
+            empty_state_text(true, "", false, false),
+            "Перетащите аудиофайлы в окно, чтобы добавить"
+        );
+        assert_eq!(
+            empty_state_text(false, "  джаз  ", false, false),
+            "Ничего не найдено по „джаз“"
+        );
+        assert_eq!(
+            empty_state_text(false, "", false, true),
+            "Пустой плейлист. Перетащите треки из таблицы"
+        );
+    }
+
+    // ---- status-bar error tooltip (round 4 UX) ----
+
+    #[test]
+    fn error_tooltip_gathers_message_hint_and_nonempty_stderr() {
+        let plain = UiError {
+            message: "Не удалось определить блочное устройство".to_owned(),
+            hint: None,
+            stderr: None,
+        };
+        assert_eq!(error_tooltip(&plain), plain.message);
+
+        let with_stderr = UiError {
+            message: "mount failed".to_owned(),
+            hint: Some("Проверьте пароль".to_owned()),
+            stderr: Some("\n".to_owned()), // whitespace-only → skipped
+        };
+        assert_eq!(
+            error_tooltip(&with_stderr),
+            "mount failed\nПроверьте пароль"
+        );
+
+        let full = UiError {
+            message: "mount failed".to_owned(),
+            hint: None,
+            stderr: Some("mount: bad option".to_owned()),
+        };
+        assert_eq!(error_tooltip(&full), "mount failed\n\nmount: bad option");
+    }
+
+    // ---- device-view media kinds (round 4.1 Ф2) ----
+
+    #[test]
+    fn view_media_kinds_per_firmware_views() {
+        assert_eq!(view_media_kinds(4), &[1]);         // «Музыка»
+        assert_eq!(view_media_kinds(5), &[8]);         // «Аудиокниги»
+        assert_eq!(view_media_kinds(2), &[2]);         // «Фильмы»
+        assert_eq!(view_media_kinds(3), &[16]);        // «Телешоу»
+        assert_eq!(view_media_kinds(1), &[2, 16, 32]); // «Видео» — всё видео
+        assert_eq!(view_media_kinds(7), &([]) as &[u32]);          // «Прокат» — не представим
+        assert_eq!(view_media_kinds(0), &([]) as &[u32]);          // обычный/мастер-плейлист
+        assert_eq!(view_media_kinds(11), &([]) as &[u32]);         // classic podcast — неизвестен
+    }
+
+    // ---- row click → selection (round 4.1 Ф3) ----
+
+    #[test]
+    fn plain_click_resets_selection_to_one() {
+        let (selected, anchor) = apply_row_click(&[0, 3], Some(3), 5, false, false);
+        assert_eq!(selected, [5]);
+        assert_eq!(anchor, Some(5));
+    }
+
+    #[test]
+    fn ctrl_click_toggles_preserving_order() {
+        // Toggle off an already selected row.
+        let (selected, anchor) = apply_row_click(&[2, 4], Some(2), 4, true, false);
+        assert_eq!(selected, [2]);
+        assert_eq!(anchor, Some(2), "ctrl keeps the anchor");
+        // Toggle on a new row.
+        let (selected, anchor) = apply_row_click(&[2], Some(2), 7, true, false);
+        assert_eq!(selected, [2, 7]);
+        assert_eq!(anchor, Some(2));
+    }
+
+    #[test]
+    fn shift_click_selects_the_range_from_anchor() {
+        let (selected, anchor) = apply_row_click(&[2], Some(2), 6, false, true);
+        assert_eq!(selected, [2, 3, 4, 5, 6]);
+        assert_eq!(anchor, Some(2), "shift keeps the anchor for further shifts");
+        // Backwards shift works too.
+        let (selected, anchor) = apply_row_click(&[5], Some(5), 1, false, true);
+        assert_eq!(selected, [1, 2, 3, 4, 5]);
+        assert_eq!(anchor, Some(5));
+    }
+
+    #[test]
+    fn shift_without_anchor_acts_like_plain_click() {
+        let (selected, anchor) = apply_row_click(&[1, 2], None, 6, false, true);
+        assert_eq!(selected, [6]);
+        assert_eq!(anchor, Some(6));
+    }
+
+    // ---- table columns fit the panel (round 4.1 Ф4) ----
+
+    /// Worst-case central content width at a 900px window: 900 − 240
+    /// sidebar − panel margins − vscroll bar. All four columns must be
+    /// visible with a ≥120px title.
+    #[test]
+    fn table_columns_fit_narrow_panel_with_120px_title() {
+        let rects: std::rc::Rc<std::cell::RefCell<Vec<egui::Rect>>> = Default::default();
+        let sink = rects.clone();
+        egui::__run_test_ui(|ui| {
+            ui.allocate_ui(egui::vec2(616.0, 400.0), |ui| {
+                let columns = render_measured_table(ui);
+                *sink.borrow_mut() = columns;
+            });
+        });
+        let rects = rects.borrow();
+        assert_eq!(rects.len(), 4, "four header cells must render");
+        let panel_right = 616.0;
+        for (index, rect) in rects.iter().enumerate() {
+            assert!(
+                rect.right() <= panel_right + 1.0,
+                "column {index} overflows the panel: {rect:?}"
+            );
+            assert!(rect.width() > 40.0, "column {index} collapsed: {rect:?}");
+        }
+        assert!(rects[0].width() >= 120.0, "title ≥ 120px, got {}", rects[0].width());
+        assert!(rects[3].left() >= rects[2].right(), "columns must not overlap");
     }
 }

@@ -35,14 +35,26 @@ impl CommandSpec {
     }
 }
 
-/// A discovered device candidate: a volume directory that contains an
-/// `iPod_Control` entry.
+/// A discovered device candidate: either an already-mounted volume
+/// directory that contains an `iPod_Control` entry, or a whole Apple
+/// disk found in sysfs while unmounted (machines without an automount
+/// daemon — the GUI mounts it itself).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CandidateKind {
+    /// Volume is mounted; `mount` is the actual mount point.
+    Mounted,
+    /// Volume is not mounted; `mount` is the *planned* mount point
+    /// (see [`default_mount_path`]) that «Подключить» will create.
+    Unmounted,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceCandidate {
-    /// Mount point, e.g. `/run/media/user/07516d6c-…`.
+    /// Mounted: actual mount point. Unmounted: planned mount point.
     pub mount: PathBuf,
     /// Volume directory name (UUID or label), for display.
     pub label: String,
+    pub kind: CandidateKind,
 }
 
 /// Scans the system media root for device candidates.
@@ -67,12 +79,139 @@ pub fn scan_under(root: &Path) -> Vec<DeviceCandidate> {
                 candidates.push(DeviceCandidate {
                     label: volume.file_name().to_string_lossy().into_owned(),
                     mount: volume.path(),
+                    kind: CandidateKind::Mounted,
                 });
             }
         }
     }
     candidates.sort_by(|a, b| a.mount.cmp(&b.mount));
     candidates
+}
+
+/// An Apple iPod detected through sysfs while its data volume is not
+/// mounted anywhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppleDisk {
+    /// The largest partition (the data volume; the tiny first partition
+    /// is an MBR/GPT stub), e.g. `/dev/sda2`.
+    pub partition: PathBuf,
+    /// `vendor model`, e.g. `Apple iPod`, for display and mount label.
+    pub label: String,
+}
+
+/// Pure scan core with an injectable sysfs root: every `/sys/block/*`
+/// entry whose `device/vendor` is `Apple` is an iPod. Its data partition
+/// is the largest partition child (children carrying the `partition`
+/// marker file, sized by the `size` file in 512-byte sectors). The
+/// devnode name is the basename of the sysfs partition dir (`sda2` →
+/// `/dev/sda2`) — safe because the vendor filter admits only sd-like
+/// USB disks (WHY: no libudev, KISS per the round-1 decision).
+pub fn scan_apple_disks(sys_block_root: &Path) -> Vec<AppleDisk> {
+    let mut disks = Vec::new();
+    let Ok(entries) = std::fs::read_dir(sys_block_root) else {
+        return disks;
+    };
+    for entry in entries.flatten() {
+        let sys_text = |rel: &str| -> String {
+            std::fs::read_to_string(entry.path().join(rel))
+                .map(|text| text.trim().to_owned())
+                .unwrap_or_default()
+        };
+        let vendor = sys_text("device/vendor");
+        if vendor != "Apple" {
+            continue;
+        }
+        let model = sys_text("device/model");
+        let Ok(parts) = std::fs::read_dir(entry.path()) else {
+            continue;
+        };
+        let data = parts
+            .flatten()
+            .filter(|part| part.path().join("partition").is_file())
+            .filter_map(|part| {
+                let size: u64 = std::fs::read_to_string(part.path().join("size"))
+                    .ok()?
+                    .trim()
+                    .parse()
+                    .ok()?;
+                let name = part.file_name().to_string_lossy().into_owned();
+                Some((size, name))
+            })
+            .max_by_key(|(size, _)| *size);
+        let Some((_, part_name)) = data else {
+            continue;
+        };
+        let label = if model.is_empty() {
+            vendor
+        } else {
+            format!("{vendor} {model}")
+        };
+        disks.push(AppleDisk {
+            partition: PathBuf::from("/dev").join(part_name),
+            label,
+        });
+    }
+    disks.sort_by(|a, b| a.partition.cmp(&b.partition));
+    disks
+}
+
+/// Planned mount point for an unmounted iPod, following the udisks
+/// convention `/run/media/<user>/<label>` so the layout matches
+/// automounted volumes on machines that have an automount daemon.
+pub fn default_mount_path(label: &str, user: &str) -> PathBuf {
+    Path::new("/run/media").join(user).join(label)
+}
+
+/// Pure merge: mounted candidates win (dedup by block device — a sysfs
+/// disk whose data partition is already mounted is the same iPod);
+/// unmounted disks become candidates with a planned mount path. Output
+/// is sorted by mount path for determinism (tests rely on it).
+pub fn merge_candidates(
+    mounted: Vec<(DeviceCandidate, Option<PathBuf>)>,
+    disks: Vec<AppleDisk>,
+    user: &str,
+) -> Vec<(DeviceCandidate, Option<PathBuf>)> {
+    let mut out: Vec<(DeviceCandidate, Option<PathBuf>)> = Vec::new();
+    let mut mounted_devs: Vec<Option<&Path>> = Vec::new();
+    for (candidate, dev) in &mounted {
+        mounted_devs.push(dev.as_deref());
+        out.push((candidate.clone(), dev.clone()));
+    }
+    for disk in disks {
+        if mounted_devs
+            .iter()
+            .any(|dev| *dev == Some(disk.partition.as_path()))
+        {
+            continue;
+        }
+        out.push((
+            DeviceCandidate {
+                mount: default_mount_path(&disk.label, user),
+                label: disk.label,
+                kind: CandidateKind::Unmounted,
+            },
+            Some(disk.partition),
+        ));
+    }
+    out.sort_by(|a, b| a.0.mount.cmp(&b.0.mount));
+    out
+}
+
+/// Full discovery, the «Обновить» button body: mounted iPod volumes plus
+/// unmounted Apple disks from sysfs. Returns each candidate with its
+/// resolved block device (resolved for mounted volumes, known from sysfs
+/// for unmounted disks).
+pub fn discover_devices() -> Vec<(DeviceCandidate, Option<PathBuf>)> {
+    let mounted = scan_candidates()
+        .into_iter()
+        .map(|candidate| {
+            let dev = resolve_block_device(&candidate.mount);
+            (candidate, dev)
+        })
+        .collect::<Vec<_>>();
+    let disks = scan_apple_disks(Path::new("/sys/block"));
+    let user = std::env::var("USER").unwrap_or_else(|_| "user".to_owned());
+    merge_candidates(mounted, disks, &user)
 }
 
 /// Resolves the block device backing a mount point via sysfs: stat the
@@ -170,6 +309,18 @@ pub fn build_mount_command(spec: &MountSpec) -> CommandSpec {
             spec.mount_path.display().to_string(),
         ],
     }
+}
+
+/// Connect sequence for a possibly-missing mount point: `mkdir -p`
+/// first (`/run/media/<user>` is root-owned, so an unmounted iPod has
+/// no directory yet), then the rw-mount. `mkdir -p` on an existing
+/// directory is a no-op, so the same sequence serves the already-mounted
+/// flow too — one code path in the connect worker.
+pub fn build_mount_sequence(spec: &MountSpec) -> Vec<CommandSpec> {
+    vec![
+        CommandSpec::new("mkdir", &["-p", &spec.mount_path.display().to_string()]),
+        build_mount_command(spec),
+    ]
 }
 
 /// Safe-eject sequence from the runbook: flush buffers, unmount the
@@ -375,13 +526,115 @@ mod tests {
                 DeviceCandidate {
                     mount: root.path().join("user1/uuid-abc"),
                     label: "uuid-abc".to_owned(),
+                    kind: CandidateKind::Mounted,
                 },
                 DeviceCandidate {
                     mount: root.path().join("user2/uuid-def"),
                     label: "uuid-def".to_owned(),
+                    kind: CandidateKind::Mounted,
                 },
             ]
         );
+    }
+
+    /// Fake sysfs disk: `sys/block/<name>` with `device/{vendor,model}`
+    /// and partition children carrying the `partition` marker + `size`.
+    fn fake_apple_disk(root: &Path, name: &str, partitions: &[(&str, u64)]) {
+        let disk = root.join(name);
+        touch_dir(&disk.join("device"));
+        std::fs::write(disk.join("device/vendor"), b"Apple\n").unwrap();
+        std::fs::write(disk.join("device/model"), b"iPod\n").unwrap();
+        for (part, size) in partitions {
+            let dir = disk.join(part);
+            touch_dir(&dir);
+            std::fs::write(dir.join("partition"), b"2\n").unwrap();
+            std::fs::write(dir.join("size"), size.to_string()).unwrap();
+        }
+    }
+
+    #[test]
+    fn apple_disk_scan_picks_the_largest_partition() {
+        let sys = TempDir::new().unwrap();
+        fake_apple_disk(
+            sys.path(),
+            "sda",
+            &[("sda1", 488), ("sda2", 30_800_368)],
+        );
+        let disks = scan_apple_disks(sys.path());
+        assert_eq!(
+            disks,
+            vec![AppleDisk {
+                partition: PathBuf::from("/dev/sda2"),
+                label: "Apple iPod".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn apple_disk_scan_ignores_other_vendors_and_partitionless_disks() {
+        let sys = TempDir::new().unwrap();
+        let ata = sys.path().join("nvme0n1");
+        touch_dir(&ata.join("device"));
+        std::fs::write(ata.join("device/vendor"), b"ATA\n").unwrap();
+        touch_dir(&sys.path().join("sdb/device")); // Apple, no partitions yet
+        std::fs::write(sys.path().join("sdb/device/vendor"), b"Apple\n").unwrap();
+        assert!(scan_apple_disks(sys.path()).is_empty());
+    }
+
+    #[test]
+    fn merge_drops_disk_when_its_partition_is_already_mounted() {
+        let mounted = vec![(
+            DeviceCandidate {
+                mount: PathBuf::from("/run/media/user/uuid"),
+                label: "uuid".to_owned(),
+                kind: CandidateKind::Mounted,
+            },
+            Some(PathBuf::from("/dev/sda2")),
+        )];
+        let disks = vec![AppleDisk {
+            partition: PathBuf::from("/dev/sda2"),
+            label: "Apple iPod".to_owned(),
+        }];
+        let merged = merge_candidates(mounted, disks, "user");
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].0.kind, CandidateKind::Mounted);
+    }
+
+    #[test]
+    fn merge_adds_unmounted_disk_with_planned_mount_path() {
+        let disks = vec![AppleDisk {
+            partition: PathBuf::from("/dev/sda2"),
+            label: "Apple iPod".to_owned(),
+        }];
+        let merged = merge_candidates(Vec::new(), disks, "user");
+        assert_eq!(merged.len(), 1);
+        let (candidate, dev) = &merged[0];
+        assert_eq!(candidate.kind, CandidateKind::Unmounted);
+        assert_eq!(candidate.mount, PathBuf::from("/run/media/user/Apple iPod"));
+        assert_eq!(candidate.label, "Apple iPod");
+        // The partition comes straight from sysfs — no mount stat needed.
+        assert_eq!(dev.as_deref(), Some(Path::new("/dev/sda2")));
+    }
+
+    #[test]
+    fn mount_sequence_is_mkdir_then_mount() {
+        let spec = MountSpec {
+            block_dev: PathBuf::from("/dev/sda2"),
+            mount_path: PathBuf::from("/run/media/user/Apple iPod"),
+            uid: 1000,
+            gid: 1000,
+        };
+        let steps = build_mount_sequence(&spec);
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].program, "mkdir");
+        assert_eq!(
+            steps[0].args,
+            vec![
+                "-p".to_owned(),
+                "/run/media/user/Apple iPod".to_owned(),
+            ]
+        );
+        assert_eq!(steps[1], build_mount_command(&spec));
     }
 
     #[test]

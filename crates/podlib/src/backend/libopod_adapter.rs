@@ -13,6 +13,7 @@ use libopod::{
     Device, EditSession, InstallMode, MediaDeletionPolicy, MediaKind, PersistentId, StagedSqliteEdit,
     TrackToAdd,
 };
+use rusqlite::{types::Value, OpenFlags};
 
 use crate::backend::{BackendError, LibraryBackend};
 use crate::domain::{
@@ -23,16 +24,27 @@ use crate::domain::{
 /// so additions declare the canonical 44.1 kHz.
 const DEFAULT_SAMPLE_RATE: u32 = 44_100;
 
+/// Library database inside the mounted volume — the exact path vendored
+/// libopod resolves in `device/mod.rs` (constants are not public there).
+/// Used only by the media-kind enrichment query (see `hidden_items`).
+const SQLITE_LIBRARY_PATH: &str = "iPod_Control/iTunes/iTunes Library.itlp/Library.itdb";
+
 /// Adapter around an opened libopod device.
 pub struct LibopodBackend {
     device: Device,
+    /// Mount point, kept so the media-kind enrichment query can reach
+    /// the same `Library.itdb` libopod opened.
+    mount: PathBuf,
 }
 
 impl LibopodBackend {
     /// Opens the iPod mounted at `mount` (validates identity and library).
     pub fn open(mount: impl AsRef<Path>) -> Result<Self, BackendError> {
-        let device = Device::open(mount)?;
-        Ok(Self { device })
+        let device = Device::open(mount.as_ref())?;
+        Ok(Self {
+            device,
+            mount: mount.as_ref().to_path_buf(),
+        })
     }
 
     fn library(&self) -> Result<&libopod::Library, BackendError> {
@@ -101,10 +113,55 @@ impl LibopodBackend {
 
     fn require_track_ids(&self, ids: &[TrackId]) -> Result<(), BackendError> {
         let known = self.track_id_set()?;
+        let hidden = self.hidden_track_ids()?;
         for id in ids {
-            if !known.contains(&id.to_bits()) {
+            let bits = id.to_bits();
+            if !known.contains(&bits) && !hidden.contains(&bits) {
                 return Err(BackendError::TrackNotFound(*id));
             }
+        }
+        Ok(())
+    }
+
+    /// Pids of items vendored libopod does not read: its item query only
+    /// covers `is_song = 1 OR media_kind IN (1, 4) OR is_podcast = 1`,
+    /// which drops audiobooks (media_kind 8) and other device kinds from
+    /// the GUI entirely. This read-only companion query fetches exactly
+    /// that complement, with the raw media-kind bits the view filters
+    /// need. Size stays 0 (it lives in Locations.itdb and is display-only
+    /// metadata); mutations on these records are refused before any
+    /// libopod call (see `reject_hidden_mutation`), so the missing
+    /// location never matters. An unreadable database yields an empty
+    /// list — the library still works without the enrichment.
+    fn hidden_items(&self) -> Vec<Track> {
+        let path = self.mount.join(SQLITE_LIBRARY_PATH);
+        let connection = match rusqlite::Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            Ok(connection) => connection,
+            Err(_) => return Vec::new(),
+        };
+        hidden_items_from(&connection)
+    }
+
+    fn hidden_track_ids(&self) -> Result<HashSet<u64>, BackendError> {
+        Ok(self.hidden_items().iter().map(|t| t.id.to_bits()).collect())
+    }
+
+    /// Honest refusal for records libopod does not model (audiobooks,
+    /// video): `session.remove_track` would answer a generic
+    /// TrackNotFound and the UI would hint at a stale list. One precise
+    /// message instead, checked before any libopod call.
+    fn reject_hidden_mutation(&self, id: TrackId) -> Result<(), BackendError> {
+        if !self.track_id_set()?.contains(&id.to_bits())
+            && self.hidden_track_ids()?.contains(&id.to_bits())
+        {
+            return Err(BackendError::Failure(
+                "Записи этого типа (аудиокниги, видео) нельзя удалять и изменять: \
+                 libopod не редактирует их"
+                    .to_owned(),
+            ));
         }
         Ok(())
     }
@@ -127,7 +184,29 @@ fn map_track(track: &libopod::Track) -> Track {
         disc_number: track.disc_number,
         size_bytes: track.size,
         has_artwork: track.has_artwork,
+        media_kind: media_kind_bits(track.media_kind),
     }
+}
+
+/// libopod `MediaKind` as raw iTunesDB bits. libopod's enum knows only
+/// songs and podcasts; other kinds (audiobooks, video) never appear in
+/// its track list — those come from the enrichment query instead.
+fn media_kind_bits(kind: MediaKind) -> u32 {
+    match kind {
+        MediaKind::Song => 1,
+        MediaKind::Podcast => 4,
+    }
+}
+
+/// Master predicate for Nano 7G libraries: exactly the hidden container
+/// WITHOUT a distinguished kind. `is_hidden` alone is wrong — the 7G
+/// database marks all built-in firmware views («Музыка», «Аудиокниги»,
+/// …) as hidden too, and treating them as masters made every one of
+/// them show «Все треки» and hijack the master view in the GUI.
+/// Classic iTunesDB has no distinguished kind, so `distinguished_kind`
+/// is 0 there and the predicate degenerates to the old `is_hidden`.
+fn is_master_playlist(is_hidden: bool, distinguished_kind: i64) -> bool {
+    is_hidden && distinguished_kind == 0
 }
 
 fn map_playlist(playlist: &libopod::Playlist) -> Playlist {
@@ -139,8 +218,89 @@ fn map_playlist(playlist: &libopod::Playlist) -> Playlist {
             .iter()
             .map(|pid| TrackId::from_bits(pid.to_bits()))
             .collect(),
-        is_master: playlist.is_hidden, // libopod encodes "master" as hidden on classic devices
+        is_master: is_master_playlist(playlist.is_hidden, playlist.distinguished_kind),
         is_smart: playlist.is_smart,
+        distinguished_kind: playlist.distinguished_kind,
+    }
+}
+
+/// Same query as [`LibopodBackend::hidden_items`], split from the
+/// device-bound method so tests can drive an in-memory connection
+/// with the same untyped schema.
+fn hidden_items_from(connection: &rusqlite::Connection) -> Vec<Track> {
+    let mut statement = match connection.prepare(
+        "SELECT pid, COALESCE(title, ''), COALESCE(album, ''), \
+         COALESCE(artist, ''), COALESCE(album_artist, ''), \
+         COALESCE(total_time_ms, 0), COALESCE(track_number, 0), \
+         COALESCE(disc_number, 0), COALESCE(artwork_status, 0), \
+         COALESCE(artwork_cache_id, 0), COALESCE(media_kind, 0) \
+         FROM item WHERE NOT (is_song = 1 OR media_kind IN (1, 4) OR is_podcast = 1) \
+         ORDER BY pid",
+    ) {
+        Ok(statement) => statement,
+        // No readable database: the library still works without the
+        // enrichment (same robustness contract as hidden_items).
+        Err(_) => return Vec::new(),
+    };
+    let rows = statement.query_map([], |row| Ok(hidden_item_track(row)));
+    match rows {
+        // The row mapping is total (Values normalize anything), so an
+        // error here is statement stepping I/O only → empty enrichment.
+        Ok(rows) => rows.collect::<Result<Vec<_>, _>>().unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Maps one enrichment-query row onto a domain Track. The schema is
+/// untyped (PRAGMA table_info reports no column types), so EVERY
+/// numeric cell is read as a `Value` and normalized — a strict
+/// `get::<i64>` answered «Invalid column type Real» on the live
+/// database (`total_time_ms` is REAL there) and `flatten()` silently
+/// emptied the whole enrichment (the «Аудиокниги = 0» bug).
+fn hidden_item_track(row: &rusqlite::Row<'_>) -> Track {
+    let cell = |index: usize| row.get::<_, Value>(index).unwrap_or(Value::Null);
+    let pid = value_i64(cell(0));
+    Track {
+        id: TrackId::from_bits(u64::from_ne_bytes(pid.to_ne_bytes())),
+        title: value_text(cell(1)),
+        album: optional(&value_text(cell(2))),
+        artist: optional(&value_text(cell(3))),
+        album_artist: optional(&value_text(cell(4))),
+        duration_ms: value_u32(cell(5)),
+        track_number: value_u32(cell(6)),
+        disc_number: value_u32(cell(7)),
+        size_bytes: 0,
+        has_artwork: value_i64(cell(8)) != 0 || value_i64(cell(9)) != 0,
+        media_kind: value_u32(cell(10)),
+    }
+}
+
+/// Normalizes one untyped-schema cell to i64: Integer as-is, Real
+/// rounded, Text parsed (0 on garbage), Null/Blob → 0. Negative values
+/// are preserved: a negative pid is legal (its bit pattern is the id).
+fn value_i64(value: Value) -> i64 {
+    match value {
+        Value::Integer(n) => n,
+        Value::Real(f) => f.round() as i64,
+        Value::Text(text) => text.trim().parse().unwrap_or(0),
+        Value::Null | Value::Blob(_) => 0,
+    }
+}
+
+/// Same normalization clamped to ≥0 and u32: counters (duration,
+/// track/disc numbers, artwork flags, media kind).
+fn value_u32(value: Value) -> u32 {
+    value_i64(value).clamp(0, i64::from(u32::MAX)) as u32
+}
+
+/// Normalizes one untyped-schema cell to text: Text as-is, numbers via
+/// Display, Null/Blob → empty.
+fn value_text(value: Value) -> String {
+    match value {
+        Value::Text(text) => text,
+        Value::Integer(n) => n.to_string(),
+        Value::Real(f) => f.to_string(),
+        Value::Null | Value::Blob(_) => String::new(),
     }
 }
 
@@ -222,7 +382,12 @@ fn find_new_playlist_id(
 
 impl LibraryBackend for LibopodBackend {
     fn tracks(&self) -> Result<Vec<Track>, BackendError> {
-        Ok(self.library()?.tracks().iter().map(map_track).collect())
+        let mut tracks: Vec<Track> = self.library()?.tracks().iter().map(map_track).collect();
+        // Audiobooks and other non-song kinds: invisible to libopod, but
+        // real device library members (the master playlist references
+        // them). Appended so the views and the master stay complete.
+        tracks.extend(self.hidden_items());
+        Ok(tracks)
     }
 
     fn playlists(&self) -> Result<Vec<Playlist>, BackendError> {
@@ -242,6 +407,7 @@ impl LibraryBackend for LibopodBackend {
     }
 
     fn remove_track(&mut self, id: TrackId, purge_media: bool) -> Result<bool, BackendError> {
+        self.reject_hidden_mutation(id)?;
         let known = self.track_id_set()?;
         if !known.contains(&id.to_bits()) {
             return Ok(false);
@@ -264,6 +430,7 @@ impl LibraryBackend for LibopodBackend {
     /// change sets are a no-op returning the current track unchanged.
     fn edit_track(&mut self, id: TrackId, changes: &TrackChanges) -> Result<Track, BackendError> {
         changes.validate()?;
+        self.reject_hidden_mutation(id)?;
         let known = self.track_id_set()?;
         let current = self
             .tracks()?
@@ -413,6 +580,7 @@ mod tests {
             disc_number: 1,
             size_bytes: 10,
             has_artwork: false,
+            media_kind: 1,
         }
     }
 
@@ -420,6 +588,103 @@ mod tests {
     fn optional_blank_strings_become_none() {
         assert_eq!(optional("  "), None);
         assert_eq!(optional("X"), Some("X".to_owned()));
+    }
+
+    // ---- master predicate (round 4.1 Ф1) ----
+
+    #[test]
+    fn only_hidden_kindless_containers_are_masters() {
+        // Live 7G database: the master «iPod» and the built-in views are
+        // all hidden; only the master has distinguished_kind 0.
+        assert!(is_master_playlist(true, 0), "master «iPod»");
+        assert!(!is_master_playlist(true, 4), "«Музыка» view");
+        assert!(!is_master_playlist(true, 5), "«Аудиокниги» view");
+        assert!(!is_master_playlist(true, 1), "«Видео» view");
+        assert!(!is_master_playlist(false, 0), "user playlist");
+        // Classic iTunesDB: podcast playlists are hidden with kind 11.
+        assert!(!is_master_playlist(true, 11), "classic podcast");
+    }
+
+    #[test]
+    fn media_kind_maps_to_itunesdb_bits() {
+        assert_eq!(media_kind_bits(MediaKind::Song), 1);
+        assert_eq!(media_kind_bits(MediaKind::Podcast), 4);
+    }
+
+    // ---- enrichment mapping over the untyped schema (round 4.2) ----
+
+    /// Reproduction of the «Аудиокниги = 0» bug: the live Library.itdb
+    /// has an untyped schema and stores `total_time_ms` as REAL; a
+    /// strict `get::<i64>` failed per-row and `flatten()` silently
+    /// dropped every row. The mapping must normalize every storage
+    /// class on every numeric column.
+    #[test]
+    fn hidden_items_read_untyped_columns_with_real_numbers() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE item (pid, title, album, artist, album_artist, \
+                 total_time_ms, track_number, disc_number, artwork_status, \
+                 artwork_cache_id, media_kind, is_song, is_podcast);
+                 INSERT INTO item VALUES (-42, 'Часть 3', 'Сказки', 'Народ', '', \
+                   123.5, 1.0, 2.9, 1, 0, 8, 0, 0);
+                 INSERT INTO item VALUES (7, 'Фильм', 'Кино', 'Режиссёр', '', \
+                   6000, 2, 1, 0, 5, 2, 0, 0);
+                 INSERT INTO item VALUES (8, 'Песня', '', '', '', 100, 1, 1, 0, 0, 1, 1, 0);",
+            )
+            .unwrap();
+        let tracks = hidden_items_from(&connection);
+        assert_eq!(tracks.len(), 2, "songs must stay outside the enrichment");
+
+        let audiobook = &tracks[0];
+        assert_eq!(audiobook.title, "Часть 3");
+        assert_eq!(audiobook.duration_ms, 124, "REAL total_time_ms rounds");
+        assert_eq!(audiobook.track_number, 1, "REAL 1.0");
+        assert_eq!(audiobook.disc_number, 3, "REAL 2.9 rounds up");
+        assert_eq!(audiobook.media_kind, 8);
+        assert!(audiobook.has_artwork);
+        // A negative pid is legal: the bits survive the i64 → u64 id.
+        assert_eq!(
+            audiobook.id.to_bits(),
+            u64::from_ne_bytes((-42i64).to_ne_bytes())
+        );
+
+        let movie = &tracks[1];
+        assert_eq!(movie.media_kind, 2);
+        assert_eq!(movie.duration_ms, 6000, "plain INTEGER cell");
+        assert_eq!(movie.size_bytes, 0, "size lives in Locations.itdb");
+    }
+
+    #[test]
+    fn value_i64_normalizes_every_storage_class() {
+        use rusqlite::types::Value;
+        assert_eq!(value_i64(Value::Integer(7)), 7);
+        assert_eq!(value_i64(Value::Integer(-42)), -42);
+        assert_eq!(value_i64(Value::Real(123.5)), 124, "REAL rounds");
+        assert_eq!(value_i64(Value::Real(-3.2)), -3);
+        assert_eq!(value_i64(Value::Text("42".to_owned())), 42);
+        assert_eq!(value_i64(Value::Text(" garbage ".to_owned())), 0);
+        assert_eq!(value_i64(Value::Null), 0);
+        assert_eq!(value_i64(Value::Blob(vec![1, 2])), 0);
+    }
+
+    #[test]
+    fn value_u32_clamps_negatives_and_overflows() {
+        use rusqlite::types::Value;
+        assert_eq!(value_u32(Value::Integer(8)), 8);
+        assert_eq!(value_u32(Value::Integer(-5)), 0, "counters never go below 0");
+        assert_eq!(value_u32(Value::Real(9.9)), 10);
+        assert_eq!(value_u32(Value::Integer(i64::MAX)), u32::MAX);
+    }
+
+    #[test]
+    fn value_text_normalizes_numbers_and_nulls() {
+        use rusqlite::types::Value;
+        assert_eq!(value_text(Value::Text("Часть 3".to_owned())), "Часть 3");
+        assert_eq!(value_text(Value::Integer(42)), "42");
+        assert_eq!(value_text(Value::Real(1.5)), "1.5");
+        assert_eq!(value_text(Value::Null), "");
+        assert_eq!(value_text(Value::Blob(vec![9])), "");
     }
 
     #[test]

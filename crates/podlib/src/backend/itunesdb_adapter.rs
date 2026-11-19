@@ -498,6 +498,7 @@ mod tests {
             disc_number: 1,
             size_bytes: 10,
             has_artwork: false,
+            media_kind: 0,
         }
     }
 

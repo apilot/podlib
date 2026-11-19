@@ -80,6 +80,8 @@ fn domain_track(mhit: &Mhit) -> Track {
         disc_number: mhit.disc_number,
         size_bytes: u64::from(mhit.size_bytes),
         has_artwork: false,
+        // Classic iTunesDB does not expose media kind here (0 = unknown).
+        media_kind: 0,
     }
 }
 
@@ -111,6 +113,8 @@ fn domain_playlist(mhyp: &Mhyp) -> Playlist {
             .collect(),
         is_master: mhyp.is_master,
         is_smart: mhyp.is_smart,
+        // Classic iTunesDB has no device views: kind stays 0.
+        distinguished_kind: 0,
     }
 }
 

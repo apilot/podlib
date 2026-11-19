@@ -71,6 +71,10 @@ pub struct Track {
     pub disc_number: u32,
     pub size_bytes: u64,
     pub has_artwork: bool,
+    /// Raw iTunesDB media-kind bits: 1 = music, 2 = movie, 4 = podcast,
+    /// 8 = audiobook, 16 = TV show, 32 = music video. 0 = unknown (the
+    /// classic iTunesDB path does not expose it).
+    pub media_kind: u32,
 }
 
 /// Metadata for a track about to be added to the library.
@@ -152,6 +156,10 @@ pub struct Playlist {
     /// True for the built-in library playlist (cannot be deleted or edited).
     pub is_master: bool,
     pub is_smart: bool,
+    /// Nano 7G device view kind (libopod `distinguished_kind`): 0 = a
+    /// regular or master playlist, 1..=7 = built-in firmware views
+    /// («Видео», «Фильмы», «Аудиокниги», …). Always 0 on classic devices.
+    pub distinguished_kind: i64,
 }
 
 impl Playlist {
@@ -252,6 +260,7 @@ mod tests {
             ],
             is_master: false,
             is_smart: false,
+            distinguished_kind: 0,
         };
         let unique = playlist.unique_track_ids();
         assert_eq!(

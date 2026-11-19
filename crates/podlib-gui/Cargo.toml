@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 eframe = { workspace = true }
+egui_extras = { workspace = true }
 podlib = { path = "../podlib" }
 thiserror = { workspace = true }
 
