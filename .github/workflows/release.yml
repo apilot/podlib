@@ -1,0 +1,57 @@
+# Release: builds podlib (CLI) + podlib-gui and uploads tarballs to GitHub
+# Releases on a v* tag push. The release itself is created automatically by
+# upload-rust-binary-action if it does not exist yet.
+#
+# Asset naming CONTRACT with cargo-binstall (do not rename!): every target
+# produces `podlib-<target>.tar.gz` (+ .sha256) — it must stay byte-identical
+# to the `[package.metadata.binstall]` pkg-url template in both
+# crates/podlib-cli/Cargo.toml and crates/podlib-gui/Cargo.toml
+# (`podlib-{ target }.tar.gz`), or `cargo binstall` stops finding the archive.
+#
+# NOTE: this workflow runs for the first time on the first v* tag — verify the
+# produced assets on that Release page (see docs/tasks packaging checklist).
+name: Release
+
+permissions:
+  contents: read
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  upload-assets:
+    strategy:
+      matrix:
+        include:
+          # x86_64 gnu: native build on the ubuntu runner (default toolchain).
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          # aarch64 musl: static binary — no glibc version constraints, best
+          # portability for a distribution binary.
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write # upload assets to the GitHub Release
+    steps:
+      - uses: actions/checkout@v6
+      # Cross linker for the bundled C code (vendored libopod + bundled
+      # SQLite) when targeting aarch64-musl; x86_64 gnu builds natively
+      # without it.
+      - uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+          runner: none
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+      # Multi-bin is valid here: the root manifest is a virtual workspace.
+      # `archive` must be explicit with >1 bin ($bin default is forbidden).
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: podlib,podlib-gui
+          archive: podlib-${{ matrix.target }} # binstall contract, see header
+          target: ${{ matrix.target }}
+          tar: unix
+          zip: none
+          checksum: sha256

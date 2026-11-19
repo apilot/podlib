@@ -4,10 +4,24 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "podlib"
 path = "src/main.rs"
+
+# cargo-binstall metadata. Both binaries ship in ONE archive per target
+# (podlib-{target}.tar.gz, built by .github/workflows/release.yml on v* tags):
+# one release = both binaries, so podlib-cli and podlib-gui point at the same
+# pkg-url. The .tar.gz suffix is spelled out (not { archive-suffix }) because
+# Tgz extensions = [".tgz", ".tar.gz"] — archive-suffix would try .tgz first,
+# wasting a 404 per install, while the release asset is always .tar.gz.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/podlib-{ target }.tar.gz"
+# Binaries sit at the archive root (taiki-e upload-rust-binary-action,
+# leading-dir off).
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
 
 [dependencies]
 podlib = { path = "../podlib" }

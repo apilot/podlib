@@ -18,6 +18,19 @@
 
 podlib is built on [libopod](https://github.com/koriwi/libopod) (vendored, see below) — the first library with write support for the Nano 7G database format.
 
+## Installing
+
+Prebuilt binaries (`podlib` + `podlib-gui`, Linux x86_64/aarch64) are published
+by the release workflow on every `v*` tag. Install both with
+[cargo-binstall](https://github.com/cargo-bins/cargo-binstall):
+
+```sh
+cargo binstall podlib-cli podlib-gui
+```
+
+The GUI additionally needs ffmpeg and a desktop GL stack at runtime — see
+[Distro notes](#distro-notes).
+
 ## Building
 
 Requirements:

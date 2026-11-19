@@ -6,6 +6,10 @@ members = ["crates/podlib", "crates/podlib-cli", "crates/podlib-gui"]
 edition = "2021"
 version = "0.1.0"
 license = "MIT"
+# Used by [package.metadata.binstall] `{ repo }` template in podlib-cli and
+# podlib-gui: binstall resolves download URLs from the repository field,
+# so it must be set on every published crate with binstall metadata.
+repository = "https://github.com/apilot/podlib"
 # 1.95 is the MSRV gate: eframe/egui 0.37 requires 1.95 (edition 2024
 # toolchain features), and slice::as_chunks::<N> (1.88) stays covered.
 # Older toolchains must fail at build time with a clear message instead

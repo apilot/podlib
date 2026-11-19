@@ -4,10 +4,20 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "podlib-gui"
 path = "src/main.rs"
+
+# Same cargo-binstall metadata as podlib-cli: both binaries ship in ONE
+# archive per target (podlib-{target}.tar.gz) — one release, both binaries.
+# Must stay in sync with crates/podlib-cli/Cargo.toml and the `archive:` name
+# in .github/workflows/release.yml.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/podlib-{ target }.tar.gz"
+bin-dir = "{ bin }{ binary-ext }" # binaries at the archive root
+pkg-fmt = "tgz"
 
 [dependencies]
 eframe = { workspace = true }
