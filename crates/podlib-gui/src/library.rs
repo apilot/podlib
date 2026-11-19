@@ -548,6 +548,11 @@ pub const AUDIO_EXTENSIONS: [&str; 8] = ["mp3", "m4a", "m4b", "aac", "wav", "fla
 /// The extension that marks an audiobook file.
 const AUDIOBOOK_EXTENSION: &str = "m4b";
 
+/// Raw iTunesDB media-kind bit of audiobooks (round 5.1). Checks use
+/// the semantic bit test (`bits & AUDIOBOOK_BIT != 0`) — an exact
+/// `== 8` breaks for combined bits (round 6 tail nit-6).
+pub(crate) const AUDIOBOOK_BIT: u32 = 8;
+
 /// Lowercased extension of a path, or an empty string when absent.
 pub(crate) fn path_extension(path: &std::path::Path) -> String {
     path.extension()
@@ -565,7 +570,7 @@ pub(crate) fn needs_transcode(extension: &str) -> bool {
 /// Target container extension of a transcode: audiobook bits get the
 /// book container, everything else the music one.
 fn transcode_target_extension(media_kind_bits: u32) -> &'static str {
-    if media_kind_bits == 8 {
+    if media_kind_bits & AUDIOBOOK_BIT != 0 {
         "m4b"
     } else {
         "m4a"
@@ -636,10 +641,13 @@ fn collect_audio_files(directory: &std::path::Path, out: &mut Vec<PathBuf>) {
 /// and non-audio files skipped) and every audio file inside becomes an
 /// audiobook (bits 8 — the owner's rule: directory = book); a
 /// directory with no audio lands in `skipped` by its full name.
+/// Provenance is tracked PER PATH (round 6 tail minor-4): in a mixed
+/// drop the directly dropped files keep their extension-based kind —
+/// only the directory expansion is forced to bits 8.
 pub fn drafts_from_paths(paths: &[PathBuf]) -> (Vec<TrackDraft>, Vec<String>) {
     let mut drafts = Vec::new();
     let mut skipped = Vec::new();
-    let mut expanded: Vec<PathBuf> = Vec::new();
+    let mut expanded: Vec<(PathBuf, bool)> = Vec::new(); // (path, from a dropped directory)
     for path in paths {
         if path.is_dir() {
             let mut collected = Vec::new();
@@ -655,14 +663,13 @@ pub fn drafts_from_paths(paths: &[PathBuf]) -> (Vec<TrackDraft>, Vec<String>) {
                         .unwrap_or_else(|| path.display().to_string()),
                 );
             } else {
-                expanded.extend(collected);
+                expanded.extend(collected.into_iter().map(|path| (path, true)));
             }
         } else {
-            expanded.push(path.clone());
+            expanded.push((path.clone(), false));
         }
     }
-    let directory_drop = paths.iter().any(|path| path.is_dir());
-    for path in &expanded {
+    for (path, from_directory) in &expanded {
         let name = match path.file_name().and_then(|name| name.to_str()) {
             Some(name) => name.to_owned(),
             None => path.display().to_string(),
@@ -681,8 +688,9 @@ pub fn drafts_from_paths(paths: &[PathBuf]) -> (Vec<TrackDraft>, Vec<String>) {
             Ok(draft) if is_audio => {
                 // A file expanded from a dropped directory is always a
                 // part of the dropped book; a single dropped file keeps
-                // its own extension-based kind.
-                let draft = if directory_drop || extension == AUDIOBOOK_EXTENSION {
+                // its own extension-based kind (round 6 tail minor-4:
+                // per-path provenance, not a global directory flag).
+                let draft = if *from_directory || extension == AUDIOBOOK_EXTENSION {
                     draft.with_media_kind_bits(8)
                 } else {
                     draft
@@ -1004,6 +1012,45 @@ mod tests {
         assert!(drafts[1].source_path.ends_with("02.ogg"));
     }
 
+    // ---- round 6 tail minor-4: per-path provenance ----
+
+    /// A MIXED drop (directory + individual files in one gesture) is
+    /// provenance-tracked per path: files expanded from the directory
+    /// are the book (bits 8), the directly dropped files keep their
+    /// own extension-based kind. The old global `directory_drop` flag
+    /// wrongly made everything an audiobook.
+    #[test]
+    fn mixed_drop_keeps_direct_files_by_extension() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("book")).unwrap();
+        write_file(dir.path(), "book/01.mp3");
+        write_file(dir.path(), "book/02.mp3");
+        let single = write_file(dir.path(), "top.mp3");
+        let m4b = write_file(dir.path(), "audio.m4b");
+
+        for order in 0..2 {
+            // Both orders prove the per-path (not first-seen) logic.
+            let paths: Vec<PathBuf> = if order == 0 {
+                vec![dir.path().join("book"), single.clone(), m4b.clone()]
+            } else {
+                vec![single.clone(), m4b.clone(), dir.path().join("book")]
+            };
+            let (drafts, skipped) = drafts_from_paths(&paths);
+            assert!(skipped.is_empty());
+            assert_eq!(drafts.len(), 4, "2 book files + 2 direct files: {order}");
+            for draft in &drafts {
+                let bits = draft.media_kind_bits;
+                if draft.source_path.starts_with(dir.path().join("book")) {
+                    assert_eq!(bits, 8, "directory expansion is a book: {order}");
+                } else if draft.source_path == m4b {
+                    assert_eq!(bits, 8, ".m4b is a book by extension: {order}");
+                } else {
+                    assert_eq!(bits, 1, "direct mp3 stays a song: {order}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn directory_without_audio_lands_in_skipped() {
         let dir = TempDir::new().unwrap();
@@ -1032,6 +1079,8 @@ mod tests {
         assert_eq!(transcode_target_extension(8), "m4b", "audiobook container");
         assert_eq!(transcode_target_extension(1), "m4a", "music container");
         assert_eq!(transcode_target_extension(4), "m4a");
+        // nit-6: the check is the semantic BIT, not an exact == 8.
+        assert_eq!(transcode_target_extension(9), "m4b", "audiobook bit wins");
     }
 
     #[test]

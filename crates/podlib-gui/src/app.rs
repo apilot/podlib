@@ -19,8 +19,8 @@ use podlib::{Playlist, PlaylistId, Track, TrackDraft, TrackId};
 use crate::device::{self, DeviceCandidate, MountError};
 use crate::library::{
     changes_from_track, drafts_from_paths, guard_playlist_mutation, needs_transcode, panic_message,
-    path_extension, plural, EditDialogFields, DraggedTracks, LibraryCommand, LibraryOutcome,
-    LibrarySnapshot, LibraryWorker,
+    path_extension, plural, AUDIOBOOK_BIT, EditDialogFields, DraggedTracks, LibraryCommand,
+    LibraryOutcome, LibrarySnapshot, LibraryWorker,
 };
 
 /// Row height of the track table rows, keeps the column grid aligned.
@@ -31,6 +31,19 @@ const ROW_HEIGHT: f32 = 26.0;
 const ARTIST_COLUMN: f32 = 180.0;
 const ALBUM_COLUMN: f32 = 200.0;
 const DURATION_COLUMN: f32 = 64.0;
+/// Width of the checkbox column (round 6 П2): one narrow first column
+/// carrying the row checkbox; the header holds the tri-state «выбрать
+/// все». Fits the 616px worst-case panel together with the other four
+/// fixed columns (28+120+180+200+64 = 592).
+const CHECK_COLUMN: f32 = 28.0;
+/// Height of one sidebar row (round 6 П1) — the table row height, so
+/// both lists share one rhythm.
+const SIDEBAR_ROW_HEIGHT: f32 = 26.0;
+/// Left/right text inset inside a sidebar row. Identical for every
+/// section (master / «Устройство» / «Плейлисты»): one geometry.
+const SIDEBAR_ROW_INSET: f32 = 8.0;
+/// Gap kept between a (clipped) row name and the right-aligned count.
+const SIDEBAR_NAME_COUNT_GAP: f32 = 8.0;
 
 /// Messages from worker threads to the UI.
 enum DeviceEvent {
@@ -154,6 +167,12 @@ struct TrackRowActions {
     row_click: Option<(usize, bool, bool)>,
     /// «Убрать из плейлиста» in a playlist view: (playlist, member).
     remove_from_playlist: Option<(PlaylistId, TrackId)>,
+    /// Round 6 П2: header checkbox toggled → target state (true =
+    /// select all visible rows).
+    select_all: Option<bool>,
+    /// Round 6 П2: a row checkbox was clicked → explicit toggle of
+    /// that id in the shared selection.
+    checkbox_toggle: Option<TrackId>,
 }
 
 impl TrackRowActions {
@@ -166,6 +185,8 @@ impl TrackRowActions {
         self.remove_from_playlist = other
             .remove_from_playlist
             .or(self.remove_from_playlist.take());
+        self.select_all = other.select_all.or(self.select_all.take());
+        self.checkbox_toggle = other.checkbox_toggle.or(self.checkbox_toggle.take());
     }
 }
 
@@ -221,8 +242,12 @@ struct LibraryUi {
     selected_track: Option<TrackId>,
     /// Multi-selection in the central table, in click order.
     selected_tracks: Vec<TrackId>,
-    /// Anchor row (index into the visible list) for shift-range clicks.
-    selection_anchor: Option<usize>,
+    /// Anchor row (round 6 tail nit-10): (index into the visible list,
+    /// TrackId of the anchored row) for shift-range clicks. The id
+    /// makes the anchor identity-checked: after a re-list that replaced
+    /// the rows, a stale anchor is dropped instead of shift-selecting
+    /// a foreign range.
+    selection_anchor: Option<(usize, TrackId)>,
     /// Remaining rows of a multi-track delete (one in-flight worker
     /// command at a time; the chain continues on each Applied).
     delete_queue: Vec<TrackId>,
@@ -230,6 +255,15 @@ struct LibraryUi {
     /// album. All collapsed by default; stale keys (a book renamed or
     /// gone) simply never render — no fix-up needed.
     expanded_books: HashSet<String>,
+    /// Round 6 П3: expanded groups of the music section's album/artist
+    /// views (books keep their own set — the names are different
+    /// domains). Same stale-key semantics.
+    expanded_groups: HashSet<String>,
+    /// Round 6 П3: display modes of the grouping-capable sections.
+    /// «Музыка» defaults to the flat list; «Аудиокниги» keeps the
+    /// round-5 books view as its default (no behavior change).
+    music_mode: SectionMode,
+    books_mode: SectionMode,
     /// Toolbar search box; empty string = no filter.
     search_query: String,
 }
@@ -443,6 +477,9 @@ impl PodlibApp {
             selection_anchor: None,
             delete_queue: Vec::new(),
             expanded_books: HashSet::new(),
+            expanded_groups: HashSet::new(),
+            music_mode: SectionMode::List,
+            books_mode: SectionMode::Books,
             search_query: String::new(),
         });
     }
@@ -534,6 +571,20 @@ impl PodlibApp {
                 }
                 Ok(LibraryOutcome::Applied { snapshot, summary }) => {
                     if let Some(library) = self.library.as_mut() {
+                        // Review 🟢-5: the applied operation may have
+                        // removed tracks — dead ids must not stay in the
+                        // selection, the toolbar would count rows that
+                        // no longer exist and leak them into later
+                        // actions. The anchor carries the same TrackId
+                        // identity; dropping a stale one here mirrors
+                        // `valid_anchor` (which would degenerate it to
+                        // a plain click later anyway).
+                        library
+                            .selected_tracks
+                            .retain(|id| snapshot.track(*id).is_some());
+                        library.selection_anchor = library
+                            .selection_anchor
+                            .filter(|&(_, id)| snapshot.track(id).is_some());
                         library.snapshot = snapshot;
                     }
                     self.status = summary;
@@ -998,9 +1049,8 @@ impl PodlibApp {
             // library listing, device view → tracks matching its media
             // kinds, user playlist → its members in order (rows that
             // vanished from the library are skipped).
-            let (table_id, total, visible): (egui::Id, usize, Vec<&Track>) = match view {
+            let (total, visible): (usize, Vec<&Track>) = match view {
                 LibraryView::Master => (
-                    egui::Id::unique(("track_table", 0u64)),
                     library.snapshot.tracks.len(),
                     library.snapshot.tracks.iter().collect(),
                 ),
@@ -1012,13 +1062,7 @@ impl PodlibApp {
                         .iter()
                         .filter(|track| kinds.contains(&track.media_kind))
                         .collect();
-                    (
-                        // id per view context: switching sections starts
-                        // a fresh scroll position.
-                        egui::Id::unique(("track_table", u64::try_from(distinguished.max(0)).unwrap_or(0))),
-                        matches.len(),
-                        matches,
-                    )
+                    (matches.len(), matches)
                 }
                 LibraryView::Playlist(id) => {
                     let members: Vec<&Track> = library
@@ -1032,11 +1076,7 @@ impl PodlibApp {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    (
-                        egui::Id::unique(("track_table", id.to_bits())),
-                        members.len(),
-                        members,
-                    )
+                    (members.len(), members)
                 }
             };
             let filtered: Vec<&Track> = visible
@@ -1064,6 +1104,45 @@ impl PodlibApp {
             );
             ui.add_space(4.0);
 
+            // Round 6 П3: the unified view switcher over the
+            // grouping-capable sections («Музыка»: список/альбомы/
+            // исполнители; «Аудиокниги»: список/книги). The mode is
+            // re-read after the switcher — a click applies THIS frame.
+            // Search keeps working over every mode: the filter runs
+            // before grouping (the grouped views receive `filtered`).
+            let switchable = matches!(view, LibraryView::Media { distinguished: 4 | 5 });
+            if switchable {
+                let distinguished = match view {
+                    LibraryView::Media { distinguished } => distinguished,
+                    _ => 0,
+                };
+                let current = if distinguished == 4 {
+                    &mut library.music_mode
+                } else {
+                    &mut library.books_mode
+                };
+                view_switcher(ui, section_modes(distinguished), current);
+                ui.add_space(2.0);
+            }
+            let mode = match view {
+                LibraryView::Media { distinguished: 4 } => library.music_mode,
+                LibraryView::Media { distinguished: 5 } => library.books_mode,
+                _ => SectionMode::List,
+            };
+            // Per-context (and per-mode) scroll id: switching sections
+            // or modes starts a fresh scroll position.
+            let table_id = match view {
+                LibraryView::Master => egui::Id::unique(("track_table", 0u64)),
+                LibraryView::Media { distinguished } => egui::Id::unique((
+                    "track_table",
+                    u64::try_from(distinguished.max(0)).unwrap_or(0),
+                    mode as u64,
+                )),
+                LibraryView::Playlist(id) => {
+                    egui::Id::unique(("track_table", id.to_bits()))
+                }
+            };
+
             if filtered.is_empty() {
                 ui.centered_and_justified(|ui| {
                     ui.label(egui::RichText::new(empty_state_text(
@@ -1073,19 +1152,30 @@ impl PodlibApp {
                         empty_playlist,
                     )).weak());
                 });
-            } else if matches!(view, LibraryView::Media { distinguished: 5 }) {
-                // Round 5: audiobooks group into books — a flat
-                // collapsed-by-default list instead of a flat table.
-                actions.merge(books_view(
+            } else if switchable && mode != SectionMode::List {
+                // Grouped views (round 5 books + round 6 П3) share ONE
+                // component; each mode keeps its own expanded set.
+                let groups = match mode {
+                    SectionMode::Albums => group_by_album(filtered.iter().copied()),
+                    SectionMode::Artists => group_by_artist(filtered.iter().copied()),
+                    _ => group_books(filtered.iter().copied()),
+                };
+                let expanded = if mode == SectionMode::Books {
+                    &mut library.expanded_books
+                } else {
+                    &mut library.expanded_groups
+                };
+                actions.merge(groups_view(
                     ui,
-                    BooksViewParams {
+                    GroupsViewParams {
                         ctx: &ctx,
                         tracks: &filtered,
+                        groups: &groups,
                         selected_tracks: &library.selected_tracks,
                         cursor,
                         menus_allowed,
                         visible_ids: &visible_ids,
-                        expanded: &mut library.expanded_books,
+                        expanded,
                     },
                 ));
             } else {
@@ -1100,26 +1190,23 @@ impl PodlibApp {
                 ));
             }
 
-            // A click on a visible row resolves through apply_row_click
-            // (plain/ctrl/shift) against the current visible list. A
-            // stale anchor (list shrank since the anchored click) is
-            // dropped here: shift degenerates to a plain click.
-            if let Some((index, ctrl, shift)) = actions.row_click.take() {
-                let anchor = library.selection_anchor.filter(|&a| a < visible_ids.len());
-                let selected_idx: Vec<usize> = library
-                    .selected_tracks
-                    .iter()
-                    .filter_map(|id| visible_ids.iter().position(|candidate| candidate == id))
-                    .collect();
-                let (new_indices, anchor) =
-                    apply_row_click(&selected_idx, anchor, index, ctrl, shift);
-                library.selected_tracks = new_indices
-                    .iter()
-                    .filter_map(|&index| visible_ids.get(index).copied())
-                    .collect();
-                library.selection_anchor = anchor;
-                library.selected_track = library.selected_tracks.last().copied();
-            }
+            // Row-click / «выбрать все» / checkbox resolution lives in
+            // the pure [`resolve_selection_actions`] (review 🟡-3);
+            // `cursor` is the value read before rendering and nothing
+            // below has touched the field yet, so passing it back is a
+            // no-op when no branch moves the cursor.
+            let update = resolve_selection_actions(
+                &library.selected_tracks,
+                library.selection_anchor,
+                cursor,
+                &visible_ids,
+                actions.row_click.take(),
+                actions.select_all.take(),
+                actions.checkbox_toggle.take(),
+            );
+            library.selected_tracks = update.selected_tracks;
+            library.selection_anchor = update.selection_anchor;
+            library.selected_track = update.selected_track;
 
             // Toolbar actions over the multi-selection.
             let selected = library.selected_tracks.clone();
@@ -1768,11 +1855,14 @@ impl PodlibApp {
         if review.book_title.trim().is_empty() {
             return; // near-field error is rendered by the modal
         }
+        // Kind-aware validation text (round 6 tail nit-8).
+        let texts = tag_review_texts(review.kind_bits);
         match apply_tag_review(
             &review.drafts,
             &review.book_title,
             &review.author,
             &review.rows,
+            texts.empty_title,
         ) {
             Ok(drafts) => {
                 let transcodes = drafts
@@ -1815,38 +1905,30 @@ impl PodlibApp {
             let Some(review) = self.tag_review.as_mut() else {
                 return;
             };
-            let title = if review.kind_bits == 8 {
-                format!(
-                    "Добавление книги: проверьте теги ({} файлов)",
-                    review.rows.len()
-                )
-            } else {
-                format!(
-                    "Добавление музыки: проверьте теги ({} файлов)",
-                    review.rows.len()
-                )
-            };
+            // Kind-aware texts (round 6 tail nit-8): audiobooks speak
+            // «книга/автор», music «альбом/исполнитель».
+            let texts = tag_review_texts(review.kind_bits);
+            let title = format!(
+                "Добавление {}: проверьте теги ({} файлов)",
+                texts.subject,
+                review.rows.len()
+            );
             ui.set_width(560.0);
             ui.heading(title);
             ui.add_space(4.0);
             ui.label("Общее для всех файлов");
-            let kind_field = if review.kind_bits == 8 {
-                "Название книги*"
-            } else {
-                "Альбом"
-            };
             ui.horizontal(|ui| {
-                ui.label(kind_field);
+                ui.label(texts.title_field);
                 ui.add(
                     egui::TextEdit::singleline(&mut review.book_title)
                         .desired_width(320.0),
                 );
             });
             if review.validation_attempted && review.book_title.trim().is_empty() {
-                ui.colored_label(egui::Color32::LIGHT_RED, "Укажите название книги");
+                ui.colored_label(egui::Color32::LIGHT_RED, texts.empty_title);
             }
             ui.horizontal(|ui| {
-                ui.label("Автор");
+                ui.label(texts.author_field);
                 ui.add(
                     egui::TextEdit::singleline(&mut review.author).desired_width(320.0),
                 );
@@ -1860,13 +1942,10 @@ impl PodlibApp {
                     )
                     .changed()
                 {
-                    for (row, draft) in review.rows.iter_mut().zip(&review.drafts) {
-                        row.title = if review.strip_prefix {
-                            strip_prefix_in(&draft.title, &prefix)
-                        } else {
-                            draft.title.clone()
-                        };
-                    }
+                    // nit-9: only rows still showing the previous
+                    // automatic value are re-derived — manual edits in
+                    // the title column survive the toggle.
+                    retoggle_prefix_titles(&mut review.rows, &prefix, review.strip_prefix);
                 }
             }
             ui.label("Файлы — проверьте названия (Tab — переход между полями):");
@@ -1937,12 +2016,7 @@ impl PodlibApp {
                     cancelled = true;
                     ui.close();
                 }
-                let add_label = if review.kind_bits == 8 {
-                    "Добавить книгу"
-                } else {
-                    "Добавить музыку"
-                };
-                if ui.button(add_label).clicked() {
+                if ui.button(texts.add_button).clicked() {
                     review.validation_attempted = true;
                     if !review.book_title.trim().is_empty() {
                         committed = true;
@@ -2156,6 +2230,66 @@ enum LibraryView {
     Playlist(PlaylistId),
 }
 
+// ---- round 6 П3: section view modes ----
+
+/// Display mode of a section's central panel. The switcher itself is
+/// ONE component reused by every grouping-capable section; playlists
+/// and the master stay flat lists (and never render it).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SectionMode {
+    /// Flat track table (with the checkbox column).
+    #[default]
+    List,
+    /// Grouped by album («Музыка»).
+    Albums,
+    /// Grouped by artist («Музыка»).
+    Artists,
+    /// Grouped by book = album («Аудиокниги», round 5 default).
+    Books,
+}
+
+impl SectionMode {
+    /// Switcher label.
+    fn label(self) -> &'static str {
+        match self {
+            Self::List => "Список",
+            Self::Albums => "Альбомы",
+            Self::Artists => "Исполнители",
+            Self::Books => "Книги",
+        }
+    }
+}
+
+/// Switcher modes of a built-in device view, in display order:
+/// «Музыка» offers список/альбомы/исполнители, «Аудиокниги»
+/// список/книги, the rest just the flat list (the switcher is not
+/// rendered for them).
+fn section_modes(distinguished_kind: i64) -> &'static [SectionMode] {
+    match distinguished_kind {
+        4 => &[SectionMode::List, SectionMode::Albums, SectionMode::Artists],
+        5 => &[SectionMode::List, SectionMode::Books],
+        _ => &[SectionMode::List],
+    }
+}
+
+/// The unified view switcher (round 6 П3): a segmented row of labels
+/// directly over the table/content. Returns true when the active mode
+/// changed. Theme-driven `selectable_label` — no custom colors, the
+/// system theme decides (owner requirement, round 4).
+fn view_switcher(ui: &mut egui::Ui, modes: &[SectionMode], current: &mut SectionMode) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        for mode in modes {
+            let active = *mode == *current;
+            if ui.selectable_label(active, mode.label()).clicked() && !active {
+                *current = *mode;
+                changed = true;
+            }
+        }
+    });
+    changed
+}
+
 /// Raw iTunesDB media-kind bits covered by a built-in device view.
 /// Kinds follow the firmware: 1 = music, 2 = movie, 4 = podcast,
 /// 8 = audiobook, 16 = TV show, 32 = music video. The rentals view
@@ -2209,6 +2343,151 @@ fn apply_row_click(
     (vec![clicked], Some(clicked))
 }
 
+// ---- round 6 П2: checkbox multi-select (pure helpers, tested) ----
+
+/// Tri-state of the «выбрать все» header checkbox against the visible
+/// rows: every visible id selected → checked, none → unchecked,
+/// anything between (including a partial-visibility edge) → dash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectAllState {
+    All,
+    Some,
+    None,
+}
+
+fn select_all_state(selected: &[TrackId], visible: &[TrackId]) -> SelectAllState {
+    let hits = visible.iter().filter(|id| selected.contains(id)).count();
+    match (hits == 0, hits == visible.len()) {
+        (true, _) => SelectAllState::None,
+        (_, true) => SelectAllState::All,
+        (false, false) => SelectAllState::Some,
+    }
+}
+
+/// Header-checkbox toggle: checking adds every visible id (the click
+/// order of already-selected rows is preserved, new ones append in
+/// visible order); unchecking removes exactly the visible ids, so a
+/// selection made elsewhere (another view, out-of-filter rows)
+/// survives. The result feeds the same `selected_tracks` — the single
+/// selection mechanism (no parallel state).
+fn apply_select_all(selected: &[TrackId], visible: &[TrackId], check: bool) -> Vec<TrackId> {
+    if check {
+        let mut result = selected.to_vec();
+        for id in visible {
+            if !result.contains(id) {
+                result.push(*id);
+            }
+        }
+        result
+    } else {
+        selected
+            .iter()
+            .copied()
+            .filter(|id| !visible.contains(id))
+            .collect()
+    }
+}
+
+/// One checkbox click = an explicit toggle of that row in the shared
+/// selection. Unlike a row click it never resets the rest, never moves
+/// the shift anchor — and keeps the click order stable.
+fn toggle_selected(selected: &[TrackId], id: TrackId) -> Vec<TrackId> {
+    let mut result = selected.to_vec();
+    match result.iter().position(|candidate| candidate == &id) {
+        Some(position) => {
+            result.remove(position);
+        }
+        None => result.push(id),
+    }
+    result
+}
+
+/// The stored shift-anchor is valid only if the row identity still
+/// matches the visible list (round 6 tail nit-10): a boundary check
+/// alone let a re-listed view shift-select a foreign range. Returns
+/// the anchor index for `apply_row_click`, or None (shift then
+/// degenerates to a plain click).
+fn valid_anchor(anchor: Option<(usize, TrackId)>, visible: &[TrackId]) -> Option<usize> {
+    anchor
+        .filter(|&(index, id)| visible.get(index) == Some(&id))
+        .map(|(index, _)| index)
+}
+
+/// The selection state after resolving one frame's row interactions.
+struct SelectionUpdate {
+    selected_tracks: Vec<TrackId>,
+    selection_anchor: Option<(usize, TrackId)>,
+    selected_track: Option<TrackId>,
+}
+
+/// Pure selection resolution (review 🟡-3: functions < 50 lines —
+/// extracted from `library_view`): row clicks (plain/ctrl/shift),
+/// «выбрать все» and a row-checkbox toggle, applied in that order to
+/// the SAME `selected_tracks` — one selection mechanism. Checkbox
+/// changes land here too, so the toolbar and the row clicks read the
+/// same state. The cursor moves only where the mechanics demand it: a
+/// row click targets the clicked row, a checkbox check targets the
+/// toggled row; «выбрать все» rewrites the row set and deliberately
+/// leaves the cursor put (review 🟡-1), so Enter/«Изменить…» keep the
+/// row they had before the bulk edit.
+fn resolve_selection_actions(
+    selected_tracks: &[TrackId],
+    selection_anchor: Option<(usize, TrackId)>,
+    cursor: Option<TrackId>,
+    visible_ids: &[TrackId],
+    row_click: Option<(usize, bool, bool)>,
+    select_all: Option<bool>,
+    checkbox_toggle: Option<TrackId>,
+) -> SelectionUpdate {
+    let mut selection = SelectionUpdate {
+        selected_tracks: selected_tracks.to_vec(),
+        selection_anchor,
+        selected_track: cursor,
+    };
+
+    // A click on a visible row resolves through apply_row_click
+    // (plain/ctrl/shift) against the current visible list. The
+    // anchor is identity-checked first (nit-10): a stale anchor
+    // (the list shrank OR the row was replaced by a re-list) is
+    // dropped, so shift degenerates to a plain click.
+    if let Some((index, ctrl, shift)) = row_click {
+        let anchor = valid_anchor(selection.selection_anchor, visible_ids);
+        let selected_idx: Vec<usize> = selection
+            .selected_tracks
+            .iter()
+            .filter_map(|id| visible_ids.iter().position(|candidate| candidate == id))
+            .collect();
+        let (new_indices, anchor_index) =
+            apply_row_click(&selected_idx, anchor, index, ctrl, shift);
+        selection.selected_tracks = new_indices
+            .iter()
+            .filter_map(|&index| visible_ids.get(index).copied())
+            .collect();
+        // Whatever anchor apply_row_click kept, the row identity
+        // is recorded with it.
+        selection.selection_anchor = anchor_index
+            .and_then(|index| visible_ids.get(index).map(|&id| (index, id)));
+        selection.selected_track = selection.selected_tracks.last().copied();
+    }
+
+    // «выбрать все» edits the row set only: the cursor stays put
+    // (review 🟡-1) — a bulk selection is not a navigation act.
+    if let Some(check) = select_all {
+        selection.selected_tracks = apply_select_all(&selection.selected_tracks, visible_ids, check);
+    }
+
+    // A checkbox check moves the cursor to the toggled row (Enter
+    // targets the last touched row); an uncheck leaves it where it is.
+    if let Some(id) = checkbox_toggle {
+        selection.selected_tracks = toggle_selected(&selection.selected_tracks, id);
+        if selection.selected_tracks.contains(&id) {
+            selection.selected_track = Some(id);
+        }
+    }
+
+    selection
+}
+
 /// Central-panel empty-state text: empty library, empty filter result,
 /// empty device view or empty playlist — in that priority order.
 fn empty_state_text(library_empty: bool, query: &str, empty_view: bool, empty_playlist: bool) -> String {
@@ -2243,22 +2522,28 @@ fn error_tooltip(error: &UiError) -> String {
     text
 }
 
-// ---- round 5: audiobook grouping (pure helpers, tested) ----
+// ---- round 5 + 6 П3: track grouping (pure helpers, tested) ----
 
-/// One book inside the «Аудиокниги» view: the album is the book, the
-/// files are its members in display order. Duration/count are derived
-/// from `track_ids` + the snapshot at render time (single source of
-/// truth, KISS) — not stored here.
+/// One named group (book / album / artist) with its tracks in display
+/// order. Duration/count are derived from `track_ids` + the snapshot
+/// at render time (single source of truth, KISS) — not stored here.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct BookGroup {
-    album: String,
-    author: String,
+struct TrackGroup {
+    name: String,
+    /// Secondary info line: the author of a book or album. `None` →
+    /// the info line shows only the counters (the «Исполнители» view,
+    /// where the name IS the artist).
+    author: Option<String>,
     track_ids: Vec<TrackId>,
 }
 
 /// The album-as-book key: blank/missing tags collapse into one
 /// fallback group (pinned last by the sort — see `group_books`).
 const NO_ALBUM_GROUP: &str = "Без альбома";
+/// The artist catch-all, pinned last in the «Исполнители» view.
+const NO_ARTIST_GROUP: &str = "Неизвестный исполнитель";
+/// Honest placeholder of the books view (round 5 behavior).
+const UNKNOWN_BOOK_AUTHOR: &str = "Неизвестный автор";
 
 fn album_group_key(track: &Track) -> String {
     track
@@ -2270,7 +2555,20 @@ fn album_group_key(track: &Track) -> String {
         .unwrap_or_else(|| NO_ALBUM_GROUP.to_owned())
 }
 
-/// Sort key of a file inside its book: numbered discs/tracks first
+/// Artist of a track for the «Исполнители» view: album_artist →
+/// artist (the same fallback as the author line — Apple semantics);
+/// blank/missing tags collapse into the pinned catch-all group.
+fn artist_group_key(track: &Track) -> String {
+    [track.album_artist.as_deref(), track.artist.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|text| !text.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| NO_ARTIST_GROUP.to_owned())
+}
+
+/// Sort key of a file inside its group: numbered discs/tracks first
 /// (0 = «no number» sorts last among equals), then title
 /// case-insensitively.
 fn book_file_sort_key(track: &Track) -> (bool, u32, bool, u32, String) {
@@ -2283,63 +2581,115 @@ fn book_file_sort_key(track: &Track) -> (bool, u32, bool, u32, String) {
     )
 }
 
-/// Groups the (already filtered) audiobook tracks into books.
-/// Groups sort by album case-insensitively; files inside a book by
-/// (disc, track, title) with «no number» last. The author is the first
-/// non-empty album_artist (Apple semantics: album artist outranks the
-/// track artist), then artist, in final file order; without any —
-/// «Неизвестный автор».
-fn group_books<'a>(tracks: impl IntoIterator<Item = &'a Track>) -> Vec<BookGroup> {
-    // Insertion-ordered buckets keep a stable start before sorting.
+/// Shared grouping engine: buckets tracks by `key` (insertion order),
+/// sorts buckets case-insensitively with the `catch_all` bucket pinned
+/// last, then orders the members with `member_sort`.
+fn group_tracks_by<'a>(
+    tracks: impl IntoIterator<Item = &'a Track>,
+    key: impl Fn(&Track) -> String,
+    catch_all: &str,
+    member_sort: impl Fn(&mut [&'a Track]),
+) -> Vec<(String, Vec<&'a Track>)> {
     let mut buckets: Vec<(String, Vec<&Track>)> = Vec::new();
     for track in tracks {
-        let album = album_group_key(track);
-        match buckets.iter_mut().find(|(name, _)| *name == album) {
+        let group = key(track);
+        match buckets.iter_mut().find(|(name, _)| *name == group) {
             Some((_, members)) => members.push(track),
-            None => buckets.push((album, vec![track])),
+            None => buckets.push((group, vec![track])),
         }
     }
-    buckets.sort_by(|(album_a, _), (album_b, _)| {
-        // The synthetic fallback bucket («Без альбома») pins last:
-        // real books first, the catch-all below them (the spec only
-        // demands case-insensitive album sorting).
-        let a_last = album_a == NO_ALBUM_GROUP;
-        let b_last = album_b == NO_ALBUM_GROUP;
-        a_last.cmp(&b_last).then_with(|| {
-            album_a.to_lowercase().cmp(&album_b.to_lowercase())
-        })
+    buckets.sort_by(|(a, _), (b, _)| {
+        // The synthetic catch-all bucket pins last: real groups first,
+        // the fallback below them.
+        (a == catch_all)
+            .cmp(&(b == catch_all))
+            .then_with(|| a.to_lowercase().cmp(&b.to_lowercase()))
     });
+    for (_, members) in &mut buckets {
+        member_sort(members);
+    }
     buckets
-        .into_iter()
-        .map(|(album, mut members)| {
-            members.sort_by_key(|track| book_file_sort_key(track));
-            let author = members
-                .iter()
-                .filter_map(|track| {
+}
+
+/// The author of a group: the first non-empty album_artist (Apple
+/// semantics: the album artist outranks the track artist), then
+/// artist, in the group's final file order.
+fn resolved_author(members: &[&Track]) -> Option<String> {
+    members
+        .iter()
+        .filter_map(|track| {
+            track
+                .album_artist
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
                     track
-                        .album_artist
+                        .artist
                         .as_deref()
                         .map(str::trim)
                         .filter(|text| !text.is_empty())
                         .map(str::to_owned)
-                        .or_else(|| {
-                            track
-                                .artist
-                                .as_deref()
-                                .map(str::trim)
-                                .filter(|text| !text.is_empty())
-                                .map(str::to_owned)
-                        })
                 })
-                .next()
-                .unwrap_or_else(|| "Неизвестный автор".to_owned());
-            BookGroup {
-                album,
-                author,
-                track_ids: members.into_iter().map(|track| track.id).collect(),
-            }
         })
-        .collect()
+        .next()
+}
+
+/// Groups the (already filtered) audiobook tracks into books (round 5
+/// behavior): albums case-insensitive, «Без альбома» last, files by
+/// (disc, track, title); the author line always shows — honestly
+/// «Неизвестный автор» when nobody is tagged.
+fn group_books<'a>(tracks: impl IntoIterator<Item = &'a Track>) -> Vec<TrackGroup> {
+    group_tracks_by(tracks, album_group_key, NO_ALBUM_GROUP, |members| {
+        members.sort_by_key(|track| book_file_sort_key(track));
+    })
+    .into_iter()
+    .map(|(name, members)| TrackGroup {
+        author: Some(
+            resolved_author(&members).unwrap_or_else(|| UNKNOWN_BOOK_AUTHOR.to_owned()),
+        ),
+        name,
+        track_ids: members.iter().map(|track| track.id).collect(),
+    })
+    .collect()
+}
+
+/// Round 6 П3: the music view grouped by album — the same engine as
+/// books («Без альбома» pinned last, files by disc/track/title), but
+/// the author line stays honest: an untagged album shows no author.
+fn group_by_album<'a>(tracks: impl IntoIterator<Item = &'a Track>) -> Vec<TrackGroup> {
+    group_tracks_by(tracks, album_group_key, NO_ALBUM_GROUP, |members| {
+        members.sort_by_key(|track| book_file_sort_key(track));
+    })
+    .into_iter()
+    .map(|(name, members)| TrackGroup {
+        author: resolved_author(&members),
+        name,
+        track_ids: members.iter().map(|track| track.id).collect(),
+    })
+    .collect()
+}
+
+/// Round 6 П3: the music view grouped by artist («Неизвестный
+/// исполнитель» pinned last); the files of one artist are ordered by
+/// album first, then by disc/track/title — a tiny discography.
+fn group_by_artist<'a>(tracks: impl IntoIterator<Item = &'a Track>) -> Vec<TrackGroup> {
+    group_tracks_by(tracks, artist_group_key, NO_ARTIST_GROUP, |members| {
+        members.sort_by(|a, b| {
+            album_group_key(a)
+                .to_lowercase()
+                .cmp(&album_group_key(b).to_lowercase())
+                .then_with(|| book_file_sort_key(a).cmp(&book_file_sort_key(b)))
+        });
+    })
+    .into_iter()
+    .map(|(name, members)| TrackGroup {
+        author: None,
+        name,
+        track_ids: members.iter().map(|track| track.id).collect(),
+    })
+    .collect()
 }
 
 /// One rendered line of the «Аудиокниги» view: a collapsible book
@@ -2421,18 +2771,83 @@ fn strip_prefix_in(title: &str, prefix: &str) -> String {
         .unwrap_or_else(|| title.to_owned())
 }
 
+// ---- round 6 tail nit-8: kind-aware tag-review texts ----
+
+/// Field labels and messages of the tag-review modal, chosen by the
+/// media kind: audiobooks speak «книга/автор», music speaks
+/// «альбом/исполнитель». The check is the semantic audiobook BIT —
+/// combined bits stay book-flavored.
+struct TagReviewTexts {
+    /// Subject of the heading («Добавление {subject}: …»).
+    subject: &'static str,
+    /// Label of the shared title field.
+    title_field: &'static str,
+    /// Label of the shared author field.
+    author_field: &'static str,
+    /// Near-field validation text for an empty title.
+    empty_title: &'static str,
+    /// The commit button.
+    add_button: &'static str,
+}
+
+fn tag_review_texts(kind_bits: u32) -> TagReviewTexts {
+    if kind_bits & AUDIOBOOK_BIT != 0 {
+        TagReviewTexts {
+            subject: "книги",
+            title_field: "Название книги*",
+            author_field: "Автор",
+            empty_title: "Укажите название книги",
+            add_button: "Добавить книгу",
+        }
+    } else {
+        TagReviewTexts {
+            subject: "музыки",
+            title_field: "Альбом",
+            author_field: "Исполнитель",
+            empty_title: "Укажите название альбома",
+            add_button: "Добавить музыку",
+        }
+    }
+}
+
+// ---- round 6 tail nit-9: prefix toggle keeps manual edits ----
+
+/// Re-derives the automatic titles after the prefix-checkbox toggle,
+/// but only for rows still showing the PREVIOUS automatic value — a
+/// manually edited title survives (round 6 tail nit-9: the checkbox
+/// used to overwrite every row from the raw file stem).
+fn retoggle_prefix_titles(rows: &mut [TagRow], prefix: &str, strip_now: bool) {
+    for row in rows {
+        let auto_now = if strip_now {
+            strip_prefix_in(&row.original_title, prefix)
+        } else {
+            row.original_title.clone()
+        };
+        let auto_before = if strip_now {
+            row.original_title.clone()
+        } else {
+            strip_prefix_in(&row.original_title, prefix)
+        };
+        if row.title == auto_before {
+            row.title = auto_now;
+        }
+    }
+}
+
 /// Applies the reviewed tags to the drafts: album/book title for all,
 /// author as album_artist (when non-empty), per-row title (an empty
-/// edit falls back to the file stem) and track number.
+/// edit falls back to the file stem) and track number. The empty-title
+/// validation text is kind-aware (round 6 tail nit-8).
 fn apply_tag_review(
     drafts: &[TrackDraft],
     book_title: &str,
     author: &str,
     rows: &[TagRow],
+    empty_title_error: &str,
 ) -> Result<Vec<TrackDraft>, String> {
     let book = book_title.trim();
     if book.is_empty() {
-        return Err("Укажите название книги".to_owned());
+        return Err(empty_title_error.to_owned());
     }
     let author = author.trim();
     Ok(drafts
@@ -2481,10 +2896,13 @@ fn prefill_book_title(drafts: &[TrackDraft]) -> String {
     }
 }
 
-/// One editable file line of the review modal.
+/// One editable file line of the review modal. `original_title` is
+/// the untouched file stem — the reference for the prefix toggle to
+/// detect (and spare) manual edits (round 6 tail nit-9).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TagRow {
     title: String,
+    original_title: String,
     track_number: u32,
 }
 
@@ -2520,17 +2938,18 @@ struct TagReview {
 /// prefix was found.
 fn open_tag_review(drafts: Vec<TrackDraft>) -> TagReview {
     let kind_bits = drafts.first().map(|d| d.media_kind_bits).unwrap_or(1);
+    let stems: Vec<String> = drafts.iter().map(|d| d.title.clone()).collect();
+    let prefix = common_prefix(&stems);
     let rows: Vec<TagRow> = drafts
         .iter()
         .enumerate()
         .map(|(index, draft)| TagRow {
             title: draft.title.clone(),
+            original_title: draft.title.clone(),
             track_number: trailing_number(&draft.title)
                 .unwrap_or(index as u32 + 1),
         })
         .collect();
-    let stems: Vec<String> = drafts.iter().map(|d| d.title.clone()).collect();
-    let prefix = common_prefix(&stems);
     TagReview {
         kind_bits,
         book_title: prefill_book_title(&drafts),
@@ -2641,28 +3060,36 @@ fn search_toolbar(ui: &mut egui::Ui, params: SearchToolbarParams<'_>) -> Toolbar
 }
 
 /// Column setup of the track table, shared with the layout test
-/// (round 4.1 Ф4): title takes the remainder with a 120px floor, the
-/// other three are exact widths. WHY the floor: with `remainder` +
-/// fixed columns in a narrow panel the remainder can collapse to 0
-/// (`Sizing::to_lengths` clamps negative remainders to 0) and the row
-/// loses its title entirely; the floor keeps it readable.
+/// (round 4.1 Ф4): a narrow checkbox column (round 6 П2), the title
+/// takes the remainder with a 100px floor, the other three are exact
+/// widths. WHY the floor: with `remainder` + fixed columns in a narrow
+/// panel the remainder can collapse to 0 (`Sizing::to_lengths` clamps
+/// negative remainders to 0) and the row loses its title entirely; the
+/// floor keeps it readable. 100px (was 120 in round 4.1): the checkbox
+/// column joined the same 616px worst case, and the title now floors
+/// just under its 104px worst-case share instead of overflowing.
 fn track_table_builder<'a>(ui: &'a mut egui::Ui, table_id: egui::Id) -> TableBuilder<'a> {
     TableBuilder::new(ui)
         .id_salt(table_id)
         .striped(true)
         .vscroll(true)
         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-        .column(Column::remainder().clip(true).resizable(false).at_least(120.0))
+        .column(Column::exact(CHECK_COLUMN).resizable(false))
+        .column(Column::remainder().clip(true).resizable(false).at_least(100.0))
         .column(Column::exact(ARTIST_COLUMN).clip(true).resizable(false))
         .column(Column::exact(ALBUM_COLUMN).clip(true).resizable(false))
         .column(Column::exact(DURATION_COLUMN).resizable(false))
 }
 
-/// Aggregated arguments for [`books_view`] («Аудиокниги» table);
-/// `ui` stays a plain argument per egui convention.
-struct BooksViewParams<'a> {
+/// Aggregated arguments for [`groups_view`] (grouped track views);
+/// `ui` stays a plain argument per egui convention. `groups` arrive
+/// precomputed (group_books / group_by_album / group_by_artist) — the
+/// component is render-only (round 6 П3: ONE grouped-list component
+/// for books, albums and artists).
+struct GroupsViewParams<'a> {
     ctx: &'a egui::Context,
     tracks: &'a [&'a Track],
+    groups: &'a [TrackGroup],
     selected_tracks: &'a [TrackId],
     cursor: Option<TrackId>,
     menus_allowed: bool,
@@ -2670,16 +3097,18 @@ struct BooksViewParams<'a> {
     expanded: &'a mut HashSet<String>,
 }
 
-/// The «Аудиокниги» view (round 5): books (albums) collapsed by
-/// default; a header click toggles the book; an expanded book shows an
-/// info line (author · files · total duration) and its file list.
-/// File rows reuse the proven selection machinery: clicks report their
-/// index in `visible_ids` (headers are not selectable — they toggle),
-/// so apply_row_click / anchor / toolbar / keyboard all work unchanged.
-fn books_view(ui: &mut egui::Ui, params: BooksViewParams<'_>) -> TrackRowActions {
-    let BooksViewParams {
+/// The grouped view component (round 5 books / round 6 П3): groups
+/// collapsed by default; a header click toggles the group; an expanded
+/// group shows an info line (optional author · files · total duration)
+/// and its file list. File rows reuse the proven selection machinery:
+/// clicks report their index in `visible_ids` (headers are not
+/// selectable — they toggle), so apply_row_click / anchor / toolbar /
+/// keyboard all work unchanged.
+fn groups_view(ui: &mut egui::Ui, params: GroupsViewParams<'_>) -> TrackRowActions {
+    let GroupsViewParams {
         ctx,
         tracks,
+        groups,
         selected_tracks,
         cursor,
         menus_allowed,
@@ -2690,16 +3119,15 @@ fn books_view(ui: &mut egui::Ui, params: BooksViewParams<'_>) -> TrackRowActions
     if !expanded.is_empty() && ui.button("Свернуть все").clicked() {
         expanded.clear();
     }
-    let groups = group_books(tracks.iter().copied());
     // Durations and titles for the infoblock/file rows; the groups
-    // carry ids only (single source of truth, see BookGroup).
+    // carry ids only (single source of truth, see TrackGroup).
     let by_id: HashMap<TrackId, &Track> =
         tracks.iter().map(|track| (track.id, *track)).collect();
     egui::ScrollArea::vertical()
         .auto_shrink(false)
         .show(ui, |ui| {
-            for group in &groups {
-                let is_expanded = expanded.contains(&group.album);
+            for group in groups {
+                let is_expanded = expanded.contains(&group.name);
                 let arrow = if is_expanded { "▾" } else { "▸" };
                 let total_ms: u64 = group
                     .track_ids
@@ -2727,7 +3155,7 @@ fn books_view(ui: &mut egui::Ui, params: BooksViewParams<'_>) -> TrackRowActions
                 painter.text(
                     egui::pos2(inner.left(), middle),
                     egui::Align2::LEFT_CENTER,
-                    format!("{arrow} {}", group.album),
+                    format!("{arrow} {}", group.name),
                     egui::FontId::proportional(14.0),
                     visuals.strong_text_color(),
                 );
@@ -2744,8 +3172,8 @@ fn books_view(ui: &mut egui::Ui, params: BooksViewParams<'_>) -> TrackRowActions
                 );
                 if response.clicked() {
                     // Insert-else-remove = toggle.
-                    if !expanded.insert(group.album.clone()) {
-                        expanded.remove(&group.album);
+                    if !expanded.insert(group.name.clone()) {
+                        expanded.remove(&group.name);
                     }
                 }
                 if is_expanded {
@@ -2762,16 +3190,14 @@ fn books_view(ui: &mut egui::Ui, params: BooksViewParams<'_>) -> TrackRowActions
                                 group.track_ids.len(),
                                 plural(group.track_ids.len(), "файл", "файла", "файлов")
                             );
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Автор: {} · {} · {}",
-                                    group.author,
-                                    files_text,
-                                    format_total_duration(total_ms)
-                                ))
-                                .weak()
-                                .size(13.0),
-                            );
+                            let total_text = format_total_duration(total_ms);
+                            let info = match &group.author {
+                                Some(author) => {
+                                    format!("Автор: {author} · {files_text} · {total_text}")
+                                }
+                                None => format!("{files_text} · {total_text}"),
+                            };
+                            ui.label(egui::RichText::new(info).weak().size(13.0));
                             ui.add_space(2.0);
                             for (file_idx, track_id) in group.track_ids.iter().enumerate() {
                                 let Some(track) = by_id.get(track_id) else {
@@ -2889,11 +3315,37 @@ fn book_file_row(
     }
 }
 
+/// The tri-state «выбрать все» header checkbox (round 6 П2): a click
+/// selects every visible row; from the checked state a click clears
+/// them again. From the partial dash a click selects too — egui's
+/// indeterminate flag is purely visual and does not invert the
+/// toggle. Returns the requested target state when the widget was
+/// clicked.
+fn header_select_all(ui: &mut egui::Ui, state: SelectAllState) -> Option<bool> {
+    let mut checked = state == SelectAllState::All;
+    let response = ui.add(
+        egui::Checkbox::without_text(&mut checked)
+            .indeterminate(state == SelectAllState::Some),
+    );
+    response.changed().then_some(checked)
+}
+
+/// One checkbox cell of a table row (round 6 П2): an explicit toggle
+/// of the row in the shared selection. A plain widget on purpose —
+/// unlike the draggable title/artist/album/duration cells it must not
+/// intercept or emit row clicks.
+fn row_checkbox(ui: &mut egui::Ui, selected_tracks: &[TrackId], id: TrackId) -> Option<TrackId> {
+    let mut checked = selected_tracks.contains(&id);
+    let response = ui.add(egui::Checkbox::without_text(&mut checked));
+    response.changed().then_some(id)
+}
+
 /// The track table (round 4): `egui_extras::TableBuilder` with striped
 /// rows, per-context scroll state, clip + hover-tooltips, a right
 /// aligned duration column, multi-row selection (Ф3: plain/ctrl/shift
-/// clicks, toolbar actions) and full-row drag. Collects row choices
-/// without holding an app-state borrow.
+/// clicks, toolbar actions; round 6 П2: checkbox column + «выбрать
+/// все») and full-row drag. Collects row choices without holding an
+/// app-state borrow.
 fn track_table(
     ui: &mut egui::Ui,
     tracks: &[&Track],
@@ -2907,8 +3359,16 @@ fn track_table(
     // Modifiers at click time are the current input state: egui
     // processes clicks within their frame.
     let ctx = ui.ctx().clone();
+    let visible_ids: Vec<TrackId> = tracks.iter().map(|track| track.id).collect();
     track_table_builder(ui, table_id)
         .header(ROW_HEIGHT, |mut header| {
+            header.col(|ui| {
+                if let Some(check) =
+                    header_select_all(ui, select_all_state(selected_tracks, &visible_ids))
+                {
+                    actions.select_all = Some(check);
+                }
+            });
             header.col(|ui| {
                 ui.strong("Название");
             });
@@ -2931,6 +3391,13 @@ fn track_table(
                     // Selection highlight straight from TableBuilder:
                     // every row of the multi-selection plus the cursor.
                     row.set_selected(selected_tracks.contains(&track.id) || cursor == Some(track.id));
+                    // Round 6 П2: the checkbox column — an explicit
+                    // toggle, kept out of the drag/click machinery.
+                    row.col(|ui| {
+                        if let Some(id) = row_checkbox(ui, selected_tracks, track.id) {
+                            actions.checkbox_toggle = Some(id);
+                        }
+                    });
                     // WHY the same id for every cell: egui keys the drag
                     // payload by id; identical ids + identical payloads
                     // make all four cells drag the one row.
@@ -3042,9 +3509,67 @@ fn tooltip_label(ui: &mut egui::Ui, value: &Option<String>) {
     }
 }
 
-/// One sidebar row: name + weak count («Все треки» only on the master),
-/// selectable (click = the central table context). Built-in device
-/// views accept no drops and offer no ПКМ: the firmware owns them.
+/// One sidebar row (round 6 П1): the selection spans the FULL panel
+/// width — the standard list pattern — instead of ending at the text
+/// (the old `selectable_value` hugged its label, so rows had ragged
+/// widths). Name at a fixed left inset, count pinned to the right
+/// edge; selected + hover are painted backgrounds. A too-long name is
+/// clipped before the count and shows the full text on hover.
+fn sidebar_row(ui: &mut egui::Ui, selected: bool, name: &str, count: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), SIDEBAR_ROW_HEIGHT),
+        egui::Sense::click(),
+    );
+    let painter = ui.painter();
+    let visuals = ui.visuals();
+    if selected {
+        painter.rect_filled(rect, 4.0, visuals.selection.bg_fill);
+    } else if response.hovered() {
+        painter.rect_filled(rect, 4.0, visuals.widgets.hovered.bg_fill);
+    }
+    let inner = rect.shrink2(egui::vec2(SIDEBAR_ROW_INSET, 0.0));
+    let middle = rect.center().y;
+    let count_galley = painter.layout_no_wrap(
+        count.to_owned(),
+        egui::FontId::proportional(12.0),
+        visuals.weak_text_color(),
+    );
+    painter.text(
+        egui::pos2(inner.right(), middle),
+        egui::Align2::RIGHT_CENTER,
+        count,
+        egui::FontId::proportional(12.0),
+        visuals.weak_text_color(),
+    );
+    // The name is laid out first and clipped to the room left of the
+    // count: a long playlist title must never run under the numbers.
+    let name_galley = painter.layout_no_wrap(
+        name.to_owned(),
+        egui::FontId::proportional(14.0),
+        visuals.text_color(),
+    );
+    let name_width = (inner.width() - count_galley.size().x - SIDEBAR_NAME_COUNT_GAP).max(0.0);
+    let name_clipped = name_galley.size().x > name_width;
+    let name_clip = egui::Rect::from_min_max(
+        egui::pos2(inner.left(), rect.top()),
+        egui::pos2(inner.left() + name_width, rect.bottom()),
+    );
+    painter.with_clip_rect(name_clip).galley(
+        egui::pos2(inner.left(), middle - 0.5 * name_galley.size().y),
+        name_galley,
+        visuals.text_color(),
+    );
+    if name_clipped {
+        return response.on_hover_text(name);
+    }
+    response
+}
+
+/// One sidebar row wiring: painted full-width row (see [`sidebar_row`]),
+/// click switches the central context, ПКМ offers delete (user
+/// playlists only; the master is refused honestly), drops add tracks.
+/// Built-in device views accept no drops and no ПКМ: the firmware owns
+/// them. «Все треки» only on the master; the others show a count.
 fn playlist_row(
     ui: &mut egui::Ui,
     snapshot: &LibrarySnapshot,
@@ -3080,17 +3605,14 @@ fn playlist_row(
     let (_, dropped) = ui.dnd_drop_zone::<DraggedTracks, ()>(
         egui::Frame::default().inner_margin(egui::Margin::same(2)),
         |ui| {
-            let name = ui.selectable_value(
-                view,
-                row_view,
-                (
-                    egui::RichText::new(playlist.name.as_str()),
-                    egui::RichText::new(format!("  {count_text}")).weak(),
-                ),
-            );
+            let selected = *view == row_view;
+            let row = sidebar_row(ui, selected, &playlist.name, &count_text);
+            if row.clicked() {
+                *view = row_view;
+            }
             if menus_allowed && !is_view {
                 let mut refused_master = false;
-                name.context_menu(|ui| {
+                row.context_menu(|ui| {
                     if ui.button("Удалить…").clicked() {
                         if playlist.is_master {
                             refused_master = true;
@@ -3181,10 +3703,11 @@ fn edit_track_dialog_fields(ui: &mut egui::Ui, dialog: &mut EditDialogState) -> 
 }
 
 /// Headless table render for the Ф4 layout test: same builder config
-/// as production, header cells measured via allocated rects.
+/// as production, header cells measured via allocated rects. Five
+/// columns since round 6 П2 (checkbox + four data columns).
 #[cfg(test)]
 fn render_measured_table(ui: &mut egui::Ui) -> Vec<egui::Rect> {
-    let rects: [std::rc::Rc<std::cell::RefCell<Option<egui::Rect>>>; 4] =
+    let rects: [std::rc::Rc<std::cell::RefCell<Option<egui::Rect>>>; 5] =
         Default::default();
     let sinks = rects.clone();
     track_table_builder(ui, egui::Id::unique("test_table"))
@@ -3676,6 +4199,45 @@ mod tests {
         let library = app.library.as_ref().unwrap();
         assert_eq!(library.snapshot.tracks[0].title, "Beta");
         assert_eq!(app.status, "Обновлено: «Beta» (новый id: 9)");
+    }
+
+    #[test]
+    fn applied_prunes_dead_ids_from_selection_and_anchor() {
+        // Review 🟢-5: after an applied operation the toolbar must not
+        // count rows that no longer exist in the new snapshot.
+        let (mut app, _dir) = app_with_open_library();
+        let (tx, rx) = channel();
+        {
+            let library = app.library.as_mut().unwrap();
+            library.pending = Some((PendingKind::RemoveTrack, rx));
+            library.selected_tracks = vec![
+                TrackId::from_bits(1),
+                TrackId::from_bits(2),
+                TrackId::from_bits(77), // removed by the operation
+            ];
+            // The anchor row vanished with the re-list: dropped instead
+            // of surviving as a stale identity.
+            library.selection_anchor = Some((2, TrackId::from_bits(77)));
+        }
+        tx.send(LibraryOutcome::Applied {
+            snapshot: LibrarySnapshot {
+                tracks: vec![sample_track(1, "A"), sample_track(2, "B")],
+                playlists: Vec::new(),
+            },
+            summary: "Удалено".to_owned(),
+        })
+        .unwrap();
+        app.drain_library();
+        let library = app.library.as_ref().unwrap();
+        assert_eq!(
+            library.selected_tracks,
+            vec![TrackId::from_bits(1), TrackId::from_bits(2)],
+            "dead ids must leave the selection"
+        );
+        assert_eq!(
+            library.selection_anchor, None,
+            "a stale anchor must be dropped"
+        );
     }
 
     #[test]
@@ -4216,15 +4778,23 @@ mod tests {
             tag_draft("Skazka - 2", None, None, 8),
         ];
         let rows = vec![
-            TagRow { title: "Глава 1".to_owned(), track_number: 1 },
-            TagRow { title: String::new(), track_number: 2 }, // empty → stem
+            TagRow { title: "Глава 1".to_owned(), original_title: "Skazka - 1".to_owned(), track_number: 1 },
+            TagRow { title: String::new(), original_title: "Skazka - 2".to_owned(), track_number: 2 }, // empty → stem
         ];
-        // Empty book title is rejected with the near-field text.
+        // Empty book title is rejected with the KIND-aware near-field
+        // text (nit-8): books say «книги», music says «альбома».
         assert_eq!(
-            apply_tag_review(&drafts, "   ", "Пушкин", &rows).unwrap_err(),
+            apply_tag_review(&drafts, "   ", "Пушкин", &rows, "Укажите название книги")
+                .unwrap_err(),
             "Укажите название книги"
         );
-        let applied = apply_tag_review(&drafts, "Сказка о рыбаке", "Пушкин", &rows).unwrap();
+        assert_eq!(
+            apply_tag_review(&drafts, "  ", "Пушкин", &rows, "Укажите название альбома")
+                .unwrap_err(),
+            "Укажите название альбома"
+        );
+        let applied =
+            apply_tag_review(&drafts, "Сказка о рыбаке", "Пушкин", &rows, "ignored").unwrap();
         assert_eq!(applied.len(), 2);
         for draft in &applied {
             assert_eq!(draft.album.as_deref(), Some("Сказка о рыбаке"));
@@ -4235,8 +4805,76 @@ mod tests {
         assert_eq!(applied[1].title, "Skazka - 2", "empty edit falls back to stem");
         assert_eq!(applied[1].track_number, 2);
         // An empty author must NOT overwrite the draft's artist field.
-        let no_author = apply_tag_review(&drafts, "Книга", "", &rows).unwrap();
+        let no_author = apply_tag_review(&drafts, "Книга", "", &rows, "x").unwrap();
         assert_eq!(no_author[0].album_artist, None);
+    }
+
+    // ---- tail nit-8: kind-aware texts ----
+
+    #[test]
+    fn tag_review_texts_speak_books_for_books_and_music_for_music() {
+        // Books: the audiobook BIT decides (combined bits stay book).
+        let books = tag_review_texts(8);
+        assert_eq!(books.title_field, "Название книги*");
+        assert_eq!(books.author_field, "Автор");
+        assert_eq!(books.empty_title, "Укажите название книги");
+        assert_eq!(books.add_button, "Добавить книгу");
+        assert_eq!(tag_review_texts(9).title_field, "Название книги*");
+
+        let music = tag_review_texts(1);
+        assert_eq!(music.title_field, "Альбом");
+        assert_eq!(music.author_field, "Исполнитель");
+        assert_eq!(music.empty_title, "Укажите название альбома");
+        assert_eq!(music.add_button, "Добавить музыку");
+        assert!(music.subject.contains("музыки"));
+    }
+
+    // ---- tail nit-9: the prefix toggle spares manual edits ----
+
+    #[test]
+    fn prefix_toggle_rederives_only_untouched_rows() {
+        let prefix = "Skazka";
+        let mut rows = vec![
+            TagRow {
+                title: "Skazka - 1".to_owned(),
+                original_title: "Skazka - 1".to_owned(),
+                track_number: 1,
+            },
+            // The user edited this one before touching the checkbox.
+            TagRow {
+                title: "Моё название".to_owned(),
+                original_title: "Skazka - 2".to_owned(),
+                track_number: 2,
+            },
+        ];
+        // OFF: nothing was stripped yet — every row already shows its
+        // automatic (original) value, so nothing changes.
+        retoggle_prefix_titles(&mut rows, prefix, false);
+        assert_eq!(rows[0].title, "Skazka - 1");
+        assert_eq!(rows[1].title, "Моё название");
+        // ON: untouched rows strip; the manual edit survives.
+        retoggle_prefix_titles(&mut rows, prefix, true);
+        assert_eq!(rows[0].title, "1", "stem minus the «Skazka - » prefix");
+        assert_eq!(rows[1].title, "Моё название", "manual edit kept");
+        // OFF again: the untouched row returns to the stem; the manual
+        // edit is still there.
+        retoggle_prefix_titles(&mut rows, prefix, false);
+        assert_eq!(rows[0].title, "Skazka - 1");
+        assert_eq!(rows[1].title, "Моё название");
+    }
+
+    #[test]
+    fn prefix_toggle_restores_a_previously_stripped_row() {
+        let prefix = "Book";
+        let mut rows = vec![TagRow {
+            title: "5".to_owned(),
+            original_title: "Book - 5".to_owned(),
+            track_number: 5,
+        }];
+        // OFF: the stripped automatic value is the "previous auto", so
+        // it re-derives to the full stem.
+        retoggle_prefix_titles(&mut rows, prefix, false);
+        assert_eq!(rows[0].title, "Book - 5");
     }
 
     #[test]
@@ -4510,15 +5148,15 @@ mod tests {
         let groups = group_books(&tracks);
         assert_eq!(groups.len(), 2);
         // Album artist wins over the track artist; blank cells are skipped.
-        assert_eq!(groups[0].album, "Сказки");
-        assert_eq!(groups[0].author, "Народ");
+        assert_eq!(groups[0].name, "Сказки");
+        assert_eq!(groups[0].author.as_deref(), Some("Народ"));
         assert_eq!(
             groups[0].track_ids,
             [TrackId::from_bits(1), TrackId::from_bits(2)]
         );
         // A blank album is its own group.
-        assert_eq!(groups[1].album, "Без альбома");
-        assert_eq!(groups[1].author, "Певец");
+        assert_eq!(groups[1].name, "Без альбома");
+        assert_eq!(groups[1].author.as_deref(), Some("Певец"));
     }
 
     #[test]
@@ -4534,7 +5172,7 @@ mod tests {
             book_track(6, "альфа", Some("Б"), None, None, 1, 1, 60_000),
         ];
         let groups = group_books(&tracks);
-        let albums: Vec<&str> = groups.iter().map(|g| g.album.as_str()).collect();
+        let albums: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
         assert_eq!(albums, ["а", "Б"], "groups sort case-insensitively");
         // Group «а»: no-disc file after… actually both files are
         // disc-less: numbered (#5) before unnumbered.
@@ -4552,7 +5190,7 @@ mod tests {
         );
         // Author: first non-empty album_artist/artist in file order —
         // here nobody has any → the honest placeholder.
-        assert_eq!(groups[0].author, "Неизвестный автор");
+        assert_eq!(groups[0].author.as_deref(), Some("Неизвестный автор"));
     }
 
     #[test]
@@ -4562,7 +5200,7 @@ mod tests {
             book_track(2, "Файл", None, None, None, 1, 1, 60_000),
         ];
         let groups = group_books(&tracks);
-        let albums: Vec<&str> = groups.iter().map(|g| g.album.as_str()).collect();
+        let albums: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
         assert_eq!(albums, ["Ясно", "Без альбома"], "the catch-all group goes last");
     }
 
@@ -4570,8 +5208,93 @@ mod tests {
     fn book_without_any_artist_is_unknown() {
         let tracks = vec![book_track(1, "Файл", None, None, None, 1, 1, 60_000)];
         let groups = group_books(&tracks);
-        assert_eq!(groups[0].album, "Без альбома");
-        assert_eq!(groups[0].author, "Неизвестный автор");
+        assert_eq!(groups[0].name, "Без альбома");
+        assert_eq!(groups[0].author.as_deref(), Some("Неизвестный автор"));
+    }
+
+    // ---- music grouping: albums and artists (round 6 П3) ----
+
+    #[test]
+    fn albums_group_like_books_but_honest_about_the_author() {
+        let tracks = vec![
+            book_track(1, "Трек", Some("Заря"), Some("Группа"), None, 1, 2, 60_000),
+            book_track(2, "Трек", Some("заря"), Some("  "), Some("Кто-то"), 1, 1, 60_000),
+            book_track(3, "Сингл", None, None, None, 1, 1, 30_000),
+        ];
+        let groups = group_by_album(&tracks);
+        let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+        // Case-insensitive SORT; buckets stay exact (round-5 books
+        // semantics: tag-case variants are separate entries).
+        assert_eq!(names, ["Заря", "заря", "Без альбома"]);
+        // Member order inside the album: track #2 (no 1) before #1.
+        assert_eq!(groups[0].track_ids, [TrackId::from_bits(1)]);
+        assert_eq!(groups[1].track_ids, [TrackId::from_bits(2)]);
+        // Author: first non-empty album_artist in file order.
+        assert_eq!(groups[0].author.as_deref(), Some("Группа"));
+        // An album without any artist shows NO author segment (books
+        // use the «Неизвестный автор» placeholder instead).
+        assert_eq!(groups[2].author, None);
+    }
+
+    #[test]
+    fn artists_group_by_album_artist_then_artist() {
+        let tracks = vec![
+            book_track(1, "Трек", Some("Альбом"), Some("Би-2"), None, 1, 1, 60_000),
+            book_track(2, "Трек", Some("Альбом"), None, Some("Би-2"), 1, 2, 60_000),
+            book_track(3, "Гость", Some("Сборник"), Some("Сплин"), None, 1, 1, 60_000),
+            book_track(4, "Без тегов", None, None, None, 1, 1, 30_000),
+        ];
+        let groups = group_by_artist(&tracks);
+        let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+        // Case-insensitive; album_artist outranks track artist; the
+        // «Неизвестный исполнитель» catch-all pins last.
+        assert_eq!(names, ["Би-2", "Сплин", "Неизвестный исполнитель"]);
+        assert_eq!(
+            groups[0].track_ids,
+            [TrackId::from_bits(1), TrackId::from_bits(2)],
+            "the artist's files stay in one group"
+        );
+        // The name IS the artist — no author segment.
+        assert_eq!(groups[0].author, None);
+    }
+
+    #[test]
+    fn artist_members_order_by_album_then_file() {
+        let tracks = vec![
+            book_track(1, "Позже", Some("Альбом Б"), None, Some("Рокер"), 1, 1, 60_000),
+            book_track(2, "Раньше", Some("альбом а"), None, Some("Рокер"), 1, 1, 60_000),
+            book_track(3, "Азбука", Some("Альбом Б"), None, Some("Рокер"), 1, 1, 60_000),
+        ];
+        let groups = group_by_artist(&tracks);
+        assert_eq!(groups.len(), 1);
+        // Tiny discography: albums case-insensitively first («альбом
+        // а» < «Альбом Б»), then the file order inside each album
+        // (equal disc+number → title ci: «Азбука» < «Позже»).
+        assert_eq!(
+            groups[0].track_ids,
+            [TrackId::from_bits(2), TrackId::from_bits(3), TrackId::from_bits(1)]
+        );
+    }
+
+    #[test]
+    fn section_modes_per_builtin_view() {
+        assert_eq!(
+            section_modes(4),
+            [SectionMode::List, SectionMode::Albums, SectionMode::Artists]
+        );
+        assert_eq!(section_modes(5), [SectionMode::List, SectionMode::Books]);
+        // Any other section (and master/playlists) has only the flat
+        // list — the switcher is not rendered there.
+        assert_eq!(section_modes(2), [SectionMode::List]);
+        assert_eq!(section_modes(0), [SectionMode::List]);
+    }
+
+    #[test]
+    fn switcher_labels_are_owner_facing_russian() {
+        assert_eq!(SectionMode::List.label(), "Список");
+        assert_eq!(SectionMode::Albums.label(), "Альбомы");
+        assert_eq!(SectionMode::Artists.label(), "Исполнители");
+        assert_eq!(SectionMode::Books.label(), "Книги");
     }
 
     #[test]
@@ -4693,13 +5416,200 @@ mod tests {
         assert_eq!(anchor, Some(6));
     }
 
+    // ---- checkbox multi-select (round 6 П2) ----
+
+    #[test]
+    fn select_all_states_follow_visible_coverage() {
+        let visible = ids(&[1, 2, 3]);
+        assert_eq!(select_all_state(&ids(&[]), &visible), SelectAllState::None);
+        assert_eq!(select_all_state(&ids(&[1]), &visible), SelectAllState::Some);
+        assert_eq!(
+            select_all_state(&ids(&[1, 2, 3]), &visible),
+            SelectAllState::All
+        );
+        // A selection that covers nothing visible stays unchecked.
+        assert_eq!(select_all_state(&ids(&[9]), &visible), SelectAllState::None);
+        // An empty view has nothing to select.
+        assert_eq!(select_all_state(&ids(&[1]), &ids(&[])), SelectAllState::None);
+    }
+
+    #[test]
+    fn toggle_all_on_partial_selection_selects_everything() {
+        let visible = ids(&[1, 2, 3]);
+        let result = apply_select_all(&ids(&[1]), &visible, true);
+        assert_eq!(result, ids(&[1, 2, 3]), "partial → all");
+    }
+
+    #[test]
+    fn unchecking_all_keeps_rows_outside_the_view() {
+        let visible = ids(&[1, 2, 3]);
+        let selected = ids(&[1, 2, 3, 9]); // 9 lives in another view
+        let result = apply_select_all(&selected, &visible, false);
+        assert_eq!(result, ids(&[9]));
+    }
+
+    #[test]
+    fn selecting_all_twice_does_not_duplicate() {
+        let visible = ids(&[1, 2]);
+        let result = apply_select_all(&ids(&[1, 2]), &visible, true);
+        assert_eq!(result, ids(&[1, 2]));
+    }
+
+    #[test]
+    fn checkbox_toggle_is_an_explicit_flip() {
+        let selected = ids(&[1, 3]);
+        assert_eq!(
+            toggle_selected(&selected, TrackId::from_bits(5)),
+            ids(&[1, 3, 5])
+        );
+        assert_eq!(
+            toggle_selected(&selected, TrackId::from_bits(3)),
+            ids(&[1])
+        );
+    }
+
+    // ---- tail nit-10: shift anchor is identity-checked ----
+
+    #[test]
+    fn anchor_survives_only_while_the_row_identity_matches() {
+        let visible = ids(&[10, 20, 30]);
+        // Same index, same row → valid.
+        assert_eq!(valid_anchor(Some((1, TrackId::from_bits(20))), &visible), Some(1));
+        // The list shrank → out of bounds → invalid.
+        assert_eq!(valid_anchor(Some((3, TrackId::from_bits(99))), &visible), None);
+        // A re-list put a DIFFERENT row at the anchor index: the old
+        // code shifted from here; now the anchor is dropped.
+        assert_eq!(valid_anchor(Some((1, TrackId::from_bits(99))), &visible), None);
+        // No anchor at all.
+        assert_eq!(valid_anchor(None, &visible), None);
+    }
+
+    #[test]
+    fn shift_from_a_relisted_anchor_degenerates_to_plain_click() {
+        let visible = ids(&[10, 20, 30]);
+        // The anchor row (id 20) vanished in a re-list; index 1 now
+        // holds id 99. The identity check drops the anchor, so the
+        // shift click acts like a plain click on the row (the old
+        // boundary-only check would select a foreign range).
+        let anchor = valid_anchor(Some((1, TrackId::from_bits(99))), &visible);
+        let (selected, new_anchor) = apply_row_click(&[], anchor, 2, false, true);
+        assert_eq!(selected, [2]);
+        assert_eq!(new_anchor, Some(2));
+    }
+
+    // ---- selection resolution (review 🟡-3: extracted from
+    // library_view as a pure function) ----
+
+    #[test]
+    fn resolution_plain_click_from_empty_selection_targets_the_row() {
+        let visible = ids(&[10, 20, 30]);
+        let update = resolve_selection_actions(
+            &ids(&[]),
+            None,
+            None,
+            &visible,
+            Some((1, false, false)),
+            None,
+            None,
+        );
+        assert_eq!(update.selected_tracks, ids(&[20]));
+        assert_eq!(update.selection_anchor, Some((1, TrackId::from_bits(20))));
+        assert_eq!(update.selected_track, Some(TrackId::from_bits(20)));
+    }
+
+    #[test]
+    fn resolution_shift_degenerates_when_the_anchor_row_is_gone() {
+        // The anchor identity (id 99 claimed at index 1) no longer
+        // matches the visible list: the shift click must act as a plain
+        // click, not select a foreign range.
+        let visible = ids(&[10, 20, 30]);
+        let update = resolve_selection_actions(
+            &ids(&[]),
+            Some((1, TrackId::from_bits(99))),
+            Some(TrackId::from_bits(30)),
+            &visible,
+            Some((2, false, true)),
+            None,
+            None,
+        );
+        assert_eq!(update.selected_tracks, ids(&[30]));
+        assert_eq!(update.selection_anchor, Some((2, TrackId::from_bits(30))));
+        assert_eq!(update.selected_track, Some(TrackId::from_bits(30)));
+    }
+
+    #[test]
+    fn resolution_select_all_keeps_hidden_rows_and_the_cursor() {
+        // Rows hidden by the search (id 9) survive; the cursor stays on
+        // its previous row (review 🟡-1) — Enter must not retarget to
+        // the bottom visible row; the anchor is untouched as well.
+        let visible = ids(&[1, 2, 3]);
+        let update = resolve_selection_actions(
+            &ids(&[9]),
+            Some((0, TrackId::from_bits(9))),
+            Some(TrackId::from_bits(9)),
+            &visible,
+            None,
+            Some(true),
+            None,
+        );
+        assert_eq!(update.selected_tracks, ids(&[9, 1, 2, 3]));
+        assert_eq!(update.selection_anchor, Some((0, TrackId::from_bits(9))));
+        assert_eq!(update.selected_track, Some(TrackId::from_bits(9)), "cursor put");
+    }
+
+    #[test]
+    fn resolution_uncheck_all_clears_only_visible_and_keeps_the_cursor() {
+        let visible = ids(&[1, 2, 3]);
+        let update = resolve_selection_actions(
+            &ids(&[1, 2, 3, 9]),
+            Some((0, TrackId::from_bits(1))),
+            Some(TrackId::from_bits(3)),
+            &visible,
+            None,
+            Some(false),
+            None,
+        );
+        assert_eq!(update.selected_tracks, ids(&[9]), "out-of-view rows survive");
+        assert_eq!(update.selected_track, Some(TrackId::from_bits(3)), "cursor put");
+    }
+
+    #[test]
+    fn resolution_checkbox_toggle_moves_the_cursor_only_on_check() {
+        let visible = ids(&[1, 2]);
+        // Checking: the cursor moves to the toggled row.
+        let check = resolve_selection_actions(
+            &ids(&[1]),
+            None,
+            Some(TrackId::from_bits(1)),
+            &visible,
+            None,
+            None,
+            Some(TrackId::from_bits(2)),
+        );
+        assert_eq!(check.selected_tracks, ids(&[1, 2]));
+        assert_eq!(check.selected_track, Some(TrackId::from_bits(2)));
+        // Unchecking: the cursor stays where it was.
+        let uncheck = resolve_selection_actions(
+            &ids(&[1, 2]),
+            None,
+            Some(TrackId::from_bits(1)),
+            &visible,
+            None,
+            None,
+            Some(TrackId::from_bits(2)),
+        );
+        assert_eq!(uncheck.selected_tracks, ids(&[1]));
+        assert_eq!(uncheck.selected_track, Some(TrackId::from_bits(1)), "cursor put");
+    }
+
     // ---- table columns fit the panel (round 4.1 Ф4) ----
 
     /// Worst-case central content width at a 900px window: 900 − 240
-    /// sidebar − panel margins − vscroll bar. All four columns must be
-    /// visible with a ≥120px title.
+    /// sidebar − panel margins − vscroll bar. All five columns must be
+    /// visible with a ≥100px title (round 6 П2: the checkbox column
+    /// shares the same width — the title's worst case is 104px).
     #[test]
-    fn table_columns_fit_narrow_panel_with_120px_title() {
+    fn table_columns_fit_narrow_panel_with_100px_title() {
         let rects: std::rc::Rc<std::cell::RefCell<Vec<egui::Rect>>> = Default::default();
         let sink = rects.clone();
         egui::__run_test_ui(|ui| {
@@ -4709,16 +5619,35 @@ mod tests {
             });
         });
         let rects = rects.borrow();
-        assert_eq!(rects.len(), 4, "four header cells must render");
+        assert_eq!(rects.len(), 5, "five header cells must render");
         let panel_right = 616.0;
         for (index, rect) in rects.iter().enumerate() {
             assert!(
                 rect.right() <= panel_right + 1.0,
                 "column {index} overflows the panel: {rect:?}"
             );
-            assert!(rect.width() > 40.0, "column {index} collapsed: {rect:?}");
+            assert!(rect.width() > 20.0, "column {index} collapsed: {rect:?}");
         }
-        assert!(rects[0].width() >= 120.0, "title ≥ 120px, got {}", rects[0].width());
-        assert!(rects[3].left() >= rects[2].right(), "columns must not overlap");
+        assert_eq!(rects[0].width(), CHECK_COLUMN, "checkbox column is fixed");
+        assert!(rects[1].width() >= 100.0, "title ≥ 100px, got {}", rects[1].width());
+        assert!(rects[4].left() >= rects[3].right(), "columns must not overlap");
+    }
+
+    // ---- sidebar geometry (round 6 П1) ----
+
+    /// The selection must span the whole panel width (the standard list
+    /// pattern), not end at the text like the old selectable_value.
+    #[test]
+    fn sidebar_row_spans_the_full_panel_width() {
+        let rect: std::rc::Rc<std::cell::RefCell<Option<egui::Rect>>> = Default::default();
+        let sink = rect.clone();
+        egui::__run_test_ui(|ui| {
+            ui.allocate_ui(egui::vec2(240.0, 120.0), |ui| {
+                let response = sidebar_row(ui, true, "Плейлист", "5 треков");
+                *sink.borrow_mut() = Some(response.rect);
+            });
+        });
+        let rect = rect.borrow().expect("the row must render");
+        assert!((rect.width() - 240.0).abs() < 0.5, "full width, got {rect:?}");
     }
 }
