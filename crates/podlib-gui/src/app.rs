@@ -118,15 +118,60 @@ fn close_confirmation_action(mounted_by_us: bool) -> CloseAction {
 fn deferred_eject_due(pending: bool, busy: bool, library_idle: bool) -> bool {
     pending && !busy && library_idle
 }
+
+/// Honest confirm texts (batch F): busy — the worker must not die
+/// mid-write; idle with our mount — the close ejects the device, and
+/// the eject needs the sudo password for it.
+fn close_confirm_texts(busy: bool) -> (&'static str, &'static str) {
+    if busy {
+        (
+            "Идёт операция с библиотекой",
+            "Закрыть всё равно? Возможно повреждение базы на устройстве.",
+        )
+    } else {
+        (
+            "Закрыть podlib?",
+            "Смонтированное устройство будет безопасно отключено перед \
+             закрытием (понадобится пароль sudo).",
+        )
+    }
+}
+
+/// Retry hint for a failed eject (batch F): the library is already
+/// closed and the button is available again, so a retry is safe.
+/// Sudo-auth failures (classified by `classify_mount_failure`) get the
+/// layout/Caps Lock wording; everything else keeps the honest «volume
+/// may still be mounted».
+fn ejected_failure_hint(failure: device::MountFailure) -> &'static str {
+    match failure {
+        device::MountFailure::WrongPassword => {
+            "Пароль sudo отклонён — проверьте раскладку и Caps Lock. \
+             Нажмите „Безопасно отключить“ ещё раз: библиотека уже \
+             закрыта, том не тронут, повторный ввод пароля безопасен."
+        }
+        _ => {
+            "Нажмите „Безопасно отключить“ ещё раз — библиотека уже \
+             закрыта и повторная попытка безопасна; том мог остаться \
+             смонтированным."
+        }
+    }
+}
 fn close_decision(
     close_requested: bool,
     operation_active: bool,
     close_confirmed: bool,
+    mounted_by_us: bool,
 ) -> CloseDecision {
-    if !close_requested || close_confirmed || !operation_active {
+    if !close_requested || close_confirmed {
         return CloseDecision::Allow;
     }
-    CloseDecision::BlockWithConfirm
+    // Batch F: an idle close with a device mounted by this app must
+    // also ask — the round 5.3 eject runs sudo steps and cannot be
+    // done silently behind the user's back.
+    if operation_active || mounted_by_us {
+        return CloseDecision::BlockWithConfirm;
+    }
+    CloseDecision::Allow
 }
 
 /// Which operation the UI is waiting on; at most one at a time. Only
@@ -293,9 +338,11 @@ pub struct PodlibApp {
     /// Deferred «Убрать из плейлиста» from the toolbar (the request
     /// needs the worker free; collected during the render pass).
     pending_remove_from_playlist: Option<(PlaylistId, Vec<TrackId>)>,
-    /// True only when THIS app run performed the mount (round 5.3):
-    /// closing the app then unmounts the volume; a skipped idempotent
-    /// mount (already mounted externally) never sets it.
+    /// True when this app run is responsible for the safe unmount
+    /// (round 5.3): closing the app then ejects the volume. Batch F:
+    /// set for mounts we performed AND for adopted already-mounted
+    /// volumes («Подключить» to a mount orphaned by a restart, or a
+    /// foreign mount the owner deliberately connected to).
     mounted_by_us: bool,
     /// Open tag-review modal (round 5.5): an untagged batch is edited
     /// here before the regular AddTracks dispatch; lives on the app so
@@ -429,17 +476,22 @@ impl PodlibApp {
                 }
             }
             DeviceEvent::Ejected(Err(message)) => {
-                // The library was closed before the sequence ran, so the
-                // volume may still be mounted — say so honestly.
-                let hint = if self.connected.is_some() {
-                    Some(
-                        "Библиотека закрыта, но том мог остаться смонтированным. \
-                         Подключите устройство заново, чтобы продолжить работу."
-                            .to_owned(),
-                    )
-                } else {
-                    None
-                };
+                // Batch F: a failed eject also cancels the pending close —
+                // otherwise the deferred path would restart the eject every
+                // idle frame (previously with an empty password again). The
+                // window stays; the user can close it again, which now goes
+                // through the password modal.
+                self.pending_close_after_eject = false;
+                // Batch F retry support: the library is already closed
+                // (and `library_idle` counts None as idle), so the eject
+                // button is available again — the hint says a retry is
+                // safe. Sudo-auth failures get the layout/Caps Lock
+                // wording, the rest keeps the honest «volume may still
+                // be mounted».
+                let hint = self.connected.is_some().then(|| {
+                    ejected_failure_hint(device::classify_mount_failure(&message))
+                        .to_owned()
+                });
                 self.error = Some(UiError {
                     message,
                     hint,
@@ -482,11 +534,14 @@ impl PodlibApp {
         });
     }
 
-    /// True while no library operation is in flight.
+    /// True while no library operation is in flight. Batch F: no library
+    /// at all is also idle — after a failed eject the worker is closed
+    /// (`None`), and the eject button plus the deferred-close paths must
+    /// stay available for a retry.
     fn library_idle(&self) -> bool {
         self.library
             .as_ref()
-            .is_some_and(|library| library.pending.is_none() && library.opening.is_none())
+            .is_none_or(|library| library.pending.is_none() && library.opening.is_none())
     }
 
     fn library_busy(&self) -> bool {
@@ -767,12 +822,24 @@ impl PodlibApp {
         };
         // Round 6.1: close library → sync → drain unmounts (one per
         // stacked mount of the devnode, per the /proc/mounts snapshot)
-        // → power off the whole disk under sudo, strictly LAST.
+        // → power off the whole disk, strictly LAST.
         let block_dev = connected.block_dev.clone();
-        // The power-off step runs under sudo -S (password over stdin,
-        // never argv); taken here so it is consumed and cleared like in
-        // the connect flow.
+        // Round 6.2: EVERY shutdown step runs under sudo -S (password
+        // over stdin, never argv) with this ONE password — the volume
+        // was mounted by us as root, so a user-side unmount would pop a
+        // polkit dialog (the second password prompt this round kills).
+        // Taken here so it is consumed and cleared like in the connect
+        // flow.
         let password = std::mem::take(&mut self.password);
+        // Live-run diagnostic (round 6.2 F): sudo rejected the delivered
+        // line once with «1 incorrect password attempt»; log the LENGTH
+        // only — never the content — so an empty/short delivery is
+        // distinguishable from a typed-but-rejected password.
+        eprintln!(
+            "[eject] пароль sudo: {} симв., ascii={}",
+            password.chars().count(),
+            password.bytes().all(|byte| byte.is_ascii()),
+        );
         // Take the library out: the backend must be closed (and joined)
         // before the unmount sequence, on the eject thread itself.
         let library = self.library.take();
@@ -806,15 +873,21 @@ impl PodlibApp {
                         Path::new("/sys/dev/block"),
                         &mounts,
                     );
-                    device::run_sequence(&steps).map_err(|error| error.to_string())?;
-                    // Power-off under sudo, strictly after the drain.
-                    let output = device::run_sudo_command(&password, &power_off)
-                        .map_err(|error| error.to_string())?;
-                    drop(password);
-                    if !output.status.success() {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        return Err(format!("шаг power-off (udisksctl): {}", stderr.trim()));
+                    // Same loop shape as the connect flow: each step
+                    // under sudo, fail fast on the exit status, honest
+                    // stderr in the message. WHY password lives across
+                    // the whole loop: every sudo step consumes its own
+                    // copy from stdin; it is dropped only after the
+                    // last step, never stored anywhere.
+                    for spec in steps.iter().chain(std::iter::once(&power_off)) {
+                        let output = device::run_sudo_command(&password, spec)
+                            .map_err(|error| device::shutdown_step_error(spec, &error.to_string()))?;
+                        if !output.status.success() {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            return Err(device::shutdown_step_error(spec, &stderr));
+                        }
                     }
+                    drop(password);
                     Ok(())
                 },
                 |message| format!("внутренняя ошибка: {message}"),
@@ -1443,8 +1516,12 @@ impl PodlibApp {
     fn guard_close_request(&mut self, ui: &egui::Ui) {
         let close_requested = ui.input(|input| input.viewport().close_requested());
         let operation_active = self.busy || self.library_busy();
-        if close_decision(close_requested, operation_active, self.force_close)
-            == CloseDecision::BlockWithConfirm
+        if close_decision(
+            close_requested,
+            operation_active,
+            self.force_close,
+            self.mounted_by_us,
+        ) == CloseDecision::BlockWithConfirm
         {
             // CancelClose must be sent during this frame, or eframe exits.
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1495,8 +1572,26 @@ impl PodlibApp {
         if decision == PasswordModal::Confirmed {
             self.start_eject = true;
         }
+        // Batch F: cancelling the eject also cancels the close that asked
+        // for it — the window stays, and the deferred path cannot re-open
+        // this modal every idle frame.
+        if decision == PasswordModal::Cancelled && self.pending_close_after_eject {
+            self.pending_close_after_eject = false;
+        }
         if decision != PasswordModal::Open {
             self.confirm_eject = false;
+        }
+    }
+
+    /// A close requested mid-operation (round 5.3) fires its eject as soon
+    /// as the app goes idle again. Batch F (round 6.1 F3): the eject opens
+    /// the shared password modal instead of starting directly — the direct
+    /// start ran sudo on an empty password. Opening is harmless while the
+    /// modal is already up; cancellation clears `pending_close_after_eject`
+    /// (see `maybe_eject_modal`), so the prompt cannot loop.
+    fn maybe_deferred_close_eject(&mut self) {
+        if deferred_eject_due(self.pending_close_after_eject, self.busy, self.library_idle()) {
+            self.confirm_eject = true;
         }
     }
 
@@ -1508,12 +1603,20 @@ impl PodlibApp {
             return;
         }
         let mut confirmed = false;
+        let (title, body) = close_confirm_texts(self.busy || self.library_busy());
         let response = egui::Modal::new(egui::Id::unique("confirm_close")).show(ctx, |ui| {
             ui.set_width(440.0);
-            ui.heading("Идёт операция с библиотекой");
+            ui.heading(title);
             ui.add_space(4.0);
-            ui.label("Закрыть всё равно? Возможно повреждение базы на устройстве.");
+            ui.label(body);
             ui.separator();
+            // Enter confirms the primary action («Закрыть») at the
+            // input level, regardless of focus — the same pattern as
+            // the password modal (round 6.1 F3).
+            if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                confirmed = true;
+                ui.close();
+            }
             ui.horizontal(|ui| {
                 if ui.button("Отмена").clicked() {
                     ui.close();
@@ -1528,20 +1631,26 @@ impl PodlibApp {
             self.confirm_close = false;
         }
         if confirmed {
-            // Round 5.3: a device mounted by this app run is unmounted
-            // before the window closes (the owner's requirement); a
-            // busy worker defers the eject until the app goes idle.
-            match close_confirmation_action(self.mounted_by_us) {
-                CloseAction::EjectFirst => {
-                    self.pending_close_after_eject = true;
-                    if deferred_eject_due(true, self.busy, self.library_idle()) {
-                        self.start_eject = true;
-                    }
+            self.apply_close_confirmation(ctx);
+        }
+    }
+
+    /// What a confirmed window close does (round 5.3): a device mounted
+    /// by this app run is ejected first — through the password modal
+    /// (batch F), never a direct start with an empty password; a busy
+    /// worker defers the eject until the app goes idle. Anything else
+    /// closes immediately.
+    fn apply_close_confirmation(&mut self, ctx: &egui::Context) {
+        match close_confirmation_action(self.mounted_by_us) {
+            CloseAction::EjectFirst => {
+                self.pending_close_after_eject = true;
+                if deferred_eject_due(true, self.busy, self.library_idle()) {
+                    self.confirm_eject = true;
                 }
-                CloseAction::CloseNow => {
-                    self.force_close = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+            }
+            CloseAction::CloseNow => {
+                self.force_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
     }
@@ -1596,6 +1705,13 @@ impl PodlibApp {
                 .weak(),
             );
             ui.separator();
+            // Enter confirms the primary action («Удалить») at the
+            // input level, regardless of focus — the same pattern as
+            // the password modal (round 6.1 F3).
+            if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                confirmed = true;
+                ui.close();
+            }
             ui.horizontal(|ui| {
                 if ui.button("Отмена").clicked() {
                     ui.close();
@@ -1657,6 +1773,13 @@ impl PodlibApp {
                 ui.add_space(4.0);
                 ui.label("Сами треки останутся в библиотеке.");
                 ui.separator();
+                // Enter confirms the primary action («Удалить») at the
+                // input level, regardless of focus — the same pattern as
+                // the password modal (round 6.1 F3).
+                if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    confirmed = true;
+                    ui.close();
+                }
                 ui.horizontal(|ui| {
                     if ui.button("Отмена").clicked() {
                         ui.close();
@@ -3849,12 +3972,17 @@ fn password_modal(
 }
 
 /// Worker-thread body: run the sudo mount sequence (`mkdir -p`, then
-/// rw-mount) and report the mount point plus whether THIS run actually
-/// performed the mount (round 5.3: an already-mounted target is skipped
-/// — idempotent connect — and then the mount is not ours, so closing
-/// the app must not unmount it). The library is NOT opened here:
-/// `Box<dyn LibraryBackend>` is not `Send`, so it is opened on the library
-/// worker thread instead (see library.rs).
+/// rw-mount) and report the mount point plus whether this app run is
+/// now responsible for the safe unmount. Round 5.3: an already-mounted
+/// target is skipped (idempotent connect). Batch F: such a mount is
+/// ADOPTED (`mounted_by_us = true`) — the old «not ours, do not
+/// unmount» semantics left mounts orphaned by a podlib restart or
+/// crash mounted rw forever (live incident). Foreign mounts the owner
+/// connected to deliberately are adopted too — the price of keeping
+/// this simple; ejecting them on close is accepted by the owner.
+/// The library is NOT opened here: `Box<dyn LibraryBackend>` is not
+/// `Send`, so it is opened on the library worker thread instead (see
+/// library.rs).
 fn connect_device(
     password: String, // owned: dropped right after the last command (W3)
     steps: Vec<device::CommandSpec>,
@@ -3865,16 +3993,20 @@ fn connect_device(
     // consumes its own copy from stdin; it is dropped only after the
     // last step, never stored anywhere.
     // Idempotent mount (round 5.3): /proc/mounts decides whether the
-    // target is already ours (skip the mount step — and remember the
-    // mount is NOT ours, so closing will not unmount it), mounted from
-    // another device (honest refusal), or free (mount as usual).
+    // target is already mounted (skip the mount step — and ADOPT it:
+    // batch F reports mounted_by_us=true so closing ejects it; the old
+    // «not ours» semantics left restart-orphaned mounts rw forever),
+    // mounted from another device (honest refusal), or free (mount as
+    // usual).
     let mounts = std::fs::read_to_string("/proc/mounts")
         .map(|content| device::parse_proc_mounts(&content))
         .unwrap_or_default();
     match device::decide_mount(&mounts, &block_dev, &mount_path) {
         device::MountDecision::AlreadyMounted => {
             drop(password);
-            return Ok((mount_path, false));
+            // Batch F (adoption): connecting to an already-mounted
+            // volume makes its safe unmount this app's responsibility.
+            return Ok((mount_path, true));
         }
         device::MountDecision::ConflictsWith(other) => {
             drop(password);
@@ -3920,10 +4052,9 @@ impl eframe::App for PodlibApp {
         self.guard_close_request(ui);
         self.collect_dropped_files(ui);
         // A close requested mid-operation ejects the device as soon as
-        // the app becomes idle (round 5.3).
-        if deferred_eject_due(self.pending_close_after_eject, self.busy, self.library_idle()) {
-            self.start_eject = true;
-        }
+        // the app becomes idle (round 5.3) — through the shared password
+        // modal (batch F), never by starting the sequence directly.
+        self.maybe_deferred_close_eject();
         // A selected view deleted from the device falls back to the
         // master view (checked once per frame, before panels).
         if let Some(library) = self.library.as_mut() {
@@ -4358,7 +4489,13 @@ mod tests {
         assert!(app.connected.is_some(), "failed eject keeps the device");
         let error = app.error.expect("eject failure must be shown");
         assert!(error.hint.is_some());
-        assert!(error.hint.unwrap().contains("заново"));
+        // Batch F: the generic hint now offers the safe retry instead of
+        // pushing the user to reconnect.
+        let hint = error.hint.unwrap();
+        assert!(
+            hint.contains("ещё раз") && hint.contains("безопасна"),
+            "got: {hint}"
+        );
     }
 
     // ---- busy-worker refusal and menu gate (F2 / P2) ----
@@ -4469,34 +4606,75 @@ mod tests {
     #[test]
     fn close_while_idle_closes_without_confirm() {
         assert_eq!(
-            close_decision(true, false, false),
+            close_decision(true, false, false, false),
             CloseDecision::Allow,
-            "idle window closes as usual"
+            "idle window without our mount closes as usual"
         );
     }
 
     #[test]
     fn close_while_operation_active_blocks_and_asks() {
         assert_eq!(
-            close_decision(true, true, false),
+            close_decision(true, true, false, false),
             CloseDecision::BlockWithConfirm,
             "mid-operation close must not kill the worker thread"
+        );
+    }
+
+    /// Batch F: an idle close with a device mounted by this app must ask
+    /// before closing — the round 5.3 eject needs the sudo password and
+    /// must never run silently.
+    #[test]
+    fn close_while_idle_with_our_mount_blocks_and_asks() {
+        assert_eq!(
+            close_decision(true, false, false, true),
+            CloseDecision::BlockWithConfirm,
+            "our mount must be ejected before the window closes"
+        );
+        // Without the mount the same idle close stays a plain Allow.
+        assert_eq!(
+            close_decision(true, false, false, false),
+            CloseDecision::Allow,
+            "not-our-device close behaviour is unchanged"
         );
     }
 
     #[test]
     fn confirmed_close_passes_through_even_while_busy() {
         assert_eq!(
-            close_decision(true, true, true),
+            close_decision(true, true, true, false),
             CloseDecision::Allow,
             "the user already chose to close: no confirm loop"
+        );
+        assert_eq!(
+            close_decision(true, true, true, true),
+            CloseDecision::Allow,
+            "a confirmed close is not re-asked even with our mount"
         );
     }
 
     #[test]
     fn no_close_request_is_a_noop() {
-        assert_eq!(close_decision(false, true, false), CloseDecision::Allow);
-        assert_eq!(close_decision(false, false, true), CloseDecision::Allow);
+        assert_eq!(close_decision(false, true, false, true), CloseDecision::Allow);
+        assert_eq!(close_decision(false, false, true, true), CloseDecision::Allow);
+    }
+
+    /// Batch F: the idle+mounted case now reaches the confirm modal too,
+    /// so its text must not claim an operation is in flight.
+    #[test]
+    fn close_confirm_texts_are_honest_for_idle_mount() {
+        let (busy_title, _) = close_confirm_texts(true);
+        let (idle_title, idle_body) = close_confirm_texts(false);
+        assert_eq!(busy_title, "Идёт операция с библиотекой");
+        assert_ne!(idle_title, busy_title, "idle close is not an operation");
+        assert!(
+            idle_body.contains("безопасно отключено"),
+            "idle text must say the device is ejected, got: {idle_body}"
+        );
+        assert!(
+            idle_body.contains("пароль"),
+            "idle text must warn about the sudo password, got: {idle_body}"
+        );
     }
 
     // ---- close = safe unmount for app-created mounts (round 5.3 Ф3) ----
@@ -5213,6 +5391,370 @@ mod tests {
         password_modal_frame(&mut app, &ctx, vec![escape_pressed()]);
         assert!(!app.confirm_eject, "Esc closes the modal");
         assert!(!app.start_eject, "Esc does not start the eject");
+    }
+
+    // ---- batch F: EVERY eject collects the password through the modal ----
+
+    /// Live bug: a confirmed window close (round 5.3, mounted by us)
+    /// started the eject directly, bypassing the password modal, and the
+    /// first sudo step failed with an empty password. The close path must
+    /// open the shared modal instead.
+    #[test]
+    fn close_confirm_with_mount_opens_password_modal_before_eject() {
+        let (mut app, _dir) = app_with_open_library();
+        app.mounted_by_us = true;
+        app.confirm_close = true;
+        let ctx = egui::Context::default();
+        confirm_modal_frame(&mut app, &ctx, Vec::new()); // open
+        confirm_modal_frame(&mut app, &ctx, vec![enter_pressed()]);
+        assert!(!app.confirm_close, "modal must close on Enter");
+        assert!(
+            app.confirm_eject,
+            "the eject must ask for the password (modal open)"
+        );
+        assert!(
+            !app.start_eject,
+            "the eject must not start before the password is entered"
+        );
+        assert!(
+            app.pending_close_after_eject,
+            "the window still closes after the eject lands"
+        );
+    }
+
+    /// Cancelling the eject password modal also cancels the close that
+    /// asked for it: the window stays, nothing restarts.
+    #[test]
+    fn cancel_eject_password_modal_cancels_pending_close() {
+        let mut app = test_app();
+        app.pending_close_after_eject = true;
+        app.confirm_eject = true;
+        let ctx = egui::Context::default();
+        password_modal_frame(&mut app, &ctx, Vec::new()); // open
+        password_modal_frame(&mut app, &ctx, vec![escape_pressed()]);
+        assert!(!app.confirm_eject, "Esc closes the modal");
+        assert!(!app.start_eject, "Esc does not start the eject");
+        assert!(
+            !app.pending_close_after_eject,
+            "a cancelled eject must not keep the window waiting to close"
+        );
+    }
+
+    /// Live bug, second half: a failed eject kept `pending_close_after_eject`
+    /// set, so the deferred path restarted the (empty-password) eject every
+    /// idle frame. The failure must cancel the pending close.
+    #[test]
+    fn ejected_error_cancels_pending_close() {
+        let (mut app, _dir) = app_with_open_library();
+        app.library = None; // spawn_eject closes the library before the steps
+        app.connected = Some(ConnectedDevice {
+            block_dev: PathBuf::from("/dev/test"),
+            label: "test".to_owned(),
+        });
+        app.pending_close_after_eject = true;
+        let (tx, rx) = channel();
+        tx.send(DeviceEvent::Ejected(Err("sudo failed".to_owned()))).unwrap();
+        app.rx = Some(rx);
+        app.drain_events();
+        assert!(
+            !app.pending_close_after_eject,
+            "a failed eject must cancel the pending window close"
+        );
+        assert!(
+            !app.start_eject,
+            "the deferred path must not immediately restart the eject"
+        );
+    }
+
+    // ---- batch F: a failed eject must allow a retry ----
+
+    /// Live bug: after a failed eject the library worker is closed
+    /// (`library = None`), and `library_idle()` returned false for None —
+    /// so «Безопасно отключить» stayed disabled forever. No library means
+    /// nothing is in flight.
+    #[test]
+    fn library_idle_is_true_without_a_library() {
+        let app = test_app();
+        assert!(app.library.is_none());
+        assert!(
+            app.library_idle(),
+            "no library means nothing is in flight"
+        );
+    }
+
+    #[test]
+    fn library_idle_with_pending_operation_is_false() {
+        let (mut app, _dir) = app_with_open_library();
+        let (_tx, rx) = channel();
+        app.library.as_mut().unwrap().pending = Some((PendingKind::Refresh, rx));
+        assert!(!app.library_idle(), "an in-flight operation is not idle");
+    }
+
+    /// Live run: wrong sudo password → eject fails → the button must be
+    /// ready again (the library is already closed) and the hint must
+    /// explain the retry is safe and point at the layout/Caps Lock.
+    #[test]
+    fn wrong_password_eject_failure_offers_retry() {
+        let (mut app, _dir) = app_with_open_library();
+        app.library = None; // spawn_eject closed it before the sudo steps
+        app.connected = Some(ConnectedDevice {
+            block_dev: PathBuf::from("/dev/test"),
+            label: "test".to_owned(),
+        });
+        let (tx, rx) = channel();
+        tx.send(DeviceEvent::Ejected(Err(
+            "sudo: 1 incorrect password attempt".to_owned(),
+        )))
+        .unwrap();
+        app.rx = Some(rx);
+        app.drain_events();
+        let ready = !app.busy && app.library_idle(); // app_bar gating
+        assert!(ready, "the eject button must be available again");
+        let error = app.error.as_ref().expect("failure must be shown");
+        let hint = error.hint.as_ref().expect("retry hint must be shown");
+        assert!(
+            hint.contains("раскладку"),
+            "wrong-password hint must mention the layout, got: {hint}"
+        );
+        assert!(
+            hint.contains("ещё раз"),
+            "wrong-password hint must offer a retry, got: {hint}"
+        );
+    }
+
+    /// A non-password eject failure keeps the honest «volume may still be
+    /// mounted» wording but must also offer the safe retry.
+    #[test]
+    fn other_eject_failure_hint_mentions_retry() {
+        let (mut app, _dir) = app_with_open_library();
+        app.library = None;
+        app.connected = Some(ConnectedDevice {
+            block_dev: PathBuf::from("/dev/test"),
+            label: "test".to_owned(),
+        });
+        let (tx, rx) = channel();
+        tx.send(DeviceEvent::Ejected(Err("umount: target is busy".to_owned())))
+            .unwrap();
+        app.rx = Some(rx);
+        app.drain_events();
+        let error = app.error.as_ref().expect("failure must be shown");
+        let hint = error.hint.as_ref().expect("retry hint must be shown");
+        assert!(
+            hint.contains("ещё раз") && hint.contains("безопасна"),
+            "generic hint must offer the safe retry, got: {hint}"
+        );
+        assert!(
+            !hint.contains("раскладку"),
+            "layout wording is only for sudo-auth failures, got: {hint}"
+        );
+    }
+
+    /// Full retry path: after the failed eject (library None) the owner
+    /// presses «Безопасно отключить» again, enters the password, and the
+    /// second eject starts.
+    #[test]
+    fn failed_eject_allows_full_retry() {
+        let (mut app, _dir) = app_with_open_library();
+        app.library = None;
+        app.connected = Some(ConnectedDevice {
+            block_dev: PathBuf::from("/dev/test"),
+            label: "test".to_owned(),
+        });
+        let (tx, rx) = channel();
+        tx.send(DeviceEvent::Ejected(Err(
+            "sudo: 1 incorrect password attempt".to_owned(),
+        )))
+        .unwrap();
+        app.rx = Some(rx);
+        app.drain_events();
+        // The app-bar press: only possible when the button is enabled.
+        assert!(
+            !app.busy && app.library_idle(),
+            "the eject button must be enabled for the retry"
+        );
+        app.password.clear();
+        app.confirm_eject = true;
+        let ctx = egui::Context::default();
+        password_modal_frame(&mut app, &ctx, Vec::new()); // open + autofocus
+        app.password = "right-pass".to_owned();
+        password_modal_frame(&mut app, &ctx, vec![enter_pressed()]);
+        assert!(
+            app.start_eject,
+            "the retried eject must start from the password modal"
+        );
+        assert!(!app.confirm_eject, "the modal closed on confirm");
+    }
+
+    /// The deferred path (close confirmed while busy) opens the password
+    /// modal when the app goes idle; repeated frames keep the modal open
+    /// without ever starting the eject behind the user's back.
+    #[test]
+    fn deferred_close_eject_goes_through_password_modal() {
+        let (mut app, _dir) = app_with_open_library();
+        app.pending_close_after_eject = true;
+        let ctx = egui::Context::default();
+        // Frame 1: the app goes idle → the deferred path opens the modal.
+        app.maybe_deferred_close_eject();
+        password_modal_frame(&mut app, &ctx, Vec::new());
+        assert!(app.confirm_eject, "idle → the password modal opens");
+        assert!(!app.start_eject, "no direct eject start");
+        assert!(app.pending_close_after_eject, "the close is still pending");
+        // Frame 2: the deferred path fires again while the modal is up —
+        // it must stay a no-op, not duplicate or start anything.
+        app.maybe_deferred_close_eject();
+        password_modal_frame(&mut app, &ctx, Vec::new());
+        assert!(app.confirm_eject, "the modal is still open");
+        assert!(!app.start_eject, "still no direct eject start");
+    }
+
+    /// Live bug: closing the window by a WM hotkey while idle (no
+    /// operation in flight) with a device mounted by this app closed
+    /// instantly — no confirm, no eject, the volume stayed mounted rw.
+    /// The close guard must ask first, and the confirm must lead into
+    /// the password modal (batch F), never a direct eject.
+    #[test]
+    fn idle_close_with_our_mount_asks_and_ejects_through_password() {
+        let (mut app, _dir) = app_with_open_library();
+        app.mounted_by_us = true;
+        let ctx = egui::Context::default();
+        // Frame 1: the WM close request arrives while the app is idle.
+        let mut viewports = egui::ViewportIdMap::default();
+        viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                events: vec![egui::ViewportEvent::Close],
+                ..Default::default()
+            },
+        );
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            viewports,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            ui.style_mut().animation_time = 0.0;
+            app.guard_close_request(ui);
+            let ctx = ui.ctx().clone();
+            app.maybe_close_confirm_modal(&ctx);
+        });
+        output.textures_delta.clear();
+        let cancelled = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .is_some_and(|viewport| {
+                viewport.commands.contains(&egui::ViewportCommand::CancelClose)
+            });
+        assert!(
+            cancelled,
+            "the close must be cancelled this frame, or eframe exits"
+        );
+        assert!(app.confirm_close, "idle close with our mount must ask");
+        assert!(!app.force_close, "the window must not close silently");
+        assert!(
+            !app.start_eject,
+            "no eject without the user's password"
+        );
+        // Frame 2: the user confirms — the eject goes through the
+        // password modal (batch F), the window stays pending.
+        confirm_modal_frame(&mut app, &ctx, vec![enter_pressed()]);
+        assert!(!app.confirm_close, "modal must close on Enter");
+        assert!(
+            app.confirm_eject,
+            "confirming the close opens the password modal"
+        );
+        assert!(app.pending_close_after_eject, "the window waits for the eject");
+        assert!(!app.start_eject, "the eject still waits for the password");
+    }
+
+    // ---- round 6.2 D2: Enter in the confirm modals ----
+
+    /// Runs one headless frame through the confirm modals (the same
+    /// order as the production `ui()`), feeding extra input events.
+    fn confirm_modal_frame(app: &mut PodlibApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            ui.style_mut().animation_time = 0.0;
+            let ctx = ui.ctx().clone();
+            app.maybe_close_confirm_modal(&ctx);
+            app.maybe_delete_track_modal(&ctx);
+            app.maybe_delete_playlist_modal(&ctx);
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn close_confirm_modal_enter_confirms() {
+        let mut app = test_app();
+        app.confirm_close = true;
+        let ctx = egui::Context::default();
+        confirm_modal_frame(&mut app, &ctx, Vec::new()); // open
+        assert!(app.confirm_close, "still open before Enter");
+        confirm_modal_frame(&mut app, &ctx, vec![enter_pressed()]);
+        assert!(!app.confirm_close, "modal must close on Enter");
+        assert!(app.force_close, "Enter confirms the close (no own mount)");
+    }
+
+    #[test]
+    fn delete_track_modal_enter_confirms() {
+        let (mut app, _dir) = app_with_open_library();
+        let track_id = app.library.as_ref().unwrap().snapshot.tracks[0].id;
+        app.library.as_mut().unwrap().confirm_delete_track = Some(vec![track_id]);
+        let ctx = egui::Context::default();
+        confirm_modal_frame(&mut app, &ctx, Vec::new()); // open
+        confirm_modal_frame(&mut app, &ctx, vec![enter_pressed()]);
+        let library = app.library.as_ref().unwrap();
+        assert!(
+            library.confirm_delete_track.is_none(),
+            "modal must close on Enter"
+        );
+        assert!(
+            matches!(library.pending, Some((PendingKind::RemoveTrack, _))),
+            "Enter confirms the primary action «Удалить»"
+        );
+        assert!(library.delete_queue.is_empty(), "single track: no queue");
+    }
+
+    #[test]
+    fn delete_track_modal_esc_cancels() {
+        // Esc already worked via should_close; the Enter addition must
+        // not break it.
+        let (mut app, _dir) = app_with_open_library();
+        let track_id = app.library.as_ref().unwrap().snapshot.tracks[0].id;
+        app.library.as_mut().unwrap().confirm_delete_track = Some(vec![track_id]);
+        let ctx = egui::Context::default();
+        confirm_modal_frame(&mut app, &ctx, Vec::new()); // open
+        confirm_modal_frame(&mut app, &ctx, vec![escape_pressed()]);
+        let library = app.library.as_ref().unwrap();
+        assert!(library.confirm_delete_track.is_none(), "Esc closes");
+        assert!(library.pending.is_none(), "Esc dispatches nothing");
+    }
+
+    #[test]
+    fn delete_playlist_modal_enter_confirms() {
+        let (mut app, _dir) = app_with_open_library();
+        app.library.as_mut().unwrap().confirm_delete_playlist = Some(PlaylistId::from_bits(1));
+        let ctx = egui::Context::default();
+        confirm_modal_frame(&mut app, &ctx, Vec::new()); // open
+        confirm_modal_frame(&mut app, &ctx, vec![enter_pressed()]);
+        let library = app.library.as_ref().unwrap();
+        assert!(
+            library.confirm_delete_playlist.is_none(),
+            "modal must close on Enter"
+        );
+        assert!(
+            matches!(library.pending, Some((PendingKind::DeletePlaylist, _))),
+            "Enter confirms the primary action «Удалить»"
+        );
     }
 
     #[test]

@@ -955,6 +955,22 @@ mod tests {
         rx.recv_timeout(TIMEOUT).expect("worker must reply")
     }
 
+    /// Polls until the worker refuses commands, returning the refusal
+    /// message. The worker thread exits right AFTER its final reply
+    /// (`Failed` outcome / `Closed`), and `request()` turns Err only
+    /// once that thread has actually dropped the receiver — polling
+    /// instead of racing the exit keeps these tests deterministic.
+    fn wait_until_refusing(worker: &LibraryWorker) -> Option<String> {
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        loop {
+            match worker.request(LibraryCommand::Refresh) {
+                Err(message) => return Some(message),
+                Ok(_) if std::time::Instant::now() >= deadline => return None,
+                Ok(_) => std::thread::sleep(Duration::from_millis(2)),
+            }
+        }
+    }
+
     fn applied_snapshot(outcome: LibraryOutcome) -> LibrarySnapshot {
         match outcome {
             LibraryOutcome::Applied { snapshot, .. } => snapshot,
@@ -1779,8 +1795,8 @@ mod tests {
         }
         assert!(
             matches!(
-                worker.request(LibraryCommand::Refresh),
-                Err(message) if message.contains("не активен")
+                wait_until_refusing(&worker),
+                Some(message) if message.contains("не активен")
             ),
             "worker must refuse commands after Close"
         );
@@ -1797,7 +1813,10 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
-        assert!(worker.request(LibraryCommand::Refresh).is_err());
+        assert!(
+            wait_until_refusing(&worker).is_some(),
+            "worker must refuse commands after a failed open"
+        );
     }
 
     // ---- panic isolation (mock backend; F1) ----

@@ -578,3 +578,320 @@ fn removing_an_audiobook_end_to_end() {
     assert!(!media_path.exists(), "removed media not deleted");
 }
 
+/// Nano 7G artwork formats as (format_id, slot_bytes), mirroring the
+/// device profile that drives every artwork staging decision.
+fn nano7g_artwork_formats() -> Vec<(u32, u32)> {
+    vec![(1010, 115_200), (1013, 5_000), (1015, 6_728), (1016, 6_612)]
+}
+
+/// Serializes one `mhii` artwork record with a format child per entry,
+/// shaped exactly as the `crate::artwork` parser reads them. Format
+/// children point at `record_index * slot_bytes` (byte offsets, as Apple
+/// writes them) inside their `.ithmb` files.
+fn artwork_record(pid: u64, image_id: u32, record_index: u32, formats: &[(u32, u32)]) -> Vec<u8> {
+    let mut children = Vec::new();
+    for &(format_id, slot_bytes) in formats {
+        let name = format!(":F{format_id}_1.ithmb");
+        let name_len = name.len() as u32;
+        let byte_offset = record_index * slot_bytes;
+        // mhni: 48-byte header plus one filename mhod child
+        // (16-byte header + 12-byte body lead + payload).
+        let mhni_len = 48 + 16 + 12 + name.len();
+        let mhod_len = 24 + mhni_len;
+        let mut mhod = Vec::new();
+        mhod.extend_from_slice(b"mhod");
+        mhod.extend_from_slice(&24_u32.to_le_bytes());
+        mhod.extend_from_slice(&(mhod_len as u32).to_le_bytes());
+        mhod.extend_from_slice(&2_u32.to_le_bytes()); // type: artwork payload
+        mhod.resize(24, 0); // children start at the declared header length
+        let mut mhni = vec![0_u8; 48];
+        mhni[..4].copy_from_slice(b"mhni");
+        mhni[4..8].copy_from_slice(&48_u32.to_le_bytes());
+        mhni[8..12].copy_from_slice(&(mhni_len as u32).to_le_bytes());
+        mhni[16..20].copy_from_slice(&format_id.to_le_bytes());
+        mhni[20..24].copy_from_slice(&byte_offset.to_le_bytes()); // ithmb offset (bytes)
+        mhni[24..28].copy_from_slice(&slot_bytes.to_le_bytes());
+        mhni[32..34].copy_from_slice(&0_u16.to_le_bytes()); // height
+        mhni[34..36].copy_from_slice(&0_u16.to_le_bytes()); // width
+        let mut filename = Vec::new();
+        filename.extend_from_slice(b"mhod");
+        filename.extend_from_slice(&16_u32.to_le_bytes());
+        filename.extend_from_slice(&((16 + 12 + name.len()) as u32).to_le_bytes());
+        filename.extend_from_slice(&0_u32.to_le_bytes());
+        filename.extend_from_slice(&name_len.to_le_bytes());
+        filename.push(1); // encoding: UTF-8
+        filename.extend_from_slice(&[0_u8; 7]);
+        filename.extend_from_slice(name.as_bytes());
+        mhni.extend_from_slice(&filename);
+        mhod.extend_from_slice(&mhni);
+        children.extend_from_slice(&mhod);
+    }
+    let mut mhii = vec![0_u8; 92];
+    mhii[..4].copy_from_slice(b"mhii");
+    mhii[4..8].copy_from_slice(&92_u32.to_le_bytes());
+    mhii[8..12].copy_from_slice(&((92 + children.len()) as u32).to_le_bytes());
+    mhii[12..16].copy_from_slice(&(formats.len() as u32).to_le_bytes());
+    mhii[16..20].copy_from_slice(&image_id.to_le_bytes());
+    mhii[20..28].copy_from_slice(&pid.to_le_bytes());
+    mhii[48..52].copy_from_slice(&1_234_567_u32.to_le_bytes()); // src_img_size
+    mhii.extend_from_slice(&children);
+    mhii
+}
+
+/// Serializes a minimal `mhfd` ArtworkDB holding one record per pid.
+fn artwork_database(pids: &[u64], formats: &[(u32, u32)]) -> Vec<u8> {
+    let mut list = Vec::new();
+    for (index, pid) in pids.iter().enumerate() {
+        list.extend_from_slice(&artwork_record(
+            *pid,
+            100 + index as u32,
+            index as u32, // one slot per record, byte offsets derived inside
+            formats,
+        ));
+    }
+    let mut mhli = Vec::new();
+    mhli.extend_from_slice(b"mhli");
+    mhli.extend_from_slice(&24_u32.to_le_bytes());
+    // Unlike mhii/mhod, mhli carries its record count at +8 (the parser
+    // walks records by their own totals; the mhsd total bounds the list).
+    mhli.extend_from_slice(&(pids.len() as u32).to_le_bytes());
+    mhli.resize(24, 0); // records start at the declared header length
+    mhli.extend_from_slice(&list);
+    let mut mhsd = Vec::new();
+    mhsd.extend_from_slice(b"mhsd");
+    mhsd.extend_from_slice(&24_u32.to_le_bytes());
+    mhsd.extend_from_slice(&((24 + mhli.len()) as u32).to_le_bytes());
+    mhsd.extend_from_slice(&1_u32.to_le_bytes()); // dataset kind: mhli artwork list
+    mhsd.resize(24, 0); // the list starts at the declared header length
+    mhsd.extend_from_slice(&mhli);
+    let mut mhbd = vec![0_u8; 132];
+    mhbd[..4].copy_from_slice(b"mhfd");
+    mhbd[4..8].copy_from_slice(&132_u32.to_le_bytes());
+    mhbd[8..12].copy_from_slice(&((132 + mhsd.len()) as u32).to_le_bytes());
+    mhbd[20..24].copy_from_slice(&1_u32.to_le_bytes()); // dataset count
+    mhbd[28..32].copy_from_slice(&10_000_u32.to_le_bytes()); // next image id
+    mhbd.extend_from_slice(&mhsd);
+    mhbd
+}
+
+/// Plants deterministic artwork storage on a fixture copy: two-slot
+/// `.ithmb` files (slot fill byte = format_index * 10 + slot_no) plus an
+/// ArtworkDB holding one record per pid.
+fn install_artwork_storage(device_dir: &Path, pids: &[u64]) {
+    let formats = nano7g_artwork_formats();
+    let artwork_dir = device_dir.join("iPod_Control/Artwork");
+    fs::create_dir_all(&artwork_dir).unwrap();
+    for (format_index, &(format_id, slot_bytes)) in formats.iter().enumerate() {
+        let slot = slot_bytes as usize;
+        let mut file = vec![0_u8; 2 * slot];
+        for slot_no in 0..2_usize {
+            let fill = (format_index * 10 + slot_no) as u8;
+            for byte in &mut file[slot_no * slot..(slot_no + 1) * slot] {
+                *byte = fill;
+            }
+        }
+        fs::write(artwork_dir.join(format!("F{format_id}_1.ithmb")), file).unwrap();
+    }
+    fs::write(artwork_dir.join("ArtworkDB"), artwork_database(pids, &formats)).unwrap();
+}
+
+/// Lowest stable music pids of the fixture (audiobooks excluded).
+fn first_music_pids(count: usize) -> Vec<i64> {
+    let con = read_only(&library_path(&fixture_root()));
+    let mut statement = con
+        .prepare("SELECT pid FROM item WHERE media_kind != 8 ORDER BY pid LIMIT ?")
+        .unwrap();
+    statement
+        .query_map([count as i64], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+/// Media file path of a fixture item, with its parent directories and a
+/// deterministic payload in place (Locations.itdb carries a row per item).
+fn plant_victim_media(device_dir: &Path, pid: i64) -> PathBuf {
+    let location: String = {
+        let locations = read_only(
+            &device_dir.join("iPod_Control/iTunes/iTunes Library.itlp/Locations.itdb"),
+        );
+        locations
+            .query_row(
+                "SELECT location FROM location WHERE item_pid = ?",
+                [pid],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let media_path = device_dir.join("iPod_Control/Music").join(&location);
+    fs::create_dir_all(media_path.parent().unwrap()).unwrap();
+    fs::write(&media_path, format!("{pid} media bytes")).unwrap();
+    media_path
+}
+
+fn item_row_count(library: &Path, pid: i64) -> i64 {
+    let con = read_only(library);
+    let mut statement = con
+        .prepare("SELECT COUNT(*) FROM item WHERE pid = ?")
+        .unwrap();
+    statement.query_row([pid], |row| row.get(0)).unwrap()
+}
+
+#[test]
+fn removing_a_flagged_track_without_an_artwork_record_installs() {
+    // Live nano7g regression (19.11.2026): Apple libraries set
+    // artwork_status far more widely than they cache ArtworkDB records
+    // (the sanitized fixture carries the flag on all 845 items). Removing
+    // a flagged track that holds NO record used to predict artwork
+    // outputs the staging writer never produces, and install verification
+    // failed with "bundle profile, operation, or output count is
+    // inconsistent". Artwork accounting must key on records, not flags.
+    let device_dir = copy_fixture();
+    for index in 0..20 {
+        fs::create_dir_all(
+            device_dir
+                .path()
+                .join(format!("iPod_Control/Music/F{index:02}")),
+        )
+        .unwrap();
+    }
+    let pids = first_music_pids(3);
+    let victim_pid = pids[0];
+    install_artwork_storage(
+        device_dir.path(),
+        &[pids[1] as u64, pids[2] as u64],
+    );
+    let media_path = plant_victim_media(device_dir.path(), victim_pid);
+    let artwork_before = {
+        let artwork_dir = device_dir.path().join("iPod_Control/Artwork");
+        let mut files = std::collections::BTreeMap::new();
+        for &(format_id, _) in &nano7g_artwork_formats() {
+            files.insert(
+                format_id,
+                fs::read(artwork_dir.join(format!("F{format_id}_1.ithmb"))).unwrap(),
+            );
+        }
+        files
+    };
+    let artworkdb_before =
+        fs::read(device_dir.path().join("iPod_Control/Artwork/ArtworkDB")).unwrap();
+
+    let device = Device::open(device_dir.path()).unwrap();
+    assert_eq!(device.library().unwrap().track_count(), 811);
+    let mut edit = device.edit().unwrap();
+    edit.set_media_policy(MediaDeletionPolicy::Delete);
+    edit.remove_track(PersistentId::from_bits(victim_pid as u64))
+        .unwrap();
+
+    let bundle = tempdir().unwrap();
+    let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+    let reopened = staged
+        .install_and_open(&device, InstallMode::Full, |_| {})
+        .expect("removal of a flagged record-less track must install");
+    assert_eq!(
+        staged.removed_artwork_tracks(),
+        0,
+        "flags without records must not schedule artwork outputs"
+    );
+    assert!(staged.removed_ithmb().is_empty());
+    assert_eq!(reopened.library().unwrap().track_count(), 810);
+    assert_eq!(
+        item_row_count(&library_path(device_dir.path()), victim_pid),
+        0,
+        "victim item row still present"
+    );
+    assert!(!media_path.exists(), "victim media not deleted");
+    // The donors' artwork storage must survive untouched.
+    let artwork_dir = device_dir.path().join("iPod_Control/Artwork");
+    let records = crate::artwork::parse_artwork_records(
+        &fs::read(artwork_dir.join("ArtworkDB")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(records.len(), 2, "donor artwork records must survive");
+    for &(format_id, _) in nano7g_artwork_formats().iter() {
+        let bytes = fs::read(artwork_dir.join(format!("F{format_id}_1.ithmb"))).unwrap();
+        assert_eq!(
+            bytes,
+            artwork_before[&format_id],
+            "donor ithmb file {format_id} was modified by a record-less removal"
+        );
+    }
+    assert_eq!(
+        fs::read(artwork_dir.join("ArtworkDB")).unwrap(),
+        artworkdb_before,
+        "ArtworkDB was modified by a record-less removal"
+    );
+}
+
+#[test]
+fn removing_an_artwork_record_holder_installs() {
+    // Guard for the record-keyed artwork accounting: a track whose
+    // ArtworkDB record exists must still reindex every referenced file,
+    // and the rewritten ArtworkDB plus all `.ithmb` files must ride the
+    // manifest as outputs (this is the pre-existing, working path).
+    let device_dir = copy_fixture();
+    for index in 0..20 {
+        fs::create_dir_all(
+            device_dir
+                .path()
+                .join(format!("iPod_Control/Music/F{index:02}")),
+        )
+        .unwrap();
+    }
+    let pids = first_music_pids(2);
+    let (victim_pid, keeper_pid) = (pids[0], pids[1]);
+    install_artwork_storage(
+        device_dir.path(),
+        &[victim_pid as u64, keeper_pid as u64],
+    );
+    let media_path = plant_victim_media(device_dir.path(), victim_pid);
+
+    let device = Device::open(device_dir.path()).unwrap();
+    let mut edit = device.edit().unwrap();
+    edit.set_media_policy(MediaDeletionPolicy::Delete);
+    edit.remove_track(PersistentId::from_bits(victim_pid as u64))
+        .unwrap();
+
+    let bundle = tempdir().unwrap();
+    let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+    assert_eq!(staged.removed_artwork_tracks(), 1);
+    assert_eq!(staged.removed_ithmb().len(), nano7g_artwork_formats().len());
+    let reopened = staged
+        .install_and_open(&device, InstallMode::Full, |_| {})
+        .expect("removal of an artwork record holder must install");
+    assert_eq!(reopened.library().unwrap().track_count(), 810);
+    assert!(!media_path.exists(), "victim media not deleted");
+    // The keeper's record survives, repacked to slot 0 with its payload.
+    let artwork_dir = device_dir.path().join("iPod_Control/Artwork");
+    let records = crate::artwork::parse_artwork_records(
+        &fs::read(artwork_dir.join("ArtworkDB")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(records.len(), 1, "keeper artwork record must survive");
+    assert_eq!(
+        records[0].track_id,
+        PersistentId::from_bits(keeper_pid as u64)
+    );
+    for (index, &(format_id, slot_bytes)) in nano7g_artwork_formats().iter().enumerate() {
+        assert_eq!(
+            records[0]
+                .formats
+                .iter()
+                .find(|reference| reference.format_id == format_id)
+                .map(|reference| reference.ithmb_offset),
+            Some(0),
+            "keeper slot not repacked to the front in F{format_id}_1.ithmb"
+        );
+        let bytes = fs::read(artwork_dir.join(format!("F{format_id}_1.ithmb"))).unwrap();
+        assert_eq!(
+            bytes.len(),
+            slot_bytes as usize,
+            "F{format_id}_1.ithmb must shrink to one slot"
+        );
+        let fill = (index * 10 + 1) as u8;
+        assert!(
+            bytes.iter().all(|&byte| byte == fill),
+            "keeper payload bytes not preserved in F{format_id}_1.ithmb"
+        );
+    }
+}

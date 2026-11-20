@@ -27,12 +27,6 @@ impl CommandSpec {
             args: args.iter().map(|arg| (*arg).to_owned()).collect(),
         }
     }
-
-    fn to_command(&self) -> Command {
-        let mut command = Command::new(&self.program);
-        command.args(&self.args);
-        command
-    }
 }
 
 /// A discovered device candidate: either an already-mounted volume
@@ -419,8 +413,11 @@ pub fn build_mount_sequence(spec: &MountSpec) -> Vec<CommandSpec> {
 /// «The drive is in use», which is exactly how the live eject died
 /// (the old drain ran after power-off, behind a `?`, unreachable).
 /// Returns the ordered steps (sync first) and the power-off step
-/// separately — it alone runs under sudo (see [`build_sudo_command`]),
-/// right after the steps, removing the need for a polkit agent.
+/// separately. Round 6.2: ALL of them run under sudo (see
+/// [`build_sudo_command`], one password for the whole shutdown) — the
+/// volume is mounted by us as root, so a user-side unmount would
+/// trigger a polkit dialog (a second password prompt). Power-off stays
+/// strictly last; no polkit agent needed.
 /// `mounts` is the parsed `/proc/mounts` snapshot; the drain is capped
 /// at [`EJECT_DRAIN_LIMIT`] layers. `sys_block_dir` is the injectable
 /// sysfs root used to resolve the whole-disk device — see
@@ -451,6 +448,23 @@ pub fn build_shutdown_steps(
 /// a runaway mount table cannot spin the unmount sequence forever.
 pub const EJECT_DRAIN_LIMIT: usize = 10;
 
+/// Human-readable name of one shutdown step for error messages
+/// («шаг unmount (sudo): …»). The `udisksctl` subcommands are told
+/// apart by argv — both run the same program.
+pub fn shutdown_step_label(spec: &CommandSpec) -> &'static str {
+    match (spec.program.as_str(), spec.args.first().map(String::as_str)) {
+        ("udisksctl", Some("power-off")) => "power-off",
+        ("udisksctl", _) => "unmount",
+        _ => "sync",
+    }
+}
+
+/// Uniform UI-facing failure of one sudo shutdown step: the step name
+/// plus the tool's own stderr (or the spawn error text).
+pub fn shutdown_step_error(spec: &CommandSpec, stderr: &str) -> String {
+    format!("шаг {} (sudo): {}", shutdown_step_label(spec), stderr.trim())
+}
+
 /// Wraps `spec` in `sudo -S -p ''`: the password is read from stdin and
 /// the prompt is empty, keeping stderr clean for error classification.
 /// The password never reaches argv, so it cannot leak via process lists.
@@ -469,10 +483,10 @@ pub fn build_sudo_command(spec: &CommandSpec) -> Command {
 }
 
 /// Runs `spec` under sudo, feeding the password over the stdin pipe.
-/// Shared by the privileged system actions: the mount sequence and the
-/// eject power-off (round 6.1). The password lives only in the child's
-/// memory for the duration of the command; it is never logged,
-/// persisted, or placed in argv.
+/// Shared by every privileged system action: the connect mount
+/// sequence and the whole eject shutdown (round 6.2). The password
+/// lives only in the child's memory for the duration of the command;
+/// it is never logged, persisted, or placed in argv.
 pub fn run_sudo_command(password: &str, spec: &CommandSpec) -> std::io::Result<Output> {
     let mut child = build_sudo_command(spec).spawn()?;
     {
@@ -481,8 +495,14 @@ pub fn run_sudo_command(password: &str, spec: &CommandSpec) -> std::io::Result<O
         let stdin = child.stdin.as_mut().ok_or_else(|| {
             std::io::Error::other("stdin не открыт: build_sudo_command не настроил pipe")
         })?;
-        stdin.write_all(password.as_bytes())?;
-        stdin.write_all(b"\n")?;
+        // The write is best-effort (`let _ =`): in a loop of
+        // back-to-back sudo steps the already-validated password is
+        // cached (sudo timestamp), so a later sudo may exit WITHOUT
+        // reading stdin — our write then fails with EPIPE, which is NOT
+        // a command failure. Success/failure is decided solely by the
+        // exit status checked by the caller.
+        let _ = stdin.write_all(password.as_bytes());
+        let _ = stdin.write_all(b"\n");
     } // stdin dropped → pipe closed → sudo sees EOF
     child.wait_with_output()
 }
@@ -569,42 +589,6 @@ pub fn classify_mount_output(output: &Output) -> Result<(), MountError> {
         MountFailure::AlreadyMounted => MountError::AlreadyMounted,
         MountFailure::Other => MountError::Failed,
     })
-}
-
-/// A failed eject step with the tool's own output for display.
-#[derive(Debug, thiserror::Error)]
-#[error("шаг {step_index} ({program}) завершился с ошибкой: {message}")]
-pub struct SequenceError {
-    pub step_index: usize,
-    pub program: String,
-    pub message: String,
-}
-
-/// Runs steps in order, failing fast. Blocking — execute on a worker
-/// thread, never on the UI thread.
-pub fn run_sequence(steps: &[CommandSpec]) -> Result<(), SequenceError> {
-    for (step_index, step) in steps.iter().enumerate() {
-        let output = step.to_command().output().map_err(|error| SequenceError {
-            step_index,
-            program: step.program.clone(),
-            message: error.to_string(),
-        })?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let message = if stderr.trim().is_empty() {
-                stdout.trim().to_owned()
-            } else {
-                stderr.trim().to_owned()
-            };
-            return Err(SequenceError {
-                step_index,
-                program: step.program.clone(),
-                message,
-            });
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1089,6 +1073,28 @@ mod tests {
         assert_eq!(empty.len(), 1);
         assert_eq!(empty[0].program, "sync");
         assert_eq!(power_off.program, "udisksctl");
+    }
+
+    #[test]
+    fn shutdown_step_errors_are_named_and_uniform() {
+        // Round 6.2: every shutdown step fails with the same
+        // «шаг <name> (sudo): …» shape; udisksctl subcommands are told
+        // apart by argv.
+        let sync = CommandSpec::new("sync", &[]);
+        let unmount = CommandSpec::new("udisksctl", &["unmount", "-b", "/dev/sda2"]);
+        let power_off = CommandSpec::new("udisksctl", &["power-off", "-b", "/dev/sda"]);
+        assert_eq!(shutdown_step_label(&sync), "sync");
+        assert_eq!(shutdown_step_label(&unmount), "unmount");
+        assert_eq!(shutdown_step_label(&power_off), "power-off");
+        assert_eq!(
+            shutdown_step_error(&unmount, "  Error: The drive is in use  "),
+            "шаг unmount (sudo): Error: The drive is in use"
+        );
+        // A spawn failure reuses the same uniform shape.
+        assert_eq!(
+            shutdown_step_error(&power_off, "Нет такого файла или процесса (os error 2)"),
+            "шаг power-off (sudo): Нет такого файла или процесса (os error 2)"
+        );
     }
 
     #[test]

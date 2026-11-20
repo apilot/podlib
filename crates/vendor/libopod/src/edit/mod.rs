@@ -770,17 +770,15 @@ impl<'device> EditSession<'device> {
             .iter()
             .map(|track| track.location.clone())
             .collect();
-        // NOTE(vendored patch): artwork flags without artwork storage (e.g.
-        // host-generation backups) are not reindexable — see the matching
-        // guard in removed_ithmb_targets.
-        let removed_artwork_tracks = if has_reindexable_artwork(self.device)? {
-            removed_tracks
-                .iter()
-                .filter(|track| track.has_artwork)
-                .count()
-        } else {
-            0
-        };
+        // NOTE(vendored patch): the staged artwork account must key on the
+        // ArtworkDB records the reindex will actually touch, not on item
+        // flags: Apple libraries set artwork_status far more widely than
+        // they cache records, so flag-keyed accounting predicted artwork
+        // outputs the writer never produces and install verification
+        // failed with an output-count mismatch (live nano7g, 19.11.2026).
+        let (removal_artwork_pids, referenced_ithmb) =
+            removal_artwork_state(self.device, &self.removals)?;
+        let removed_artwork_tracks = removal_artwork_pids.len();
         let added_targets: Vec<IpodPath> = resolved
             .iter()
             .map(|addition| {
@@ -817,7 +815,10 @@ impl<'device> EditSession<'device> {
             added_tracks: resolved.len(),
             added_artwork_tracks: resolved.iter().filter(|add| add.artwork.is_some()).count(),
             added_ithmb: added_ithmb_targets(&resolved)?,
-            removed_ithmb: removed_ithmb_targets(self.device, &self.removals)?,
+            removed_ithmb: ithmb_targets_from_referenced(
+                &removal_artwork_pids,
+                &referenced_ithmb,
+            )?,
             remaining_tracks: after.track_count(),
             removed_media,
             removed_artwork_tracks,
@@ -939,17 +940,15 @@ impl<'device> EditSession<'device> {
             .iter()
             .map(|track| track.location.clone())
             .collect();
-        // NOTE(vendored patch): artwork flags without artwork storage (e.g.
-        // host-generation backups) are not reindexable — see the matching
-        // guard in removed_ithmb_targets.
-        let removed_artwork_tracks = if has_reindexable_artwork(self.device)? {
-            removed_tracks
-                .iter()
-                .filter(|track| track.has_artwork)
-                .count()
-        } else {
-            0
-        };
+        // NOTE(vendored patch): the staged artwork account must key on the
+        // ArtworkDB records the reindex will actually touch, not on item
+        // flags: Apple libraries set artwork_status far more widely than
+        // they cache records, so flag-keyed accounting predicted artwork
+        // outputs the writer never produces and install verification
+        // failed with an output-count mismatch (live nano7g, 19.11.2026).
+        let (removal_artwork_pids, referenced_ithmb) =
+            removal_artwork_state(self.device, &self.removals)?;
+        let removed_artwork_tracks = removal_artwork_pids.len();
         let added_targets: Vec<IpodPath> = resolved
             .iter()
             .map(|addition| {
@@ -986,7 +985,10 @@ impl<'device> EditSession<'device> {
             added_tracks: resolved.len(),
             added_artwork_tracks: resolved.iter().filter(|add| add.artwork.is_some()).count(),
             added_ithmb: added_ithmb_targets(&resolved)?,
-            removed_ithmb: removed_ithmb_targets(self.device, &self.removals)?,
+            removed_ithmb: ithmb_targets_from_referenced(
+                &removal_artwork_pids,
+                &referenced_ithmb,
+            )?,
             remaining_tracks: after.track_count(),
             removed_media,
             removed_artwork_tracks,
@@ -1260,7 +1262,7 @@ impl StagedSqliteEdit {
     }
 
     /// Returns the `.ithmb` files that the removal reindexes (empty when no
-    /// artwork-bearing track is removed).
+    /// removed track holds an `ArtworkDB` record).
     #[must_use]
     pub fn removed_ithmb(&self) -> &[IpodPath] {
         &self.removed_ithmb
@@ -1635,32 +1637,24 @@ fn referenced_artwork_files(
     Ok(files)
 }
 
-/// The `.ithmb` files a removal rewrites: every file referenced by `ArtworkDB`
-/// when at least one removed track carries artwork, otherwise none.
-fn removed_ithmb_targets(
+/// NOTE(vendored patch): the staged artwork account must key on the
+/// `ArtworkDB` records the reindex will actually touch, not on item
+/// flags: Apple libraries set `artwork_status` far more widely than they
+/// cache records (the sanitized nano7g fixture carries the flag on all
+/// 845 items while only some hold records), so flag-keyed accounting
+/// predicted artwork outputs the writer never produces and install
+/// verification failed with an output-count mismatch (live nano7g
+/// removal, 19.11.2026).
+///
+/// Returns the removed pids that hold an `ArtworkDB` record plus every
+/// `.ithmb` file the reindex rewrites; both empty when the device has no
+/// reindexable artwork storage or no removed track holds a record.
+fn removal_artwork_state(
     device: &Device,
     removals: &BTreeSet<PersistentId>,
-) -> Result<Vec<IpodPath>> {
-    if removals.is_empty() {
-        return Ok(Vec::new());
-    }
-    let has_artwork = device.library().is_some_and(|library| {
-        library
-            .tracks()
-            .iter()
-            .any(|track| removals.contains(&track.id) && track.has_artwork)
-    });
-    if !has_artwork {
-        return Ok(Vec::new());
-    }
-    // NOTE(vendored patch): mirror the `write_artwork_preview` guard — an
-    // initialized device (or a host-generation backup, which skips artwork
-    // binaries) can carry artwork flags without an ArtworkDB on disk. With
-    // no artwork storage there is nothing to reindex, so removals must not
-    // schedule `.ithmb` rewrites; `removed_artwork_tracks` is gated on the
-    // same predicate so install validation stays consistent.
-    if !has_reindexable_artwork(device)? {
-        return Ok(Vec::new());
+) -> Result<(BTreeSet<PersistentId>, BTreeMap<String, u32>)> {
+    if removals.is_empty() || !has_reindexable_artwork(device)? {
+        return Ok((BTreeSet::new(), BTreeMap::new()));
     }
     let profile = device.profile().ok_or_else(|| Error::Unsupported {
         feature: "artwork reindex",
@@ -1670,8 +1664,29 @@ fn removed_ithmb_targets(
     let source = device.mount().resolve_existing(&relative)?;
     let bytes = read_limited(&source, MAX_ARTWORK_BYTES, "ArtworkDB")?;
     let records = crate::artwork::parse_artwork_records(&bytes)?;
-    referenced_artwork_files(&records, &profile.capabilities().artwork_formats)?
-        .into_keys()
+    let referenced = referenced_artwork_files(&records, &profile.capabilities().artwork_formats)?;
+    let matched: BTreeSet<PersistentId> = records
+        .iter()
+        .map(|record| record.track_id)
+        .filter(|track_id| removals.contains(track_id))
+        .collect();
+    Ok((matched, referenced))
+}
+
+/// The `.ithmb` outputs a removal reindexes: every referenced file when at
+/// least one removed track holds an `ArtworkDB` record (the reindex
+/// rewrites them all), otherwise none — mirroring the early returns of
+/// `write_artwork_preview` so the staging prediction and the staged bundle
+/// agree by construction.
+fn ithmb_targets_from_referenced(
+    matched: &BTreeSet<PersistentId>,
+    referenced: &BTreeMap<String, u32>,
+) -> Result<Vec<IpodPath>> {
+    if matched.is_empty() {
+        return Ok(Vec::new());
+    }
+    referenced
+        .keys()
         .map(|name| IpodPath::new(format!("iPod_Control/Artwork/{name}")))
         .collect()
 }

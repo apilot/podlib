@@ -1204,12 +1204,23 @@ mod tests {
             return None;
         }
         let device = Device::open(&fixture).unwrap();
+        // NOTE(vendored patch): the staged artwork account keys on
+        // ArtworkDB records (flags are set more widely than Apple caches
+        // records), so the victim must hold one.
+        let artwork_bytes =
+            std::fs::read(fixture.join("iPod_Control/Artwork/ArtworkDB")).unwrap();
+        let recorded: std::collections::BTreeSet<PersistentId> =
+            crate::artwork::parse_artwork_records(&artwork_bytes)
+                .unwrap()
+                .into_iter()
+                .map(|record| record.track_id)
+                .collect();
         let track = device
             .library()
             .unwrap()
             .tracks()
             .iter()
-            .find(|track| track.has_artwork)
+            .find(|track| track.has_artwork && recorded.contains(&track.id))
             .unwrap();
         let mut edit = device.edit().unwrap();
         edit.remove_track(track.id).unwrap();
