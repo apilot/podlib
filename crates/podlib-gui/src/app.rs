@@ -3980,35 +3980,67 @@ fn password_modal(
 /// crash mounted rw forever (live incident). Foreign mounts the owner
 /// connected to deliberately are adopted too — the price of keeping
 /// this simple; ejecting them on close is accepted by the owner.
+/// Round 6.3: the one foreign mount that must NOT be adopted is a
+/// read-only automount (udisks2 on HFS+): reads work, every write
+/// fails, so it is unmounted first and the usual mkdir+mount runs.
 /// The library is NOT opened here: `Box<dyn LibraryBackend>` is not
 /// `Send`, so it is opened on the library worker thread instead (see
 /// library.rs).
+/// What must happen before (or instead of) the mkdir+rw-mount sequence,
+/// decided from the /proc/mounts snapshot (rounds 5.3 / batch F / 6.3).
+enum ConnectPlan {
+    /// Target already carries the same source rw — skip the mount and
+    /// adopt it (mounted_by_us=true so closing ejects it).
+    AdoptMounted,
+    /// Honest refusal: another device already owns the target.
+    Conflict(String),
+    /// Target free (or the foreign ro automount was just removed): run
+    /// the mkdir+rw-mount steps as usual.
+    Mount,
+}
+
+/// Mount-time branch of the connect flow: /proc/mounts decides whether
+/// the target is already mounted (adopt — idempotent connect, round
+/// 5.3), mounted read-only by the system (one extra sudo unmount first
+/// — round 6.3), mounted from another device (honest refusal), or free.
+fn resolve_connect_plan(
+    password: &str,
+    mount_path: &Path,
+    block_dev: &Path,
+) -> Result<ConnectPlan, ConnectError> {
+    let mounts = std::fs::read_to_string("/proc/mounts")
+        .map(|content| device::parse_proc_mounts_full(&content))
+        .unwrap_or_default();
+    match device::decide_mount_full(&mounts, block_dev, mount_path) {
+        device::MountDecision::AlreadyMounted => Ok(ConnectPlan::AdoptMounted),
+        device::MountDecision::ForeignReadOnly => {
+            // One extra sudo step; on success the target is free and the
+            // caller proceeds with the usual mkdir+mount.
+            unmount_foreign_ro_volume(password, block_dev)?;
+            Ok(ConnectPlan::Mount)
+        }
+        device::MountDecision::ConflictsWith(other) => Ok(ConnectPlan::Conflict(other)),
+        device::MountDecision::Free => Ok(ConnectPlan::Mount),
+    }
+}
+
 fn connect_device(
     password: String, // owned: dropped right after the last command (W3)
     steps: Vec<device::CommandSpec>,
     mount_path: PathBuf,
     block_dev: PathBuf,
 ) -> Result<(PathBuf, bool), ConnectError> {
-    // WHY the password lives across the whole loop: every sudo step
-    // consumes its own copy from stdin; it is dropped only after the
-    // last step, never stored anywhere.
-    // Idempotent mount (round 5.3): /proc/mounts decides whether the
-    // target is already mounted (skip the mount step — and ADOPT it:
-    // batch F reports mounted_by_us=true so closing ejects it; the old
-    // «not ours» semantics left restart-orphaned mounts rw forever),
-    // mounted from another device (honest refusal), or free (mount as
-    // usual).
-    let mounts = std::fs::read_to_string("/proc/mounts")
-        .map(|content| device::parse_proc_mounts(&content))
-        .unwrap_or_default();
-    match device::decide_mount(&mounts, &block_dev, &mount_path) {
-        device::MountDecision::AlreadyMounted => {
+    // WHY the password lives across the whole flow: every sudo step
+    // (ro-unmount, mount sequence) consumes its own copy from stdin;
+    // it is dropped only after the last step, never stored anywhere.
+    match resolve_connect_plan(&password, &mount_path, &block_dev)? {
+        ConnectPlan::AdoptMounted => {
             drop(password);
             // Batch F (adoption): connecting to an already-mounted
             // volume makes its safe unmount this app's responsibility.
             return Ok((mount_path, true));
         }
-        device::MountDecision::ConflictsWith(other) => {
+        ConnectPlan::Conflict(other) => {
             drop(password);
             return Err(ConnectError::Mount {
                 stderr: format!(
@@ -4018,7 +4050,7 @@ fn connect_device(
                 error: MountError::AlreadyMounted,
             });
         }
-        device::MountDecision::Free => {}
+        ConnectPlan::Mount => {}
     }
     for spec in &steps {
         let output =
@@ -4032,6 +4064,28 @@ fn connect_device(
     }
     drop(password);
     Ok((mount_path, true))
+}
+
+/// Round 6.3: removes the foreign read-only mount blocking the connect
+/// target (`udisksctl unmount -b <dev>` under sudo, password already in
+/// hand). Review M1: sudo auth failures classify as WrongPassword —
+/// the same hint and retry flow as the mount loop below; other failures
+/// keep the honest read-only message with the tool's stderr.
+fn unmount_foreign_ro_volume(password: &str, block_dev: &Path) -> Result<(), ConnectError> {
+    let spec = device::build_unmount_command(block_dev);
+    let output =
+        device::run_sudo_command(password, &spec).map_err(|error| ConnectError::Mount {
+            stderr: String::new(),
+            error: MountError::Io(error),
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(ConnectError::Mount {
+            error: device::unmount_failure_class(&stderr),
+            stderr,
+        });
+    }
+    Ok(())
 }
 
 /// Runs a worker body, converting a panic into an honest error value.

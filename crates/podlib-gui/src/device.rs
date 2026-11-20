@@ -209,18 +209,47 @@ pub fn merge_candidates(
     out
 }
 
-/// Parsed `/proc/mounts` entry: (source device, mount point), with the
+/// Parsed `/proc/mounts` entry: source device, mount point and the
+/// comma-separated mount options (e.g. `rw,relatime`), with the
 /// kernel's octal escapes (`\040` space, `\011` tab, `\012` newline,
-/// `\134` backslash) decoded.
-pub fn parse_proc_mounts(content: &str) -> Vec<(String, String)> {
+/// `\134` backslash) decoded for source and target.
+pub struct ProcMount {
+    pub source: String,
+    pub target: String,
+    pub options: String,
+}
+
+/// Options-aware parse of `/proc/mounts`: keeps the options field so the
+/// connect decision can tell a read-only foreign mount (round 6.3) from
+/// an adoptable rw one.
+pub fn parse_proc_mounts_full(content: &str) -> Vec<ProcMount> {
     content
         .lines()
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
             let source = fields.next()?;
             let target = fields.next()?;
-            Some((unescape_mount(source), unescape_mount(target)))
+            // Field layout: source target fstype options — fstype is
+            // skipped (ProcMount carries no fs type).
+            fields.next()?;
+            // Options never contain escaped whitespace — no unescape needed.
+            let options = fields.next().unwrap_or_default().to_owned();
+            Some(ProcMount {
+                source: unescape_mount(source),
+                target: unescape_mount(target),
+                options,
+            })
         })
+        .collect()
+}
+
+/// Plain (source, target) pairs for callers that ignore the options —
+/// the eject drain path ([`count_mounts_with_source`]) counts layers by
+/// devnode only.
+pub fn parse_proc_mounts(content: &str) -> Vec<(String, String)> {
+    parse_proc_mounts_full(content)
+        .into_iter()
+        .map(|mount| (mount.source, mount.target))
         .collect()
 }
 
@@ -246,23 +275,35 @@ fn unescape_mount(text: &str) -> String {
 }
 
 /// Mount-time decision for a planned (source, target) pair: the target
-/// may already carry the same source (skip the mount — idempotent), a
-/// different one (honest refusal), or be free.
+/// may already carry the same source rw (skip the mount — idempotent),
+/// the same source read-only (a foreign automount that must be removed
+/// first — round 6.3), a different one (honest refusal), or be free.
 pub enum MountDecision {
     AlreadyMounted,
+    /// The target holds the same source mounted with the `ro` option —
+    /// a foreign automount (udisks2): reads work, every write fails.
+    ForeignReadOnly,
     ConflictsWith(String),
     Free,
 }
 
-pub fn decide_mount(mounts: &[(String, String)], source: &Path, target: &Path) -> MountDecision {
+/// Whole-token match in a comma-separated options field: `ro` inside
+/// `errors=remount-ro` or `relatime` must not read as read-only.
+fn options_contain(options: &str, token: &str) -> bool {
+    options.split(',').any(|option| option == token)
+}
+
+pub fn decide_mount_full(mounts: &[ProcMount], source: &Path, target: &Path) -> MountDecision {
     let target = target.display().to_string();
     let source = source.display().to_string();
-    for (mounted_source, mounted_target) in mounts {
-        if mounted_target == &target {
-            return if mounted_source == &source {
-                MountDecision::AlreadyMounted
+    for mount in mounts {
+        if mount.target == target {
+            return if mount.source != source {
+                MountDecision::ConflictsWith(mount.source.clone())
+            } else if options_contain(&mount.options, "ro") {
+                MountDecision::ForeignReadOnly
             } else {
-                MountDecision::ConflictsWith(mounted_source.clone())
+                MountDecision::AlreadyMounted
             };
         }
     }
@@ -405,6 +446,14 @@ pub fn build_mount_sequence(spec: &MountSpec) -> Vec<CommandSpec> {
         CommandSpec::new("mkdir", &["-p", &spec.mount_path.display().to_string()]),
         build_mount_command(spec),
     ]
+}
+
+/// Round 6.3: removes a foreign read-only mount (e.g. a udisks2
+/// automount) so the connect rw-mount can take the target. Same argv
+/// shape as the eject drain steps: `udisksctl unmount -b <dev>`, run
+/// under sudo by the caller.
+pub fn build_unmount_command(block_dev: &Path) -> CommandSpec {
+    CommandSpec::new("udisksctl", &["unmount", "-b", &block_dev.display().to_string()])
 }
 
 /// Safe-eject shutdown plan (round 6.1): `sync` → one `unmount` per
@@ -551,6 +600,14 @@ pub enum MountError {
     DirtyJournal,
     #[error("том уже смонтирован")]
     AlreadyMounted,
+    /// Round 6.3: `udisksctl unmount` failed on a foreign ro automount.
+    /// Review N1: Display carries only the advice sentence — the raw
+    /// stderr travels solely in `ConnectError::Mount.stderr`.
+    #[error(
+        "том смонтирован системой только для чтения — \
+         закройте приложения, использующие iPod, и повторите подключение"
+    )]
+    ForeignReadOnly(String),
     #[error("mount завершился с ошибкой")]
     Failed,
     #[error("не удалось выполнить sudo: {0}")]
@@ -572,7 +629,7 @@ impl MountError {
             MountError::AlreadyMounted => {
                 Some("Том уже смонтирован; при необходимости отмонтируйте и повторите.")
             }
-            MountError::Failed | MountError::Io(_) => None,
+            MountError::Failed | MountError::Io(_) | MountError::ForeignReadOnly(_) => None,
         }
     }
 }
@@ -589,6 +646,17 @@ pub fn classify_mount_output(output: &Output) -> Result<(), MountError> {
         MountFailure::AlreadyMounted => MountError::AlreadyMounted,
         MountFailure::Other => MountError::Failed,
     })
+}
+
+/// Failure of the round-6.3 foreign ro-unmount (review M1): a sudo auth
+/// failure maps to [`MountError::WrongPassword`] — the same hint and
+/// retry flow as the mount loop; every other stderr keeps the honest
+/// read-only message, with the raw stderr as its payload.
+pub fn unmount_failure_class(stderr: &str) -> MountError {
+    match classify_mount_failure(stderr) {
+        MountFailure::WrongPassword => MountError::WrongPassword,
+        _ => MountError::ForeignReadOnly(stderr.to_owned()),
+    }
 }
 
 #[cfg(test)]
@@ -784,31 +852,118 @@ mod tests {
     }
 
     #[test]
-    fn mount_decision_is_idempotent_or_honest() {
-        let mounts = vec![
-            (
+    fn proc_mounts_full_captures_options_and_decodes_escapes() {
+        let mounts = parse_proc_mounts_full(
+            "/dev/sda2 /run/media/user/iPod\\0402 hfsplus ro,relatime 0 0\n",
+        );
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].source, "/dev/sda2");
+        assert_eq!(mounts[0].target, "/run/media/user/iPod 2");
+        assert_eq!(mounts[0].options, "ro,relatime");
+        // The eject-path wrapper still returns plain (source, target) pairs.
+        let pairs = parse_proc_mounts("/dev/sda2 /run/media/user/iPod hfsplus ro 0 0\n");
+        assert_eq!(
+            pairs,
+            vec![(
                 "/dev/sda2".to_owned(),
                 "/run/media/user/iPod".to_owned(),
-            ),
-            (
-                "/dev/sdb1".to_owned(),
-                "/run/media/user/other".to_owned(),
-            ),
-        ];
-        let source = Path::new("/dev/sda2");
+            )]
+        );
+    }
+
+    #[test]
+    fn mount_decision_is_idempotent_or_honest() {
+        let mounts = parse_proc_mounts_full(
+            "/dev/sda2 /run/media/user/iPod hfsplus rw,relatime 0 0\n\
+             /dev/sdb1 /run/media/user/other vfat rw 0 0\n",
+        );
         let target = Path::new("/run/media/user/iPod");
+        // Same source, rw options: idempotent connect, adopted (batch F).
         assert!(matches!(
-            decide_mount(&mounts, source, target),
+            decide_mount_full(&mounts, Path::new("/dev/sda2"), target),
             MountDecision::AlreadyMounted
         ));
         assert!(matches!(
-            decide_mount(&mounts, Path::new("/dev/sdc1"), target),
+            decide_mount_full(&mounts, Path::new("/dev/sdc1"), target),
             MountDecision::ConflictsWith(ref other) if other == "/dev/sda2"
         ));
         assert!(matches!(
-            decide_mount(&mounts, Path::new("/dev/sda2"), Path::new("/run/media/user/new")),
+            decide_mount_full(
+                &mounts,
+                Path::new("/dev/sda2"),
+                Path::new("/run/media/user/new")
+            ),
             MountDecision::Free
         ));
+    }
+
+    #[test]
+    fn mount_decision_flags_foreign_read_only_by_ro_token() {
+        // Round 6.3: udisks2 automounts HFS+ iPods read-only; the `ro`
+        // OPTION token (not a substring) is what separates a foreign ro
+        // mount from an adoptable rw one.
+        let ro = parse_proc_mounts_full(
+            "/dev/sda2 /run/media/user/iPod hfsplus ro,relatime 0 0\n",
+        );
+        assert!(matches!(
+            decide_mount_full(&ro, Path::new("/dev/sda2"), Path::new("/run/media/user/iPod")),
+            MountDecision::ForeignReadOnly
+        ));
+        // Whole-token match: option strings that merely CONTAIN the
+        // letters «ro» inside other tokens must stay adoptable.
+        for options in ["rw,relatime", "rw,errors=remount-ro"] {
+            let mounts = parse_proc_mounts_full(&format!(
+                "/dev/sda2 /run/media/user/iPod hfsplus {options} 0 0\n"
+            ));
+            assert!(
+                matches!(
+                    decide_mount_full(
+                        &mounts,
+                        Path::new("/dev/sda2"),
+                        Path::new("/run/media/user/iPod")
+                    ),
+                    MountDecision::AlreadyMounted
+                ),
+                "options {options:?} must not read as ro"
+            );
+        }
+    }
+
+    #[test]
+    fn unmount_command_targets_block_device() {
+        let spec = build_unmount_command(Path::new("/dev/sdb2"));
+        assert_eq!(spec.program, "udisksctl");
+        assert_eq!(
+            spec.args,
+            vec!["unmount".to_owned(), "-b".to_owned(), "/dev/sdb2".to_owned()]
+        );
+    }
+
+    #[test]
+    fn unmount_failure_class_splits_sudo_auth_from_ro_failure() {
+        // Review M1: a sudo auth failure must engage the password hint
+        // and the existing retry flow, not the read-only advice.
+        assert!(matches!(
+            unmount_failure_class("sudo: 1 incorrect password attempt"),
+            MountError::WrongPassword
+        ));
+        assert!(matches!(
+            unmount_failure_class("Sorry, try again."),
+            MountError::WrongPassword
+        ));
+        assert!(matches!(
+            unmount_failure_class("Error: The drive is in use"),
+            MountError::ForeignReadOnly(ref message) if message == "Error: The drive is in use"
+        ));
+    }
+
+    #[test]
+    fn foreign_read_only_display_carries_advice_only() {
+        // Review N1: the raw stderr travels solely in
+        // ConnectError::Mount.stderr; Display is the advice sentence.
+        let error = MountError::ForeignReadOnly("Error: The drive is in use".to_owned());
+        assert!(!error.to_string().contains("Error:"));
+        assert!(error.to_string().contains("закройте приложения"));
     }
 
     #[test]
