@@ -17,13 +17,12 @@ repository = "https://github.com/apilot/podlib"
 rust-version = "1.95"
 
 [workspace.dependencies]
-# Git main is required: crates.io 0.1.0 lacks playlist mutations and
-# classic-device support that the adapter depends on. The rev pin keeps
-# builds reproducible; bump deliberately when the upstream moves.
-# Vendored copy of github.com/koriwi/libopod @ rev 0eef69a2730aea6e9b8eb6a9b39c95deac05163d
-# (crates.io 0.1.0 has no playlists). Local patch: NULL-safe rank queries —
-# firmware DBs (Nano 7G fw 1.1.2) contain artist rows with NULL names.
-# Upstream PR is planned; until it merges, keep using the vendored copy.
+# Vendored copy of github.com/koriwi/libopod @ rev 0eef69a2730aea6e9b8eb6a9b39c95deac05163d:
+# crates.io 0.1.0 lacks playlist mutations and classic-device support that the
+# adapter depends on. Database-layer fixes (NULL-safe rank queries against real
+# firmware DBs, orphan-artist delete guard, empty-key reindex) are merged
+# upstream (koriwi/libopod#1); podlib-specific edit-session fixes stay local.
+# Switch back to the upstream crate once a crates.io release carries playlists.
 libopod = { package = "libopod-rs", path = "crates/vendor/libopod" }
 thiserror = "2"
 tempfile = "3"

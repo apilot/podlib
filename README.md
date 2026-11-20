@@ -2,6 +2,8 @@
 
 **podlib** is a free software library and command-line tool for managing music libraries on USB-connected iPods — a modern Rust take on the classic libgpod + gtkpod workflow.
 
+Also available in Russian: [README.ru.md](README.ru.md).
+
 ## Features
 
 - Browse tracks and playlists stored on the device
@@ -16,7 +18,7 @@
 | iPod Nano 7th generation | ✅ Verified on real hardware (firmware 1.1.2) |
 | Classic click-wheel iPods | Planned (phase 2) |
 
-podlib is built on [libopod](https://github.com/koriwi/libopod) (vendored, see below) — the first library with write support for the Nano 7G database format.
+podlib is built on [libopod](https://github.com/koriwi/libopod) (vendored, see below) — the first library with write support for the Nano 7G database format. Our database-layer fixes (NULL-safe rank queries, orphan-artist delete guard, empty-key reindex) are merged upstream as [koriwi/libopod#1](https://github.com/koriwi/libopod/pull/1).
 
 ## Installing
 
@@ -105,7 +107,7 @@ A GUI (`podlib-gui`) ships with one-click connect (this mount flow is automated 
 
 - `crates/podlib` — the library: a small domain model (tracks, playlists), a `LibraryBackend` trait, and an adapter over [libopod](https://github.com/koriwi/libopod)
 - `crates/podlib-cli` — the `podlib` command-line tool
-- `crates/vendor/libopod` — vendored copy of libopod with small local fixes (NULL-safe artist queries against real firmware databases); to be upstreamed
+- `crates/vendor/libopod` — pinned copy of libopod; its database-layer fixes are merged upstream ([koriwi/libopod#1](https://github.com/koriwi/libopod/pull/1)), podlib-specific edit-session fixes stay local until a crates.io release with playlist support (see [CONTRIBUTING.md](CONTRIBUTING.md))
 
 Writes never touch the live database directly: an edit session is staged in a temporary directory and installed atomically, and the Nano 7G checksum files (CBK) are re-signed with the device's FireWire GUID. The whole flow is verified end-to-end on a Nano 7G: playlists created and deleted, tracks added and removed, firmware starts normally afterwards.
 
@@ -122,11 +124,11 @@ podlib is free software: you can redistribute it and/or modify it under the term
 
 Third-party components:
 
-- [libopod](https://github.com/koriwi/libopod) (vendored) — MIT license
+- [libopod](https://github.com/koriwi/libopod) (vendored) — MIT license; podlib's fixes to it are merged upstream as [koriwi/libopod#1](https://github.com/koriwi/libopod/pull/1)
 - SQLite (bundled via libopod) — public domain
 
 podlib is an independent implementation developed from public research of the iPod database formats. It contains no Apple source code.
 
 ## Contributing
 
-Bug reports, feature ideas and pull requests are welcome at the [issue tracker](https://github.com/apilot/podlib/issues). For larger changes, please open an issue first to discuss the approach. Unit tests (`cargo test`) and a clean `cargo clippy` run are expected.
+Bug reports, feature ideas and pull requests are welcome at the [issue tracker](https://github.com/apilot/podlib/issues). For larger changes, please open an issue first to discuss the approach. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup and conventions: unit tests (`cargo test`) and a clean `cargo clippy` run are expected.
