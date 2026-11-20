@@ -112,6 +112,10 @@ udisksctl power-off -b /dev/sdX
 
 A GUI (`podlib-gui`) ships with one-click connect (this mount flow is automated inside the app).
 
+### GUI on Wayland (drag-and-drop)
+
+`podlib-gui` runs the X11 windowing backend by default, so file drag-and-drop works on both X11 and Wayland sessions (via XWayland). Set `PODLIB_WAYLAND=1` to force the native Wayland backend instead — at the cost of drag-and-drop, which winit 0.30 implements only on X11 (winit#1881); to be revisited on winit 0.31. If your Wayland session has no XWayland at all (for example, sway with XWayland disabled), the default X11 backend cannot start and the app exits with winit's error message — there `PODLIB_WAYLAND=1` is the escape hatch rather than a trade-off.
+
 ## How it works
 
 - `crates/podlib` — the library: a small domain model (tracks, playlists), a `LibraryBackend` trait, and an adapter over [libopod](https://github.com/koriwi/libopod)
