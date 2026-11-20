@@ -22,13 +22,22 @@ podlib is built on [libopod](https://github.com/koriwi/libopod) (vendored, see b
 
 ## Installing
 
-Prebuilt binaries (`podlib` + `podlib-gui`, Linux x86_64/aarch64) are published
-by the release workflow on every `v*` tag. Install both with
-[cargo-binstall](https://github.com/cargo-bins/cargo-binstall):
+Install from this repository with cargo (Rust 1.95+ and a C compiler):
 
 ```sh
-cargo binstall podlib-cli podlib-gui
+cargo install --git https://github.com/apilot/podlib podlib-cli
+# and/or the GUI:
+cargo install --git https://github.com/apilot/podlib podlib-gui
 ```
+
+Prebuilt binaries (`podlib` + `podlib-gui`, Linux x86_64/aarch64) are also
+attached to the [GitHub Releases](https://github.com/apilot/podlib/releases)
+page on every `v*` tag — download the tarball for your target and unpack it
+into `~/.cargo/bin`.
+
+`cargo binstall podlib-cli podlib-gui` will start working once the crates are
+published to crates.io — currently blocked on an upstream libopod release
+that carries playlist support (the vendored copy can't be published).
 
 The GUI additionally needs ffmpeg and a desktop GL stack at runtime — see
 [Distro notes](#distro-notes).

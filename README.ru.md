@@ -22,13 +22,25 @@ podlib построен на [libopod](https://github.com/koriwi/libopod) (vendo
 
 ## Установка
 
-Готовые бинарники (`podlib` + `podlib-gui`, Linux x86_64/aarch64) публикуются release-workflow'ом на каждый тег `v*`. Установка обоих через [cargo-binstall](https://github.com/cargo-bins/cargo-binstall):
+Установка из репозитория через cargo (нужны Rust 1.95+ и C-компилятор):
 
 ```sh
-cargo binstall podlib-cli podlib-gui
+cargo install --git https://github.com/apilot/podlib podlib-cli
+# и/или GUI:
+cargo install --git https://github.com/apilot/podlib podlib-gui
 ```
 
-GUI дополнительно требует ffmpeg и desktop GL-стек в рантайме — см. [Заметки по дистрибутивам](#заметки-по-дистрибутивам).
+Готовые бинарники (`podlib` + `podlib-gui`, Linux x86_64/aarch64) также
+прикладываются к [GitHub Releases](https://github.com/apilot/podlib/releases)
+на каждый тег `v*` — скачайте tarball под свою платформу и распакуйте в
+`~/.cargo/bin`.
+
+`cargo binstall podlib-cli podlib-gui` заработает после публикации крейтов
+на crates.io — сейчас блокировано: нужен релиз upstream libopod с поддержкой
+плейлистов (vendored-копию опубликовать нельзя).
+
+GUI дополнительно требует ffmpeg и desktop GL-стек в рантайме — см.
+[Заметки по дистрибутивам](#заметки-по-дистрибутивам).
 
 ## Сборка
 
