@@ -22,6 +22,7 @@ use crate::library::{
     path_extension, plural, AUDIOBOOK_BIT, EditDialogFields, DraggedTracks, LibraryCommand,
     LibraryOutcome, LibrarySnapshot, LibraryWorker,
 };
+use crate::text_menu;
 
 /// Row height of the track table rows, keeps the column grid aligned.
 /// 26px (round 4 UX): a touch taller for a comfortable click/hover target.
@@ -36,6 +37,12 @@ const DURATION_COLUMN: f32 = 64.0;
 /// все». Fits the 616px worst-case panel together with the other four
 /// fixed columns (28+120+180+200+64 = 592).
 const CHECK_COLUMN: f32 = 28.0;
+/// Minimum width the central panel keeps for the track table: 28
+/// (checkbox) + 100 (title, `at_least`) + 180 + 200 + 64 fixed columns
+/// plus item spacing (round 6.5). The sidebar's width ceiling is
+/// derived from it, so dragging the divider can never collapse the
+/// table — egui itself clamps panel drags only at the screen edge.
+const MIN_CENTRAL_PANEL_WIDTH: f32 = 616.0;
 /// Height of one sidebar row (round 6 П1) — the table row height, so
 /// both lists share one rhythm.
 const SIDEBAR_ROW_HEIGHT: f32 = 26.0;
@@ -1819,10 +1826,11 @@ impl PodlibApp {
             };
             ui.horizontal(|ui| {
                 ui.label("Название:");
-                ui.add(
+                let name = ui.add(
                     egui::TextEdit::singleline(&mut library.new_playlist_name)
                         .desired_width(240.0),
                 );
+                text_menu::attach_text_menu(&name);
             });
             name = library.new_playlist_name.clone();
             ui.separator();
@@ -2011,19 +2019,21 @@ impl PodlibApp {
             ui.label("Общее для всех файлов");
             ui.horizontal(|ui| {
                 ui.label(texts.title_field);
-                ui.add(
+                let book_title = ui.add(
                     egui::TextEdit::singleline(&mut review.book_title)
                         .desired_width(320.0),
                 );
+                text_menu::attach_text_menu(&book_title);
             });
             if review.validation_attempted && review.book_title.trim().is_empty() {
                 ui.colored_label(egui::Color32::LIGHT_RED, texts.empty_title);
             }
             ui.horizontal(|ui| {
                 ui.label(texts.author_field);
-                ui.add(
+                let author = ui.add(
                     egui::TextEdit::singleline(&mut review.author).desired_width(320.0),
                 );
+                text_menu::attach_text_menu(&author);
             });
             ui.add_space(6.0);
             if let Some(prefix) = review.prefix.clone() {
@@ -2075,6 +2085,7 @@ impl PodlibApp {
                                         .desired_width(300.0)
                                         .id_salt(("tag_review_title", index)),
                                 );
+                                text_menu::attach_text_menu(&title);
                                 review.row_edit_ids[index] = title.id;
                                 review.row_edit_rects[index] = title.rect;
                                 if title.has_focus() {
@@ -3109,12 +3120,13 @@ fn search_toolbar(ui: &mut egui::Ui, params: SearchToolbarParams<'_>) -> Toolbar
             ctx.memory_mut(|memory| memory.request_focus(search_box_id));
         }
         let query_before = query.clone();
-        ui.add(
+        let search = ui.add(
             egui::TextEdit::singleline(query)
                 .hint_text("Поиск…")
                 .id(search_box_id)
                 .desired_width(240.0),
         );
+        text_menu::attach_text_menu(&search);
         ui.label(tracks_counter(shown, total, &query_before));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let enabled = idle && selection_len > 0;
@@ -3171,6 +3183,24 @@ fn track_table_builder<'a>(ui: &'a mut egui::Ui, table_id: egui::Id) -> TableBui
         .column(Column::exact(ARTIST_COLUMN).clip(true).resizable(false))
         .column(Column::exact(ALBUM_COLUMN).clip(true).resizable(false))
         .column(Column::exact(DURATION_COLUMN).resizable(false))
+}
+
+/// Left sidebar of the main layout: 160px floor (решение владельца,
+/// 20.11.2026) and a ceiling that keeps MIN_CENTRAL_PANEL_WIDTH for the
+/// track table — egui clamps panel drags only at the screen edge and
+/// reserves nothing for the central panel, so without the ceiling the
+/// divider can be pulled until the table disappears (round 6.5).
+/// Shared by the production layout and the panel tests so the width
+/// contract lives in exactly one place.
+fn device_panel_builder(ui: &egui::Ui) -> egui::Panel {
+    let screen_w = ui.input(|input| input.viewport_rect().width());
+    egui::Panel::left("device_panel")
+        .default_size(240.0)
+        .resizable(true)
+        .size_range(egui::Rangef::new(
+            160.0,
+            (screen_w - MIN_CENTRAL_PANEL_WIDTH).max(160.0),
+        ))
 }
 
 /// Aggregated arguments for [`groups_view`] (grouped track views);
@@ -3742,40 +3772,46 @@ fn edit_track_dialog_fields(ui: &mut egui::Ui, dialog: &mut EditDialogState) -> 
     let mut fields = dialog.fields.clone();
     ui.horizontal(|ui| {
         ui.label("Название:      ");
-        ui.add(
+        let title = ui.add(
             egui::TextEdit::singleline(&mut fields.title).desired_width(320.0),
         );
+        text_menu::attach_text_menu(&title);
     });
     ui.horizontal(|ui| {
         ui.label("Исполнитель:  ");
-        ui.add(
+        let artist = ui.add(
             egui::TextEdit::singleline(&mut fields.artist).desired_width(320.0),
         );
+        text_menu::attach_text_menu(&artist);
     });
     ui.horizontal(|ui| {
         ui.label("Альбом:       ");
-        ui.add(
+        let album = ui.add(
             egui::TextEdit::singleline(&mut fields.album).desired_width(320.0),
         );
+        text_menu::attach_text_menu(&album);
     });
     ui.horizontal(|ui| {
         ui.label("Альбом-артист:");
-        ui.add(
+        let album_artist = ui.add(
             egui::TextEdit::singleline(&mut fields.album_artist)
                 .desired_width(320.0),
         );
+        text_menu::attach_text_menu(&album_artist);
     });
     ui.horizontal(|ui| {
         ui.label("Трек №:       ");
-        ui.add(
+        let track_number = ui.add(
             egui::TextEdit::singleline(&mut fields.track_number)
                 .desired_width(60.0),
         );
+        text_menu::attach_text_menu(&track_number);
         ui.label("Диск №:");
-        ui.add(
+        let disc_number = ui.add(
             egui::TextEdit::singleline(&mut fields.disc_number)
                 .desired_width(60.0),
         );
+        text_menu::attach_text_menu(&disc_number);
     });
     dialog.fields = fields;
     if let Some(error) = &dialog.error {
@@ -3926,12 +3962,13 @@ fn password_modal(
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label("Пароль sudo:");
-            ui.add(
+            let password_field = ui.add(
                 egui::TextEdit::singleline(password)
                     .password(true)
                     .desired_width(220.0)
                     .id(field_id),
             );
+            text_menu::attach_secret_text_menu(&password_field);
             if ctx.memory(|memory| memory.focused().is_none()) {
                 ctx.memory_mut(|memory| memory.request_focus(field_id));
             }
@@ -4133,10 +4170,10 @@ impl eframe::App for PodlibApp {
         //    once connected (the old right playlists panel is gone —
         //    it duplicated the central table). 240px (Ф4): leaves the
         //    table enough width for all four columns at ≥900px windows.
-        egui::Panel::left("device_panel")
-            .default_size(240.0)
-            .resizable(true)
-            .show(ui, |ui| {
+        //    The width ceiling comes from device_panel_builder: a drag
+        //    (or a persisted oversized state) can never eat the central
+        //    panel below MIN_CENTRAL_PANEL_WIDTH (round 6.5).
+        device_panel_builder(ui).show(ui, |ui| {
                 if self.connected.is_some() {
                     let actions = self.playlists_sidebar(ui);
                     self.apply_playlist_actions(actions);
@@ -4792,6 +4829,120 @@ mod tests {
                 ui.label("central");
             });
         });
+    }
+
+    // ---- sidebar vs central panel (round 6.5) ----
+
+    /// Реплика живого прогона 6.2–6.4: разделитель сайдбара оттянут до
+    /// правого края окна — egui клампит драг только по экрану и не
+    /// резервирует место под центральную панель, поэтому таблица
+    /// схлопывается в ноль. Размер панели персистится между кадрами,
+    /// поэтому «оттянули в прошлой сессии» = засеянный PanelState с
+    /// шириной всего окна. Контракт раунда 6.5: центральная панель
+    /// держит минимум MIN_CENTRAL_PANEL_WIDTH.
+    #[test]
+    fn fully_dragged_sidebar_cannot_collapse_the_central_panel() {
+        egui::__run_test_ui(|ui| {
+            ui.style_mut().animation_time = 0.0;
+            let screen_w = ui.input(|input| input.viewport_rect().width());
+            let panel_id = ui.scope_id().with_salt(egui::IdSalt::new("device_panel"));
+            ui.ctx().data_mut(|data| {
+                data.insert_persisted(
+                    panel_id,
+                    egui::PanelState {
+                        outer_rect: egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(screen_w, 600.0),
+                        ),
+                    },
+                );
+            });
+            egui::Panel::top("app_bar").default_size(48.0).show(ui, |ui| {
+                ui.label("podlib");
+            });
+            let sidebar = device_panel_builder(ui).show(ui, |ui| {
+                // Realistic content: sidebar rows span the full panel
+                // width (see sidebar_row_spans_the_full_panel_width), so
+                // the panel paints at its full reserved size. Empty
+                // content would let egui shrink the frame to the row
+                // minimum and hide the whole regression.
+                ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 10.0),
+                    egui::Sense::hover(),
+                );
+            });
+            egui::Panel::bottom("status_bar").default_size(34.0).show(ui, |_ui| {});
+            let central = egui::CentralPanel::default().show(ui, |ui| {
+                ui.label("central");
+            });
+            let sidebar_rect = sidebar.response.rect;
+            let central_rect = central.response.rect;
+            assert!(
+                sidebar_rect.right() <= central_rect.left() + 0.5,
+                "sidebar ({sidebar_rect:?}) overlaps the central panel ({central_rect:?})"
+            );
+            assert!(
+                central_rect.width() >= MIN_CENTRAL_PANEL_WIDTH,
+                "a fully dragged sidebar left the central panel only {} px \
+                 (minimum is {MIN_CENTRAL_PANEL_WIDTH})",
+                central_rect.width()
+            );
+        });
+    }
+
+    /// Sweep ширины окна 900/800/700/500: панели не пересекаются, а
+    /// чекбокс и название таблицы (первые две колонки) остаются внутри
+    /// центральной панели. Правые колонки на узких окнах деградируют
+    /// клипом (clip(true)) — это осознанное решение раунда 6.5.
+    #[test]
+    fn sidebar_and_central_panel_stay_disjoint_across_window_widths() {
+        for width in [900.0, 800.0, 700.0, 500.0] {
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.style_mut().animation_time = 0.0;
+                    egui::Panel::top("app_bar").default_size(48.0).show(ui, |_ui| {});
+                    let sidebar = device_panel_builder(ui).show(ui, |ui| {
+                        // Same full-width content contract as the
+                        // fully-dragged test above: the panel must paint
+                        // at its reserved size for disjointness to mean
+                        // anything.
+                        ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), 10.0),
+                            egui::Sense::hover(),
+                        );
+                    });
+                    egui::Panel::bottom("status_bar").default_size(34.0).show(ui, |_ui| {});
+                    let mut header = Vec::new();
+                    let central = egui::CentralPanel::default().show(ui, |ui| {
+                        header = render_measured_table(ui);
+                    });
+                    let sidebar_rect = sidebar.response.rect;
+                    let central_rect = central.response.rect;
+                    assert!(
+                        sidebar_rect.right() <= central_rect.left() + 0.5,
+                        "at {width}px: sidebar ({sidebar_rect:?}) overlaps the \
+                         central panel ({central_rect:?})"
+                    );
+                    for (name, rect) in [("чекбокс", header[0]), ("название", header[1])] {
+                        assert!(
+                            rect.right() <= central_rect.right() + 0.5
+                                && rect.left() >= central_rect.left() - 0.5,
+                            "at {width}px: колонка {name} ({rect:?}) вышла за \
+                             пределы центральной панели ({central_rect:?})"
+                        );
+                    }
+                },
+            );
+            output.textures_delta.clear();
+        }
     }
 
     // ---- pure UI helpers ----
