@@ -85,6 +85,7 @@ pub(crate) fn remove_tracks(
     checksum: ChecksumKind,
     guid: Option<&[u8; 8]>,
     removals: &[PersistentId],
+    renames: &[(PersistentId, PersistentId)],
 ) -> Result<Vec<u8>> {
     if removals.is_empty() {
         return Err(verification("no iTunesDB removals were requested"));
@@ -106,7 +107,7 @@ pub(crate) fn remove_tracks(
     for dataset in &mut datasets {
         let kind = read_u32(dataset, 12)?;
         if matches!(kind, 2 | 3 | 5) {
-            *dataset = super::cdb_edit::rewrite_playlist_dataset(dataset, &removed)?;
+            *dataset = super::cdb_edit::rewrite_playlist_dataset(dataset, &removed, renames)?;
         }
     }
 
@@ -118,12 +119,14 @@ pub(crate) fn remove_tracks(
 }
 
 /// Adds one track to an uncompressed classic `iTunesDB` and re-signs it.
+/// Returns the assigned CDB-style track id so callers can re-point
+/// playlist mhips at the replacement (see [`rename_tracks`]).
 pub(crate) fn add_track(
     itunesdb: &[u8],
     checksum: ChecksumKind,
     guid: Option<&[u8; 8]>,
     addition: &CdbTrackAddition,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, u32)> {
     let (header_length, payload_start) = header_and_payload(itunesdb)?;
     let payload = &itunesdb[payload_start..];
     let dataset_count = usize::try_from(read_u32(itunesdb, 0x14)?)
@@ -192,6 +195,40 @@ pub(crate) fn add_track(
     for dataset in datasets {
         rewritten.extend_from_slice(&dataset);
     }
+    let finalized = finalize(itunesdb, header_length, &rewritten, checksum, guid)?;
+    Ok((finalized, next_track_id))
+}
+
+/// Re-points playlist mhips at replacement tracks on a classic (raw,
+/// uncompressed) `iTunesDB` after the additions step, when the
+/// replacements' track ids are finally known.
+///
+/// NOTE(vendored patch): metadata edits are remove-and-re-add, so
+/// without this remap the replacement would drop out of every user
+/// playlist. Both type-2 and type-3 universes carry a master at
+/// position 0 (rebuilt canonically by `add_track`) — it is skipped in
+/// both; every other playlist is patched in place so the entry keeps
+/// its exact position and children.
+pub(crate) fn rename_tracks(
+    itunesdb: &[u8],
+    checksum: ChecksumKind,
+    guid: Option<&[u8; 8]>,
+    renames: &[super::cdb_edit::CdbTrackRename],
+) -> Result<Vec<u8>> {
+    if renames.is_empty() {
+        return Err(verification("no iTunesDB renames were requested"));
+    }
+    let (header_length, payload_start) = header_and_payload(itunesdb)?;
+    let dataset_count = usize::try_from(read_u32(itunesdb, 0x14)?)
+        .map_err(|_| malformed(0x14, "dataset count does not fit this host"))?;
+    let mut datasets = split_datasets(&itunesdb[payload_start..], dataset_count)?;
+    for dataset in &mut datasets {
+        let kind = read_u32(dataset, 12)?;
+        if matches!(kind, 2 | 3) {
+            *dataset = super::cdb_edit::rename_playlist_dataset(dataset, renames, true)?;
+        }
+    }
+    let rewritten = datasets.into_iter().flatten().collect::<Vec<_>>();
     finalize(itunesdb, header_length, &rewritten, checksum, guid)
 }
 

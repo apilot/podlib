@@ -17,8 +17,8 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::JoinHandle;
 
 use podlib::{
-    assign_album_track_numbers, BackendError, LibraryBackend, Playlist, PlaylistDraft,
-    PlaylistId, Track, TrackChanges, TrackDraft, TrackId,
+    assign_album_track_numbers, BackendError, BatchEditOutcome, LibraryBackend, Playlist,
+    PlaylistDraft, PlaylistId, Track, TrackChanges, TrackDraft, TrackId,
 };
 
 /// One command to the library worker; plain data, so it is `Send` even
@@ -31,6 +31,10 @@ pub enum LibraryCommand {
     AddTracks(Vec<TrackDraft>),
     RemoveTrack { id: TrackId, purge_media: bool },
     EditTrack { id: TrackId, changes: TrackChanges },
+    /// Batch tag edit: assigns one artist to every listed track.
+    /// Per-id failures do not stop the batch — the honest tail in the
+    /// summary reports each one (id/title + reason).
+    SetArtist { track_ids: Vec<TrackId>, artist: String },
     CreatePlaylist { name: String },
     DeletePlaylist { id: PlaylistId },
     AddToPlaylist { playlist: PlaylistId, track_ids: Vec<TrackId> },
@@ -319,6 +323,10 @@ fn dispatch(backend: &mut dyn LibraryBackend, command: LibraryCommand) -> Librar
             Err(error) => failure_outcome(error),
         },
         LibraryCommand::EditTrack { id, changes } => edit_track_command(backend, id, changes),
+        LibraryCommand::SetArtist {
+            track_ids,
+            artist,
+        } => set_artist_command(backend, track_ids, artist),
         LibraryCommand::CreatePlaylist { name } => match PlaylistDraft::new(&name, Vec::new()) {
             Ok(draft) => match backend.create_playlist(&draft) {
                 Ok(_) => finish(backend, format!("Создан плейлист «{name}»")),
@@ -482,6 +490,89 @@ fn edit_track_command(
         }
         Err(error) => failure_outcome(error),
     }
+}
+
+/// Batch «Задать исполнителя»: one backend batch call (on libopod
+/// backends a single edit session — N×replace_track, one stage+install,
+/// instead of N full device installs). The backend itself skips tracks
+/// that already carry the target artist ([`BatchEditOutcome::Unchanged`]
+/// — pid does not rotate, re-runs are free), so the worker only counts
+/// the buckets and reports each honestly. Titles for the failure tail
+/// come from the pre-edit listing: per-id backend failures name opaque
+/// ids only.
+fn set_artist_command(
+    backend: &mut dyn LibraryBackend,
+    track_ids: Vec<TrackId>,
+    artist: String,
+) -> LibraryOutcome {
+    let total = track_ids.len();
+    let titles: std::collections::BTreeMap<TrackId, String> = match list_snapshot(backend) {
+        Ok(snapshot) => snapshot
+            .tracks
+            .into_iter()
+            .map(|track| (track.id, track.title))
+            .collect(),
+        Err(error) => return failure_outcome(error),
+    };
+    let outcomes = match backend.set_artist_batch(&track_ids, &artist) {
+        Ok(outcomes) => outcomes,
+        Err(error) => return failure_outcome(error),
+    };
+    let mut updated = 0_usize;
+    let mut unchanged = 0_usize;
+    let mut failures: Vec<String> = Vec::new();
+    for (id, outcome) in &outcomes {
+        match outcome {
+            BatchEditOutcome::Updated(_) => updated += 1,
+            BatchEditOutcome::Unchanged => unchanged += 1,
+            BatchEditOutcome::Failed(reason) => {
+                let title =
+                    titles.get(id).map_or_else(|| id.to_string(), |title| format!("«{title}»"));
+                failures.push(format!("{title}: {reason}"));
+            }
+        }
+    }
+    if updated == 0 && !failures.is_empty() {
+        let (message, hint) = if failures.len() == 1 {
+            (failures[0].clone(), None)
+        } else {
+            (
+                format!(
+                    "Задать исполнителя не удалось ни одному треку ({} из {total}): {}",
+                    failures.len(),
+                    failures.join("; ")
+                ),
+                Some("Список мог устареть — нажмите «Обновить».".to_owned()),
+            )
+        };
+        return LibraryOutcome::Failed { message, hint };
+    }
+    let unchanged_tail =
+        if unchanged > 0 { format!("; уже с исполнителем: {unchanged}") } else { String::new() };
+    let summary = if updated == 0 {
+        // Everything already carried the artist: an honest «уже задан»
+        // instead of a fabricated success count (failures are handled
+        // above, so `unchanged` covers the whole batch).
+        format!(
+            "Исполнитель уже задан: {} {}",
+            unchanged,
+            plural(unchanged, "трек", "трека", "треков")
+        )
+    } else if updated == total {
+        format!(
+            "Исполнитель задан: {} {}{unchanged_tail}",
+            total,
+            plural(total, "трек", "трека", "треков")
+        )
+    } else {
+        let mut summary = format!("Исполнитель задан: {updated} из {total}{unchanged_tail}");
+        if !failures.is_empty() {
+            summary.push_str("; задать не удалось: ");
+            summary.push_str(&failures.join("; "));
+        }
+        summary
+    };
+    finish(backend, summary)
 }
 
 /// Re-lists after a successful mutation and wraps the fresh snapshot.
@@ -2203,5 +2294,206 @@ mod tests {
         let (tx, rx) = channel();
         std::thread::spawn(move || tx.send(command).unwrap()).join().unwrap();
         assert!(rx.recv_timeout(TIMEOUT).is_ok());
+    }
+
+    /// Two-track fake for the batch «Задать исполнителя» command: ids in
+    /// `fail_ids` refuse the edit (stale-selection shape), the rest apply
+    /// the artist in memory like a real backend would. `edit_calls`
+    /// counts edit_track invocations — the idempotency guard is proven
+    /// by skipped edits, not just by the summary text.
+    struct ArtistBackend {
+        tracks: Vec<Track>,
+        fail_ids: Vec<TrackId>,
+        edit_calls: usize,
+    }
+
+    impl ArtistBackend {
+        fn two_tracks() -> Self {
+            Self {
+                tracks: vec![track_for_artist_test(1, "Track One"), track_for_artist_test(2, "Track Two")],
+                fail_ids: Vec::new(),
+                edit_calls: 0,
+            }
+        }
+    }
+
+    fn track_for_artist_test(bits: u64, title: &str) -> Track {
+        Track {
+            id: TrackId::from_bits(bits),
+            title: title.to_owned(),
+            artist: None,
+            album: None,
+            album_artist: None,
+            duration_ms: 90_000,
+            track_number: 1,
+            disc_number: 1,
+            size_bytes: 1024,
+            has_artwork: false,
+            media_kind: 1,
+        }
+    }
+
+    impl LibraryBackend for ArtistBackend {
+        fn tracks(&self) -> Result<Vec<Track>, BackendError> {
+            Ok(self.tracks.clone())
+        }
+
+        fn playlists(&self) -> Result<Vec<Playlist>, BackendError> {
+            Ok(Vec::new())
+        }
+
+        fn add_track(&mut self, _draft: &TrackDraft) -> Result<TrackId, BackendError> {
+            Err(BackendError::TrackNotFound(TrackId::from_bits(0)))
+        }
+
+        fn remove_track(&mut self, _id: TrackId, _purge_media: bool) -> Result<bool, BackendError> {
+            Ok(true)
+        }
+
+        fn edit_track(
+            &mut self,
+            id: TrackId,
+            changes: &TrackChanges,
+        ) -> Result<Track, BackendError> {
+            self.edit_calls += 1;
+            if self.fail_ids.contains(&id) {
+                return Err(BackendError::TrackNotFound(id));
+            }
+            let track = self
+                .tracks
+                .iter_mut()
+                .find(|track| track.id == id)
+                .ok_or(BackendError::TrackNotFound(id))?;
+            if let Some(artist) = &changes.artist {
+                track.artist = Some(artist.clone());
+            }
+            Ok(track.clone())
+        }
+
+        fn create_playlist(&mut self, _draft: &PlaylistDraft) -> Result<PlaylistId, BackendError> {
+            Err(BackendError::PlaylistNotFound(PlaylistId::from_bits(0)))
+        }
+
+        fn delete_playlist(&mut self, _id: PlaylistId) -> Result<bool, BackendError> {
+            Ok(false)
+        }
+
+        fn add_to_playlist(
+            &mut self,
+            _playlist: PlaylistId,
+            _track_ids: &[TrackId],
+        ) -> Result<(), BackendError> {
+            Err(BackendError::PlaylistNotFound(PlaylistId::from_bits(0)))
+        }
+
+        fn remove_from_playlist(
+            &mut self,
+            _playlist: PlaylistId,
+            _track_ids: &[TrackId],
+        ) -> Result<(), BackendError> {
+            Err(BackendError::PlaylistNotFound(PlaylistId::from_bits(0)))
+        }
+    }
+
+    #[test]
+    fn set_artist_updates_every_selected_track() {
+        let mut backend = ArtistBackend::two_tracks();
+        let outcome = set_artist_command(
+            &mut backend,
+            vec![TrackId::from_bits(1), TrackId::from_bits(2)],
+            "Котэ".to_owned(),
+        );
+        match outcome {
+            LibraryOutcome::Applied { snapshot, summary } => {
+                assert!(summary.contains("Исполнитель задан"), "got: {summary}");
+                for track in &snapshot.tracks {
+                    assert_eq!(track.artist.as_deref(), Some("Котэ"));
+                }
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_artist_reports_an_honest_failure_tail() {
+        let mut backend = ArtistBackend::two_tracks();
+        backend.fail_ids = vec![TrackId::from_bits(2)];
+        let outcome = set_artist_command(
+            &mut backend,
+            vec![TrackId::from_bits(1), TrackId::from_bits(2)],
+            "Котэ".to_owned(),
+        );
+        match outcome {
+            LibraryOutcome::Applied { summary, .. } => {
+                assert!(summary.contains("1 из 2"), "got: {summary}");
+                assert!(summary.contains("«Track Two»"), "got: {summary}");
+                assert!(summary.contains("не удалось"), "got: {summary}");
+            }
+            other => panic!("expected Applied with an honest tail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_artist_with_no_successes_fails_honestly() {
+        let mut backend = ArtistBackend::two_tracks();
+        backend.fail_ids = vec![TrackId::from_bits(1), TrackId::from_bits(2)];
+        let outcome = set_artist_command(
+            &mut backend,
+            vec![TrackId::from_bits(1), TrackId::from_bits(2)],
+            "Котэ".to_owned(),
+        );
+        match outcome {
+            LibraryOutcome::Failed { message, .. } => {
+                assert!(message.contains("не удалось"), "got: {message}");
+                assert!(message.contains("«Track One»"), "got: {message}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// N5 (idempotency): a track that already carries the target artist
+    /// must be skipped WITHOUT an edit (its pid must not rotate) and the
+    /// summary must say so explicitly.
+    #[test]
+    fn set_artist_skips_tracks_that_already_have_the_artist() {
+        let mut backend = ArtistBackend::two_tracks();
+        backend.tracks[0].artist = Some("Котэ".to_owned());
+        let outcome = set_artist_command(
+            &mut backend,
+            vec![TrackId::from_bits(1), TrackId::from_bits(2)],
+            "Котэ".to_owned(),
+        );
+        match outcome {
+            LibraryOutcome::Applied { snapshot, summary } => {
+                assert!(summary.contains("уже с исполнителем: 1"), "got: {summary}");
+                assert_eq!(backend.edit_calls, 1, "unchanged track must not be edited");
+                assert_eq!(snapshot.track(TrackId::from_bits(1)).unwrap().artist.as_deref(), Some("Котэ"));
+                assert_eq!(snapshot.track(TrackId::from_bits(2)).unwrap().artist.as_deref(), Some("Котэ"));
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
+    }
+
+    /// All tracks already carry the artist: no edits at all, and the
+    /// outcome is an honest Applied «уже задан», not a fake success
+    /// count or an error.
+    #[test]
+    fn set_artist_when_everything_is_unchanged_reports_already_set() {
+        let mut backend = ArtistBackend::two_tracks();
+        for track in &mut backend.tracks {
+            track.artist = Some("Котэ".to_owned());
+        }
+        let outcome = set_artist_command(
+            &mut backend,
+            vec![TrackId::from_bits(1), TrackId::from_bits(2)],
+            "Котэ".to_owned(),
+        );
+        match outcome {
+            LibraryOutcome::Applied { summary, .. } => {
+                assert!(summary.contains("уже задан"), "got: {summary}");
+                assert_eq!(backend.edit_calls, 0, "nothing to edit");
+            }
+            other => panic!("expected Applied «уже задан», got {other:?}"),
+        }
     }
 }

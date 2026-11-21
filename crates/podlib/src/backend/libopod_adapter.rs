@@ -15,7 +15,7 @@ use libopod::{
 };
 use rusqlite::{types::Value, OpenFlags};
 
-use crate::backend::{BackendError, LibraryBackend};
+use crate::backend::{BackendError, BatchEditOutcome, LibraryBackend};
 use crate::domain::{
     Playlist, PlaylistDraft, PlaylistId, Track, TrackChanges, TrackDraft, TrackId,
 };
@@ -415,6 +415,120 @@ fn find_new_track(known: &HashSet<u64>, tracks: &[Track]) -> Result<Track, Backe
         .ok_or_else(|| BackendError::Failure("mutated track missing after install".to_owned()))
 }
 
+/// Plan of one batch artist assignment: per-id outcomes already decided
+/// plus the replacement queue (old id → draft) still needing a staged
+/// install. A named alias keeps the queue function's signature legible.
+type ArtistBatchPlan = (Vec<(TrackId, BatchEditOutcome)>, Vec<(TrackId, TrackDraft)>);
+
+/// Up-front decisions for the batch artist assignment: tracks already
+/// carrying the target artist are skipped WITHOUT an edit (their pid
+/// must not rotate on repeated batch runs), unknown ids and media-path
+/// failures become per-id failures. The rest returns as the replacement
+/// queue for one staging session.
+fn queue_artist_replacements(
+    track_ids: &[TrackId],
+    artist: &str,
+    current: &[Track],
+    backend: &LibopodBackend,
+) -> Result<ArtistBatchPlan, BackendError> {
+    let changes = TrackChanges {
+        artist: Some(artist.to_owned()),
+        ..TrackChanges::default()
+    };
+    let mut skipped = Vec::with_capacity(track_ids.len());
+    let mut queue = Vec::with_capacity(track_ids.len());
+    for &id in track_ids {
+        if queue.iter().any(|(queued, _)| *queued == id) {
+            skipped.push((
+                id,
+                BatchEditOutcome::Failed("duplicate id in the batch".to_owned()),
+            ));
+            continue;
+        }
+        let Some(track) = current.iter().find(|track| track.id == id) else {
+            skipped.push((
+                id,
+                BatchEditOutcome::Failed(BackendError::TrackNotFound(id).to_string()),
+            ));
+            continue;
+        };
+        if track.artist.as_deref() == Some(artist) {
+            skipped.push((id, BatchEditOutcome::Unchanged));
+            continue;
+        }
+        let merged = apply_changes(track, &changes);
+        match backend.replacement_draft(id, &merged) {
+            Ok(draft) => queue.push((id, draft)),
+            Err(error) => skipped.push((id, BatchEditOutcome::Failed(error.to_string()))),
+        }
+    }
+    Ok((skipped, queue))
+}
+
+impl LibopodBackend {
+    /// Runs the whole replacement queue through ONE edit session (one
+    /// stage + one install) and resolves each old id to its new track
+    /// via the staged pid mapping.
+    fn install_replacements(
+        &mut self,
+        queue: &[(TrackId, TrackDraft)],
+    ) -> Result<Vec<(TrackId, Track)>, BackendError> {
+        if queue.is_empty() {
+            return Ok(Vec::new());
+        }
+        let stage_dir = Self::scratch_dir()?;
+        let staged = {
+            let mut session = self.session()?;
+            session.set_media_policy(MediaDeletionPolicy::KeepOrphan);
+            for (id, draft) in queue {
+                session.replace_track(PersistentId::from_bits(id.to_bits()), track_to_add(draft))?;
+            }
+            session.stage_sqlite_preview(stage_dir.path())?
+        };
+        // Pairing must happen before `finish` consumes the staged edit.
+        let mapping: Vec<(TrackId, TrackId)> = queue
+            .iter()
+            .zip(staged.addition_pids())
+            .map(|((old, _), new)| (*old, TrackId::from_bits(new.to_bits())))
+            .collect();
+        self.finish(staged)?;
+        let after = self.tracks()?;
+        mapping
+            .into_iter()
+            .map(|(old_id, new_id)| {
+                let track = after
+                    .iter()
+                    .find(|track| track.id == new_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        BackendError::Failure("batched track missing after install".to_owned())
+                    })?;
+                Ok((old_id, track))
+            })
+            .collect()
+    }
+
+    /// Builds the re-add draft for a replacement: the merged (edited)
+    /// fields plus the track's current media file, which `KeepOrphan`
+    /// keeps alive until the re-add has copied it.
+    fn replacement_draft(&self, id: TrackId, merged: &Track) -> Result<TrackDraft, BackendError> {
+        let media_path = self.current_media_path(id)?;
+        Ok(TrackDraft {
+            source_path: media_path,
+            title: merged.title.clone(),
+            artist: merged.artist.clone(),
+            album: merged.album.clone(),
+            album_artist: merged.album_artist.clone(),
+            genre: None, // genre is write-only and not preserved across edits
+            duration_ms: merged.duration_ms,
+            media_kind_bits: merged.media_kind, // edits keep the kind
+            track_number: merged.track_number,
+            track_count: 0, // the remove+re-add cycle loses the batch context
+            disc_number: merged.disc_number,
+        })
+    }
+}
+
 fn find_new_playlist_id(
     known: &HashSet<u64>,
     playlists: &[Playlist],
@@ -493,31 +607,48 @@ impl LibraryBackend for LibopodBackend {
             return Ok(current);
         }
         let merged = apply_changes(&current, changes);
-        let media_path = self.current_media_path(id)?;
+        let draft = self.replacement_draft(id, &merged)?;
 
-        let draft = TrackDraft {
-            source_path: media_path,
-            title: merged.title.clone(),
-            artist: merged.artist.clone(),
-            album: merged.album.clone(),
-            album_artist: merged.album_artist.clone(),
-            genre: None, // genre is write-only and not preserved across edits
-            duration_ms: merged.duration_ms,
-            media_kind_bits: merged.media_kind, // edits keep the kind
-            track_number: merged.track_number,
-            track_count: 0, // the remove+re-add cycle loses the batch context
-            disc_number: merged.disc_number,
-        };
         let stage_dir = Self::scratch_dir()?;
         let staged = {
             let mut session = self.session()?;
             session.set_media_policy(MediaDeletionPolicy::KeepOrphan);
-            session.remove_track(PersistentId::from_bits(id.to_bits()))?;
-            session.add_track(track_to_add(&draft))?;
+            // replace_track records the old→new pid mapping so the edit
+            // pipeline re-links user-playlist memberships to the
+            // re-added track (plain remove+add would orphan them).
+            session.replace_track(PersistentId::from_bits(id.to_bits()), track_to_add(&draft))?;
             session.stage_sqlite_preview(stage_dir.path())?
         };
         self.finish(staged)?;
         find_new_track(&known, &self.tracks()?)
+    }
+
+    /// Batch «задать исполнителя»: ALL replacements run in ONE edit
+    /// session — one stage + one install instead of one per track (a
+    /// 200-track selection drops from minutes of repeated open/stage/
+    /// install cycles to a single pass). The old→new pid mapping comes
+    /// from the staged edit's `addition_pids`, paired with the queue
+    /// order of the `replace_track` calls.
+    fn set_artist_batch(
+        &mut self,
+        track_ids: &[TrackId],
+        artist: &str,
+    ) -> Result<Vec<(TrackId, BatchEditOutcome)>, BackendError> {
+        let current = self.tracks()?;
+        let (skipped, queue) = queue_artist_replacements(track_ids, artist, &current, self)?;
+        let updated = self.install_replacements(&queue)?;
+        Ok(track_ids
+            .iter()
+            .filter_map(|&id| {
+                if let Some((_, track)) = updated.iter().find(|(old, _)| *old == id) {
+                    return Some((id, BatchEditOutcome::Updated(track.clone())));
+                }
+                skipped
+                    .iter()
+                    .find(|(oid, _)| *oid == id)
+                    .map(|(oid, outcome)| (*oid, outcome.clone()))
+            })
+            .collect())
     }
 
     fn create_playlist(&mut self, draft: &PlaylistDraft) -> Result<PlaylistId, BackendError> {

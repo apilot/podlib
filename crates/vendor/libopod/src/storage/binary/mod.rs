@@ -19,11 +19,11 @@ pub use cdb::{CdbDatasetInfo, CdbInfo};
 pub use classic::parse_library;
 pub(crate) use classic_edit::{
     add_track as add_classic_track, edit_playlists as edit_classic_playlists,
-    remove_tracks as remove_classic_tracks, sync_podcasts as sync_classic_podcasts,
-    ClassicPlaylistMutation,
+    remove_tracks as remove_classic_tracks, rename_tracks as rename_classic_tracks,
+    sync_podcasts as sync_classic_podcasts, ClassicPlaylistMutation,
 };
 
 pub(crate) use cbk::{build_hashab_cbk, verify_cbk};
 pub(crate) use cdb::inspect_cdb;
 pub(crate) use cdb_add::{add_track_to_cdb, CdbArtworkLink, CdbTrackAddition};
-pub(crate) use cdb_edit::remove_tracks_from_cdb;
+pub(crate) use cdb_edit::{rename_tracks_in_cdb, CdbTrackRename, remove_tracks_from_cdb};

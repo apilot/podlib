@@ -24,6 +24,19 @@ pub enum BackendError {
     Domain(#[from] crate::domain::DomainError),
 }
 
+/// Per-id result of a batch edit (see
+/// [`LibraryBackend::set_artist_batch`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchEditOutcome {
+    /// The edit ran: remove-and-re-add, so the track carries the NEW id.
+    Updated(Track),
+    /// Skipped deliberately: the field already holds the target value —
+    /// no pid rotation, no media copy.
+    Unchanged,
+    /// That one id failed; the reason is the formatted backend error.
+    Failed(String),
+}
+
 /// Read and mutate an iPod music library.
 ///
 /// Implementations must persist every mutation before returning, so a
@@ -58,6 +71,50 @@ pub trait LibraryBackend {
         id: TrackId,
         changes: &TrackChanges,
     ) -> Result<Track, BackendError>;
+
+    /// Assigns one artist to every listed track as a single batch.
+    ///
+    /// Per-id contract:
+    /// - [`BatchEditOutcome::Updated`] — the edit ran; the track carries
+    ///   the NEW id (remove-and-re-add, same as [`Self::edit_track`]).
+    /// - [`BatchEditOutcome::Unchanged`] — the track already had this
+    ///   artist; deliberately not edited, so its pid does not rotate and
+    ///   no media copy is made (idempotent re-runs are free).
+    /// - [`BatchEditOutcome::Failed`] — that one id failed; the rest of
+    ///   the batch is unaffected.
+    ///
+    /// The default implementation loops [`Self::edit_track`]; the
+    /// libopod backend overrides it to run all replacements in ONE edit
+    /// session (one stage + install instead of one per track).
+    fn set_artist_batch(
+        &mut self,
+        track_ids: &[TrackId],
+        artist: &str,
+    ) -> Result<Vec<(TrackId, BatchEditOutcome)>, BackendError> {
+        // Current artists are read once: a track that already carries the
+        // target artist skips the (pid-rotating) edit entirely.
+        let current: std::collections::BTreeMap<TrackId, Option<String>> = self
+            .tracks()?
+            .into_iter()
+            .map(|track| (track.id, track.artist))
+            .collect();
+        let changes = TrackChanges {
+            artist: Some(artist.to_owned()),
+            ..TrackChanges::default()
+        };
+        let mut outcomes = Vec::with_capacity(track_ids.len());
+        for &id in track_ids {
+            if current.get(&id).is_some_and(|artist_now| artist_now.as_deref() == Some(artist)) {
+                outcomes.push((id, BatchEditOutcome::Unchanged));
+                continue;
+            }
+            match self.edit_track(id, &changes) {
+                Ok(track) => outcomes.push((id, BatchEditOutcome::Updated(track))),
+                Err(error) => outcomes.push((id, BatchEditOutcome::Failed(error.to_string()))),
+            }
+        }
+        Ok(outcomes)
+    }
 
     /// Creates a user playlist with the given initial members and returns
     /// its new id.

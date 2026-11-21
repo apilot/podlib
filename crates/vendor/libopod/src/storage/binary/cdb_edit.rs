@@ -22,6 +22,7 @@ pub(crate) fn remove_tracks_from_cdb(
     bytes: &[u8],
     firewire_guid: [u8; 8],
     removals: &[PersistentId],
+    renames: &[(PersistentId, PersistentId)],
 ) -> Result<Vec<u8>> {
     if removals.is_empty() {
         return Err(verification("no CDB removals were requested"));
@@ -43,7 +44,7 @@ pub(crate) fn remove_tracks_from_cdb(
     for dataset in &mut datasets {
         let kind = read_u32(dataset, 12)?;
         if matches!(kind, 2 | 3 | 5) {
-            *dataset = rewrite_playlist_dataset(dataset, &removed)?;
+            *dataset = rewrite_playlist_dataset(dataset, &removed, renames)?;
         }
     }
 
@@ -52,6 +53,157 @@ pub(crate) fn remove_tracks_from_cdb(
         uncompressed.extend_from_slice(&dataset);
     }
     finalize_cdb(&bytes[..header_length], &uncompressed, firewire_guid)
+}
+
+/// One removal-and-re-add remap inside playlist datasets: the mhip that
+/// referenced `old` keeps its position but re-points at the replacement
+/// under `new` (CDB track id included).
+///
+/// NOTE(vendored patch): metadata edits are remove-and-re-add, so without
+/// this remap the track would drop out of every user playlist in the
+/// binary companion. The master playlist needs no remap entry — its mhips
+/// are rebuilt canonically from the type-1 dataset on every addition
+/// (`rewrite_master_playlist`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CdbTrackRename {
+    pub old: PersistentId,
+    pub new: PersistentId,
+    pub new_track_id: u32,
+}
+
+/// Re-points playlist mhips at replacement tracks after the additions
+/// step, when the replacements' CDB track ids are finally known. The
+/// master playlist (first mhyp of the type-2/type-3 dataset, same
+/// selection as `add_track_to_cdb`) is skipped: its mhip for the
+/// replacement was already re-created there.
+///
+/// Known shape limitation: an mhip whose header is shorter than
+/// `MHIP_PERSISTENT_ID + 8` carries no pid field and cannot be matched,
+/// so it is NOT remapped (it is also silently dropped by the removal
+/// pass — pid-less mhips cannot be distinguished from plain removals).
+/// Apple-authored databases always carry the pid; only legacy
+/// libopod-generated mhips omit it.
+pub(crate) fn rename_tracks_in_cdb(
+    bytes: &[u8],
+    firewire_guid: [u8; 8],
+    renames: &[CdbTrackRename],
+) -> Result<Vec<u8>> {
+    if renames.is_empty() {
+        return Err(verification("no CDB renames were requested"));
+    }
+    let header_length = usize::try_from(read_u32(bytes, 4)?)
+        .map_err(|_| malformed(4, "mhbd header length does not fit this host"))?;
+    let payload = decode_payload(bytes, header_length)?;
+    let dataset_count = usize::try_from(read_u32(bytes, 0x14)?)
+        .map_err(|_| malformed(0x14, "dataset count does not fit this host"))?;
+    let mut datasets = split_datasets(&payload, dataset_count)?;
+    // Same master-dataset selection as add_track_to_cdb: type 2, falling
+    // back to type 3 on firmware-reset databases that omit it.
+    let master_dataset = datasets
+        .iter()
+        .position(|dataset| read_u32(dataset, 12).ok() == Some(2))
+        .or_else(|| {
+            datasets
+                .iter()
+                .position(|dataset| read_u32(dataset, 12).ok() == Some(3))
+        });
+    for (index, dataset) in datasets.iter_mut().enumerate() {
+        let kind = read_u32(dataset, 12)?;
+        if matches!(kind, 2 | 3 | 5) {
+            let skip_master_head = master_dataset == Some(index);
+            *dataset = rename_playlist_dataset(dataset, renames, skip_master_head)?;
+        }
+    }
+    let mut uncompressed = Vec::new();
+    for dataset in datasets {
+        uncompressed.extend_from_slice(&dataset);
+    }
+    finalize_cdb(&bytes[..header_length], &uncompressed, firewire_guid)
+}
+
+/// Applies rename remaps to every playlist of one mhsd. `skip_master_head`
+/// leaves the first mhyp untouched (the master playlist whose membership
+/// the addition step rebuilt).
+pub(super) fn rename_playlist_dataset(
+    dataset: &[u8],
+    renames: &[CdbTrackRename],
+    skip_master_head: bool,
+) -> Result<Vec<u8>> {
+    let header = chunk_header(dataset, 0, b"mhsd")?;
+    let list = header.header_length;
+    require_magic(dataset, list, b"mhlp")?;
+    let list_header = usize_value(read_u32(dataset, list + 4)?, list + 4)?;
+    let count = usize_value(read_u32(dataset, list + 8)?, list + 8)?;
+    let body = checked_end(list, list_header, dataset.len(), list + 4)?;
+    let mut output = dataset[..body].to_vec();
+    let mut offset = body;
+    for position in 0..count {
+        let playlist = chunk_header(dataset, offset, b"mhyp")?;
+        let skip = skip_master_head && position == 0;
+        output.extend_from_slice(&rename_playlist(
+            &dataset[offset..playlist.end],
+            renames,
+            skip,
+        )?);
+        offset = playlist.end;
+    }
+    if offset != dataset.len() {
+        return Err(malformed(offset, "trailing bytes after mhlp playlists"));
+    }
+    let output_len = u32::try_from(output.len())
+        .map_err(|_| verification("rewritten playlist dataset exceeds u32"))?;
+    write_u32(&mut output, 8, output_len)?;
+    Ok(output)
+}
+
+/// Re-points matching mhips inside one playlist. WHY patch in place: the
+/// mhip's own children (position mhod, metadata) stay byte-identical, so
+/// the playlist keeps the entry's exact position and appearance on the
+/// device; only the identity fields rotate.
+fn rename_playlist(
+    playlist: &[u8],
+    renames: &[CdbTrackRename],
+    skip: bool,
+) -> Result<Vec<u8>> {
+    if skip {
+        return Ok(playlist.to_vec());
+    }
+    let header = chunk_header(playlist, 0, b"mhyp")?;
+    if header.header_length < 20 {
+        return Err(malformed(4, "mhyp header is too short"));
+    }
+    let mhod_count = usize_value(read_u32(playlist, 12)?, 12)?;
+    let mhip_count = usize_value(read_u32(playlist, 16)?, 16)?;
+    let mut output = playlist[..header.header_length].to_vec();
+    let mut offset = header.header_length;
+    for _ in 0..mhod_count {
+        let mhod = chunk_header(playlist, offset, b"mhod")?;
+        output.extend_from_slice(&playlist[offset..mhod.end]);
+        offset = mhod.end;
+    }
+    for _ in 0..mhip_count {
+        let mhip = chunk_header(playlist, offset, b"mhip")?;
+        let mut chunk = playlist[offset..mhip.end].to_vec();
+        let persistent_id = (mhip.header_length >= MHIP_PERSISTENT_ID + 8)
+            .then(|| read_u64(&chunk, MHIP_PERSISTENT_ID))
+            .transpose()?
+            .map(PersistentId::from_bits);
+        if let Some(id) = persistent_id {
+            if let Some(rename) = renames.iter().find(|rename| rename.old == id) {
+                write_u32(&mut chunk, MHIP_TRACK_ID, rename.new_track_id)?;
+                write_u64(&mut chunk, MHIP_PERSISTENT_ID, rename.new.to_bits())?;
+            }
+        }
+        output.extend_from_slice(&chunk);
+        offset = mhip.end;
+    }
+    if offset != playlist.len() {
+        return Err(malformed(offset, "trailing bytes after mhyp children"));
+    }
+    let output_len =
+        u32::try_from(output.len()).map_err(|_| verification("rewritten playlist exceeds u32"))?;
+    write_u32(&mut output, 8, output_len)?;
+    Ok(output)
 }
 
 /// Compresses a rewritten dataset payload, patches the `mhbd` header, applies
@@ -171,6 +323,7 @@ pub(super) fn rewrite_track_dataset(
 pub(super) fn rewrite_playlist_dataset(
     dataset: &[u8],
     removed: &[RemovedTrack],
+    renames: &[(PersistentId, PersistentId)],
 ) -> Result<Vec<u8>> {
     let header = chunk_header(dataset, 0, b"mhsd")?;
     let list = header.header_length;
@@ -185,7 +338,11 @@ pub(super) fn rewrite_playlist_dataset(
     let mut offset = body;
     for _ in 0..count {
         let playlist = chunk_header(dataset, offset, b"mhyp")?;
-        output.extend_from_slice(&rewrite_playlist(&dataset[offset..playlist.end], removed)?);
+        output.extend_from_slice(&rewrite_playlist(
+            &dataset[offset..playlist.end],
+            removed,
+            renames,
+        )?);
         offset = playlist.end;
     }
     if offset != dataset.len() {
@@ -197,7 +354,11 @@ pub(super) fn rewrite_playlist_dataset(
     Ok(output)
 }
 
-fn rewrite_playlist(playlist: &[u8], removed: &[RemovedTrack]) -> Result<Vec<u8>> {
+fn rewrite_playlist(
+    playlist: &[u8],
+    removed: &[RemovedTrack],
+    renames: &[(PersistentId, PersistentId)],
+) -> Result<Vec<u8>> {
     let header = chunk_header(playlist, 0, b"mhyp")?;
     if header.header_length < 20 {
         return Err(malformed(4, "mhyp header is too short"));
@@ -244,8 +405,15 @@ fn rewrite_playlist(playlist: &[u8], removed: &[RemovedTrack]) -> Result<Vec<u8>
             .then(|| read_u64(chunk, MHIP_PERSISTENT_ID))
             .transpose()?
             .map(PersistentId::from_bits);
-        let remove = removed_track_ids.contains(&track_id)
-            || persistent_id.is_some_and(|id| removed_persistent_ids.contains(&id));
+        // A renamed (removed-and-re-added) mhip survives the removal so the
+        // additions step can re-point it; dropping it here would lose the
+        // playlist position and the entry's device-side state.
+        let renamed = persistent_id.is_some_and(|id| {
+            renames.iter().any(|(old, _)| *old == id)
+        });
+        let remove = !renamed
+            && (removed_track_ids.contains(&track_id)
+                || persistent_id.is_some_and(|id| removed_persistent_ids.contains(&id)));
         if remove {
             if let Some(value) = mhip_position(chunk)? {
                 removed_order_values.push(value);
@@ -701,7 +869,7 @@ mod device_cdb_tests {
         let pids = track_pids(&payload);
         assert!(pids.len() > 200, "fixture library is unexpectedly small");
         let removed_index = pids.len() / 2;
-        let rewritten = super::remove_tracks_from_cdb(&bytes, [0u8; 8], &[pids[removed_index]])
+        let rewritten = super::remove_tracks_from_cdb(&bytes, [0u8; 8], &[pids[removed_index]], &[])
             .expect("removal stages");
         let rewritten_header = u32::from_le_bytes(rewritten[4..8].try_into().unwrap()) as usize;
         let rewritten_payload =
@@ -746,12 +914,12 @@ mod device_cdb_tests {
             offset += total;
         }
         assert!(pids.len() > 2, "device CDB has enough tracks");
-        let first = super::remove_tracks_from_cdb(&bytes, [0u8; 8], &[pids[1]]);
+        let first = super::remove_tracks_from_cdb(&bytes, [0u8; 8], &[pids[1]], &[]);
         let rewritten = first
             .unwrap_or_else(|error| panic!("removal of the copied device CDB failed: {error:?}"));
         // The rewritten CDB must itself re-parse and re-sign: remove a second
         // track from our own output to prove the round trip stays sound.
-        let second = super::remove_tracks_from_cdb(&rewritten, [0u8; 8], &[pids[2]]);
+        let second = super::remove_tracks_from_cdb(&rewritten, [0u8; 8], &[pids[2]], &[]);
         let final_cdb = second.unwrap_or_else(|error| {
             panic!("second removal from rewritten device CDB failed: {error:?}")
         });

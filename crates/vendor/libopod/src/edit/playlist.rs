@@ -14,8 +14,7 @@ use crate::{Error, PersistentId, Result, SqliteLibraryFile};
 pub(super) fn edit_staged_playlists(
     directory: &Path,
     edits: &BTreeMap<PersistentId, PlaylistEdit>,
-) -> Result<()> {
-    if edits.is_empty() {
+) -> Result<()> {    if edits.is_empty() {
         return Ok(());
     }
 
@@ -309,6 +308,116 @@ fn validate_invariants(
 
 fn stored_pid(id: PersistentId) -> i64 {
     i64::from_ne_bytes(id.to_bits().to_ne_bytes())
+}
+
+/// One removed track's playlist memberships, captured before the removal
+/// pipeline deletes `item_to_container` rows and re-inserted after the
+/// replacement item exists.
+///
+/// NOTE(vendored patch): metadata edits are remove-and-re-add, so the
+/// track rotates its persistent id; without this relink the track would
+/// silently drop out of every user playlist on the device. The master
+/// container is excluded on purpose — the addition pipeline already
+/// links the replacement into it (`db_info.primary_container_pid`),
+/// and relinking it here too would produce a duplicate membership row.
+/// Membership lands at the container's tail (`MAX(physical_order)+1`,
+/// `shuffle_order` NULL): the removal stage owns dense renumbering, and
+/// a plain append keeps its invariants without re-running it.
+pub(super) struct MembershipRelink {
+    new: i64,
+    containers: Vec<i64>,
+}
+
+/// Captures the user-playlist containers each renamed track belongs to.
+/// Runs on the staged copy BEFORE `edit_staged_databases` deletes the
+/// old pid's membership rows.
+pub(super) fn capture_membership_relinks(
+    directory: &Path,
+    renames: &[(PersistentId, PersistentId)],
+) -> Result<Vec<MembershipRelink>> {
+    if renames.is_empty() {
+        return Ok(Vec::new());
+    }
+    let library_path = directory.join(SqliteLibraryFile::Library.file_name());
+    let connection = Connection::open_with_flags(
+        &library_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|source| {
+        sqlite_error("open staged library for membership capture", &library_path, source)
+    })?;
+    let master: i64 = connection
+        .query_row("SELECT primary_container_pid FROM db_info LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(|source| {
+            sqlite_error("read primary container for membership capture", &library_path, source)
+        })?
+        .unwrap_or(0);
+    let mut statement = connection
+        .prepare("SELECT container_pid FROM item_to_container WHERE item_pid = ?1")
+        .map_err(|source| {
+            sqlite_error("prepare membership capture", &library_path, source)
+        })?;
+    let mut relinks = Vec::with_capacity(renames.len());
+    for (old, new) in renames {
+        let rows = statement
+            .query_map([stored_pid(*old)], |row| row.get::<_, i64>(0))
+            .map_err(|source| {
+                sqlite_error("capture playlist memberships", &library_path, source)
+            })?;
+        let containers: Vec<i64> = rows
+            .filter_map(|row| row.ok())
+            .filter(|container| *container != master)
+            .collect();
+        relinks.push(MembershipRelink {
+            new: stored_pid(*new),
+            containers,
+        });
+    }
+    Ok(relinks)
+}
+
+/// Re-links the captured memberships to the replacement pid. Runs after
+/// `add_tracks_to_staged_databases`, so the new item row exists and the
+/// `item_to_container` write cannot dangle.
+pub(super) fn apply_membership_relinks(
+    directory: &Path,
+    relinks: &[MembershipRelink],
+) -> Result<()> {
+    if relinks.is_empty() {
+        return Ok(());
+    }
+    let library_path = directory.join(SqliteLibraryFile::Library.file_name());
+    let mut connection = Connection::open_with_flags(
+        &library_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|source| {
+        sqlite_error("open staged library for membership relink", &library_path, source)
+    })?;
+    let transaction = connection
+        .transaction()
+        .map_err(|source| sqlite_error("begin staged membership relink", &library_path, source))?;
+    for relink in relinks {
+        for container in &relink.containers {
+            transaction
+                .execute(
+                    "INSERT INTO item_to_container (item_pid, container_pid, physical_order, \
+                     shuffle_order) VALUES (?1, ?2, \
+                     (SELECT COALESCE(MAX(physical_order), -1) + 1 FROM item_to_container \
+                      WHERE container_pid = ?2), NULL)",
+                    params![relink.new, container],
+                )
+                .map_err(|source| {
+                    sqlite_error("relink staged playlist membership", &library_path, source)
+                })?;
+        }
+    }
+    transaction
+        .commit()
+        .map_err(|source| sqlite_error("commit staged membership relink", &library_path, source))
 }
 
 fn core_data_now() -> i64 {

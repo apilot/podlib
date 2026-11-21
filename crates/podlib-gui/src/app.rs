@@ -190,6 +190,7 @@ enum PendingKind {
     AddTracks,
     RemoveTrack,
     EditTrack,
+    SetArtist,
     CreatePlaylist,
     DeletePlaylist,
     AddToPlaylist,
@@ -201,6 +202,14 @@ struct EditDialogState {
     id: TrackId,
     fields: EditDialogFields,
     error: Option<String>,
+}
+
+/// «Задать исполнителя» modal state: the selection snapshot plus the
+/// typed value; lives in [`LibraryUi`] so both survive frames.
+#[derive(Clone)]
+struct SetArtistDialog {
+    track_ids: Vec<TrackId>,
+    value: String,
 }
 
 /// Track-table choices collected during one frame, applied afterwards
@@ -284,6 +293,10 @@ struct LibraryUi {
     create_open: bool,
     new_playlist_name: String,
     edit_dialog: Option<EditDialogState>,
+    /// Open «Задать исполнителя» modal over the multi-selection: the
+    /// snapshot of the selection plus the typed value (dialog fields
+    /// live here so they survive frames).
+    set_artist_dialog: Option<SetArtistDialog>,
     picker_tracks: Option<Vec<TrackId>>,
     /// Sidebar view context (round 4.1 Ф2): master, a built-in device
     /// view or a user playlist.
@@ -527,6 +540,7 @@ impl PodlibApp {
             create_open: false,
             new_playlist_name: String::new(),
             edit_dialog: None,
+            set_artist_dialog: None,
             picker_tracks: None,
             view: LibraryView::Master,
             selected_track: None,
@@ -639,6 +653,10 @@ impl PodlibApp {
                         // identity; dropping a stale one here mirrors
                         // `valid_anchor` (which would degenerate it to
                         // a plain click later anyway).
+                        // M4 (batch edits): после «Задать исполнителя»
+                        // ВСЕ выбранные сменили pid (контракт edit_track
+                        // = remove+re-add) — осознанный сброс выделения
+                        // вместо ремапа старых id на новые.
                         library
                             .selected_tracks
                             .retain(|id| snapshot.track(*id).is_some());
@@ -1300,6 +1318,12 @@ impl PodlibApp {
             if toolbar.add && !selected.is_empty() {
                 library.picker_tracks = Some(selected.clone());
             }
+            if toolbar.set_artist && !selected.is_empty() {
+                library.set_artist_dialog = Some(SetArtistDialog {
+                    track_ids: selected.clone(),
+                    value: String::new(),
+                });
+            }
             if toolbar.remove && !selected.is_empty() {
                 if let LibraryView::Playlist(playlist_id) = view {
                     self.pending_remove_from_playlist = Some((playlist_id, selected.clone()));
@@ -1859,6 +1883,92 @@ impl PodlibApp {
         }
     }
 
+    /// Batch «Задать исполнителя» over the multi-selection (round 6.3).
+    /// One SetArtist command carries the whole batch — the worker loops
+    /// ids and reports the honest per-id tail. An empty (whitespace
+    /// only) value disables «Присвоить»: the domain treats a blank
+    /// artist as «no value», so confirming would be a silent no-op.
+    fn maybe_set_artist_modal(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self
+            .library
+            .as_ref()
+            .and_then(|library| library.set_artist_dialog.clone())
+        else {
+            return;
+        };
+        let count = dialog.track_ids.len();
+        let mut confirmed = false;
+        let mut artist = String::new();
+        let response = egui::Modal::new(egui::Id::unique("set_artist")).show(ctx, |ui| {
+            ui.set_width(440.0);
+            let Some(library) = self.library.as_mut() else {
+                return;
+            };
+            let Some(dialog) = library.set_artist_dialog.as_mut() else {
+                return;
+            };
+            // The typed value appears in the heading as soon as it is
+            // non-empty, mirroring the quoted-entity style of the delete
+            // confirmation («Удалить трек «X»?»).
+            let value_trimmed = dialog.value.trim().to_owned();
+            if value_trimmed.is_empty() {
+                ui.heading(format!(
+                    "Присвоить исполнителя выбранным трекам ({count})?"
+                ));
+            } else {
+                ui.heading(format!(
+                    "Присвоить исполнителя «{value_trimmed}» выбранным трекам ({count})?"
+                ));
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Исполнитель:");
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut dialog.value)
+                        .hint_text("Артист")
+                        .desired_width(300.0),
+                );
+                text_menu::attach_text_menu(&field);
+                field.request_focus();
+            });
+            // N1: the command carries the TRIMMED value — the header and
+            // the readiness gate both use the trimmed form, so an
+            // untrimmed send would store an artist invisible to the user.
+            artist = dialog.value.trim().to_owned();
+            ui.separator();
+            // Enter confirms at the input level regardless of focus —
+            // the password-modal pattern (round 6.1 F3).
+            let ready = !artist.trim().is_empty();
+            if ready && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                confirmed = true;
+                ui.close();
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Отмена").clicked() {
+                    ui.close();
+                }
+                if ui.add_enabled(ready, egui::Button::new("Присвоить")).clicked() {
+                    confirmed = true;
+                    ui.close();
+                }
+            });
+        });
+        if confirmed || response.should_close() {
+            if let Some(library) = self.library.as_mut() {
+                library.set_artist_dialog = None;
+            }
+        }
+        if confirmed && !artist.trim().is_empty() {
+            self.library_request(
+                LibraryCommand::SetArtist {
+                    track_ids: dialog.track_ids,
+                    artist,
+                },
+                PendingKind::SetArtist,
+                "Задаю исполнителя…",
+            );
+        }
+    }
     fn maybe_edit_track_modal(&mut self, ctx: &egui::Context) {
         if !self
             .library
@@ -2938,7 +3048,10 @@ fn retoggle_prefix_titles(rows: &mut [TagRow], prefix: &str, strip_now: bool) {
 }
 
 /// Applies the reviewed tags to the drafts: album/book title for all,
-/// author as album_artist (when non-empty), per-row title (an empty
+/// author as album_artist (when non-empty) AND as artist for drafts
+/// without an own artist — the vendor's display_artist() persists
+/// item.artist only, so unpropagated tracks stay nameless in «Песни» —
+/// per-row title (an empty
 /// edit falls back to the file stem) and track number. The empty-title
 /// validation text is kind-aware (round 6 tail nit-8).
 fn apply_tag_review(
@@ -2961,6 +3074,13 @@ fn apply_tag_review(
             prepared.album = Some(book.to_owned());
             if !author.is_empty() {
                 prepared.album_artist = Some(author.to_owned());
+                // Propagate into `artist` when the draft has none: the
+                // vendor's display_artist() persists item.artist only,
+                // so without this the track stays nameless in «Песни».
+                // A pre-existing artist is never overwritten.
+                if prepared.artist.as_deref().is_none_or(str::is_empty) {
+                    prepared.artist = Some(author.to_owned());
+                }
             }
             let title = row.title.trim();
             prepared.title = if title.is_empty() {
@@ -3080,6 +3200,7 @@ struct ToolbarActions {
     edit: bool,
     add: bool,
     remove: bool,
+    set_artist: bool,
 }
 
 /// Aggregated arguments for [`search_toolbar`] (UI chrome above the
@@ -3145,6 +3266,12 @@ fn search_toolbar(ui: &mut egui::Ui, params: SearchToolbarParams<'_>) -> Toolbar
                 .clicked()
             {
                 toolbar.add = true;
+            }
+            if ui
+                .add_enabled(enabled, egui::Button::new("Задать исполнителя…"))
+                .clicked()
+            {
+                toolbar.set_artist = true;
             }
             if ui
                 .add_enabled(idle && selection_len == 1, egui::Button::new("Изменить…"))
@@ -4240,6 +4367,7 @@ impl eframe::App for PodlibApp {
         self.maybe_delete_track_modal(&ctx);
         self.maybe_delete_playlist_modal(&ctx);
         self.maybe_create_playlist_modal(&ctx);
+        self.maybe_set_artist_modal(&ctx);
         self.maybe_edit_track_modal(&ctx);
         self.maybe_add_to_playlist_modal(&ctx);
         if self.start_mount {
@@ -5246,6 +5374,31 @@ mod tests {
         // An empty author must NOT overwrite the draft's artist field.
         let no_author = apply_tag_review(&drafts, "Книга", "", &rows, "x").unwrap();
         assert_eq!(no_author[0].album_artist, None);
+    }
+
+    /// The author lands in `album_artist` AND in `artist` when the draft
+    /// has no own artist: the vendor's display_artist() writes
+    /// item.artist only, so without the propagation the track never
+    /// shows up in the «Песни» list (round 6.4).
+    #[test]
+    fn tag_review_propagates_author_to_artist_when_artist_is_empty() {
+        let drafts = vec![
+            tag_draft("Ch1", None, None, 8),
+            // A pre-existing artist wins: propagation fills only blanks.
+            tag_draft("Ch2", Some("Свой артист"), None, 8),
+        ];
+        let rows = vec![
+            TagRow { title: "Глава 1".to_owned(), original_title: "Ch1".to_owned(), track_number: 1 },
+            TagRow { title: "Глава 2".to_owned(), original_title: "Ch2".to_owned(), track_number: 2 },
+        ];
+        let applied = apply_tag_review(&drafts, "Книга", "Котэ", &rows, "x").unwrap();
+        assert_eq!(applied[0].artist.as_deref(), Some("Котэ"));
+        assert_eq!(applied[0].album_artist.as_deref(), Some("Котэ"));
+        assert_eq!(applied[1].artist.as_deref(), Some("Свой артист"));
+        assert_eq!(applied[1].album_artist.as_deref(), Some("Котэ"));
+        // No author at all — nothing to propagate.
+        let no_author = apply_tag_review(&drafts, "Книга", "", &rows, "x").unwrap();
+        assert_eq!(no_author[0].artist, None);
     }
 
     // ---- tail nit-8: kind-aware texts ----

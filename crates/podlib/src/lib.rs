@@ -12,7 +12,9 @@ pub mod domain;
 pub mod fixture;
 pub mod open;
 
-pub use backend::{BackendError, ItunesdbBackend, LibopodBackend, LibraryBackend};
+pub use backend::{
+    BackendError, BatchEditOutcome, ItunesdbBackend, LibopodBackend, LibraryBackend,
+};
 pub use domain::{
     assign_album_track_numbers, DomainError, Playlist, PlaylistDraft, PlaylistId, Track,
     TrackChanges, TrackDraft, TrackId,

@@ -531,7 +531,7 @@ mod nano2_add_regression {
             date_mac: 0,
             artwork: None,
         };
-        let rewritten = add_track(&bytes, crate::device::ChecksumKind::None, None, &addition)
+        let (rewritten, _) = add_track(&bytes, crate::device::ChecksumKind::None, None, &addition)
             .unwrap_or_else(|error| panic!("first Nano 2G add failed: {error:?}"));
         let library = parse_library(&rewritten, None).expect("parse first-track result");
         assert_eq!(library.tracks.len(), 1);
@@ -575,7 +575,7 @@ mod nano2_add_regression {
             date_mac: 0,
             artwork: None,
         };
-        let rewritten = add_track(&bytes, crate::device::ChecksumKind::None, None, &addition)
+        let (rewritten, _) = add_track(&bytes, crate::device::ChecksumKind::None, None, &addition)
             .unwrap_or_else(|error| panic!("add to Nano 2G DB failed: {error:?}"));
         let header_length = usize_value(read_u32(&rewritten, 4).unwrap(), 4).unwrap();
         let payload = &rewritten[header_length..];

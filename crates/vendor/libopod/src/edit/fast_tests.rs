@@ -616,6 +616,7 @@ fn verification_reparse_sees_written_audiobooks() {
         &std::collections::BTreeSet::new(),
         &[addition.clone()],
         &std::collections::BTreeMap::new(),
+        &std::collections::BTreeMap::new(),
     )
     .expect_err("the filtered reparse must not verify an audiobook add");
     assert!(
@@ -644,6 +645,7 @@ fn verification_reparse_sees_written_audiobooks() {
         &std::collections::BTreeSet::new(),
         &[addition.clone()],
         &std::collections::BTreeMap::new(),
+        &std::collections::BTreeMap::new(),
     )
     .expect_err("the filtered before must not verify against the full after");
     assert!(
@@ -667,6 +669,7 @@ fn verification_reparse_sees_written_audiobooks() {
         &after_verification,
         &std::collections::BTreeSet::new(),
         &[addition],
+        &std::collections::BTreeMap::new(),
         &std::collections::BTreeMap::new(),
     )
     .expect("matching universes must verify the audiobook add");

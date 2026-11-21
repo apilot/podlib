@@ -38,7 +38,8 @@ use crate::{
     storage::{
         binary::{
             add_track_to_cdb, build_hashab_cbk, edit_classic_playlists, remove_tracks_from_cdb,
-            verify_cbk, CdbArtworkLink, CdbTrackAddition, ClassicPlaylistMutation,
+            rename_tracks_in_cdb, verify_cbk, CdbArtworkLink, CdbTrackAddition, CdbTrackRename,
+            ClassicPlaylistMutation,
         },
         sqlite::inspect_sqlite_database,
     },
@@ -214,6 +215,11 @@ pub struct EditSession<'device> {
     wide_pids: BTreeSet<PersistentId>,
     removals: BTreeSet<PersistentId>,
     additions: Vec<TrackToAdd>,
+    /// NOTE(vendored patch): replacements queued via `replace_track` —
+    /// removed pid → the index of the queued addition that takes over
+    /// its playlist memberships. Drives the staging-time membership
+    /// relink and the CDB mhip remap.
+    replacements: BTreeMap<PersistentId, usize>,
     playlist_edits: BTreeMap<PersistentId, PlaylistEdit>,
     media_policy: MediaDeletionPolicy,
 }
@@ -266,6 +272,7 @@ impl<'device> EditSession<'device> {
             wide_pids,
             removals: BTreeSet::new(),
             additions: Vec::new(),
+            replacements: BTreeMap::new(),
             playlist_edits: BTreeMap::new(),
             media_policy: MediaDeletionPolicy::KeepOrphan,
         })
@@ -549,6 +556,46 @@ impl<'device> EditSession<'device> {
         self.additions.len()
     }
 
+    /// Queues a metadata-edit replacement: `old` is removed and `track`
+    /// added, with every user-playlist membership of `old` re-pointed at
+    /// the replacement during staging.
+    ///
+    /// Contract:
+    /// - Membership is preserved in user playlists on SQLite-era devices
+    ///   (SQLite `item_to_container` + CDB mhip remap, datasets 2|3|5)
+    ///   AND on classic (iTunesDB) devices (mhip remap, datasets 2|3).
+    /// - The member's POSITION inside a playlist is NOT preserved: the
+    ///   relinked membership lands at the container tail
+    ///   (`physical_order = MAX+1`); only membership is guaranteed.
+    /// - The master playlist is excluded from the remap — the addition
+    ///   pipeline links replacements into it directly (it is rebuilt
+    ///   canonically on CDB/classic paths).
+    /// - Classic (iTunesDB) known limitation: the type-5 dataset (OTG
+    ///   shadow playlists) still carries the stale pid after a rename —
+    ///   only datasets 2|3 are patched there. The nano7g path remaps
+    ///   2|3|5 completely. The firmware reads playlists from
+    ///   `Library.itdb` (SQLite) on 6G/7G, so the SQLite remap is the
+    ///   authoritative one.
+    ///
+    /// NOTE(vendored patch): edits are remove-and-re-add, so the track
+    /// rotates its persistent id; without the recorded old→new mapping
+    /// the replacement would silently drop out of every user playlist
+    /// (SQLite `item_to_container` and the CDB's playlist mhips both
+    /// reference the removed pid).
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::remove_track`] for `old`.
+    pub fn replace_track(&mut self, old: PersistentId, track: TrackToAdd) -> Result<()> {
+        self.remove_track(old)?;
+        let index = self.additions.len();
+        self.additions.push(track);
+        // A second replacement of the same pid re-targets the mapping at
+        // the newest addition — the only coherent reading of the queue.
+        self.replacements.insert(old, index);
+        Ok(())
+    }
+
     /// Builds a schema-preserving `SQLite` removal preview in an empty host
     /// directory.
     ///
@@ -642,7 +689,19 @@ impl<'device> EditSession<'device> {
             feature: "classic staging",
             reason: "the classic iTunesDB library is unavailable".to_owned(),
         })?;
+        // M2: reindex artwork BEFORE addition resolution — the same
+        // staged-first rule as the SQLite path (resolve and the staged
+        // additions must see the post-reindex ArtworkDB/.ithmb).
+        let artwork_supported = profile.capabilities().supports_artwork();
+        if !self.removals.is_empty() && artwork_supported {
+            progress(ProgressEvent::Phase("Reindexing artwork and thumbnails"));
+            write_artwork_preview(self.device, &destination, &self.removals)?;
+        }
         let resolved = self.resolve_additions(&destination, progress)?;
+        // Replacement old→new pid mapping drives the mhip remap: the
+        // removal keeps the old mhip, the additions step re-points it
+        // once the replacement's track id is assigned.
+        let renames = resolve_replacements(&self.replacements, &resolved)?;
         if !self.removals.is_empty() {
             progress(ProgressEvent::Phase("Removing tracks from iTunesDB"));
             let removals: Vec<PersistentId> = self.removals.iter().copied().collect();
@@ -651,18 +710,44 @@ impl<'device> EditSession<'device> {
                 checksum,
                 guid.as_ref(),
                 &removals,
+                &renames,
             )?;
         }
+        // One assigned track id per addition — the remap needs the one
+        // that belongs to each replacement.
+        let mut addition_track_ids = Vec::with_capacity(resolved.len());
         for (index, addition) in resolved.iter().enumerate() {
             progress(ProgressEvent::Item {
                 operation: "Updating iTunesDB", current: index + 1, total: resolved.len(),
                 name: &addition.title,
             });
-            database = crate::storage::binary::add_classic_track(
+            let (added_database, assigned_track_id) = crate::storage::binary::add_classic_track(
                 &database,
                 checksum,
                 guid.as_ref(),
                 &classic_addition(addition),
+            )?;
+            database = added_database;
+            addition_track_ids.push(assigned_track_id);
+        }
+        if !renames.is_empty() {
+            progress(ProgressEvent::Phase("Re-pointing playlist memberships"));
+            let classic_renames: Vec<CdbTrackRename> = self
+                .replacements
+                .iter()
+                .filter_map(|(old, index)| {
+                    resolved.get(*index).map(|addition| CdbTrackRename {
+                        old: *old,
+                        new: addition.pid,
+                        new_track_id: addition_track_ids[*index],
+                    })
+                })
+                .collect();
+            database = crate::storage::binary::rename_classic_tracks(
+                &database,
+                checksum,
+                guid.as_ref(),
+                &classic_renames,
             )?;
         }
         if !self.playlist_edits.is_empty() {
@@ -721,11 +806,8 @@ impl<'device> EditSession<'device> {
         // files as the Nano 7G: removals drop records and reindex slots,
         // additions append records and frames. Nano 1G/2G artwork writing is
         // not implemented, so their edits must leave ArtworkDB untouched.
+        // The removal reindex itself ran before resolve_additions (M2).
         progress(ProgressEvent::Phase("Updating artwork database and thumbnails"));
-        let artwork_supported = profile.capabilities().supports_artwork();
-        if !self.removals.is_empty() && artwork_supported {
-            write_artwork_preview(self.device, &destination, &self.removals)?;
-        }
         if !resolved.is_empty() && artwork_supported {
             write_artwork_additions(self.device, &destination, &resolved)?;
             write_artwork_frames(&destination, &resolved)?;
@@ -742,6 +824,7 @@ impl<'device> EditSession<'device> {
             &after,
             &self.removals,
             &resolved,
+            &self.replacements,
             &self.playlist_edits,
         )?;
         if checksum == ChecksumKind::Hash58 {
@@ -826,6 +909,7 @@ impl<'device> EditSession<'device> {
             deletions,
             source_generation: self.device.generation().clone(),
             manifest,
+            addition_pids: resolved.iter().map(|addition| addition.pid).collect(),
         })
     }
 
@@ -862,7 +946,24 @@ impl<'device> EditSession<'device> {
             feature: "SQLite staging",
             reason: format!("the source library re-read failed: {source}"),
         })?;
+        // M2 (same class as the staged-first CDB fix): reindex artwork
+        // BEFORE addition resolution, so reused-artwork lookups and
+        // fresh slot allocation read the staged (post-reindex)
+        // ArtworkDB/.ithmb instead of the pristine mount.
+        let artwork_supported = self
+            .device
+            .profile()
+            .is_some_and(|profile| profile.capabilities().supports_artwork());
+        if !self.removals.is_empty() && artwork_supported {
+            progress(ProgressEvent::Phase("Reindexing artwork and thumbnails"));
+            write_artwork_preview(self.device, &destination, &self.removals)?;
+        }
         let resolved = self.resolve_additions(&destination, progress)?;
+        // Replacement pids are resolved now; memberships are captured
+        // BEFORE the removal stage deletes them and re-linked after the
+        // addition stage re-created the item rows.
+        let renames = resolve_replacements(&self.replacements, &resolved)?;
+        let relinks = playlist::capture_membership_relinks(&destination, &renames)?;
         if !self.removals.is_empty() {
             progress(ProgressEvent::Phase("Removing tracks from SQLite databases"));
             edit_staged_databases(&destination, &self.removals)?;
@@ -870,6 +971,7 @@ impl<'device> EditSession<'device> {
         if !resolved.is_empty() {
             add_tracks_to_staged_databases(&destination, &resolved, progress)?;
         }
+        playlist::apply_membership_relinks(&destination, &relinks)?;
         if !self.playlist_edits.is_empty() {
             progress(ProgressEvent::Phase("Updating playlists"));
             edit_staged_playlists(&destination, &self.playlist_edits)?;
@@ -894,14 +996,17 @@ impl<'device> EditSession<'device> {
                 .is_some_and(|profile| profile.capabilities().supports_artwork());
             if !self.removals.is_empty() {
                 progress(ProgressEvent::Phase("Removing tracks from binary companion"));
-                write_cdb_preview(self.device, &destination, guid, &self.removals)?;
-                if artwork_supported {
-                    progress(ProgressEvent::Phase("Reindexing artwork and thumbnails"));
-                    write_artwork_preview(self.device, &destination, &self.removals)?;
-                }
+                write_cdb_preview(self.device, &destination, guid, &self.removals, &renames)?;
             }
             if !resolved.is_empty() {
-                write_cdb_additions(self.device, &destination, guid, &resolved, progress)?;
+                write_cdb_additions(
+                    self.device,
+                    &destination,
+                    guid,
+                    &resolved,
+                    &self.replacements,
+                    progress,
+                )?;
                 progress(ProgressEvent::Phase("Updating artwork database and thumbnails"));
                 if artwork_supported {
                     write_artwork_additions(self.device, &destination, &resolved)?;
@@ -925,6 +1030,7 @@ impl<'device> EditSession<'device> {
             &after,
             &self.removals,
             &resolved,
+            &self.replacements,
             &self.playlist_edits,
         )?;
         progress(ProgressEvent::Phase("Verifying source and preparing staging manifest"));
@@ -996,6 +1102,7 @@ impl<'device> EditSession<'device> {
             deletions,
             source_generation: self.device.generation().clone(),
             manifest,
+            addition_pids: resolved.iter().map(|addition| addition.pid).collect(),
         })
     }
 
@@ -1037,6 +1144,7 @@ impl<'device> EditSession<'device> {
         let mut running_sizes = std::collections::HashMap::new();
         let active_artwork_formats = addition_artwork_format_ids(
             self.device,
+            destination,
             &profile.capabilities().artwork_formats,
             &self.removals,
             &self.additions,
@@ -1048,7 +1156,7 @@ impl<'device> EditSession<'device> {
             .iter()
             .any(|track| track.reuse_album_art || track.artwork_source.is_some())
         {
-            base_image_id(self.device)?
+            base_image_id(self.device, destination)?
         } else {
             100
         };
@@ -1069,10 +1177,17 @@ impl<'device> EditSession<'device> {
                     reason: "reuse_album_art and artwork_source are mutually exclusive".to_owned(),
                 });
             } else if track.reuse_album_art {
-                resolve_reused_artwork(self.device, track, &mut next_image_id)?
+                resolve_reused_artwork(
+                    self.device,
+                    destination,
+                    track,
+                    &mut next_image_id,
+                    &self.removals,
+                )?
             } else if track.artwork_source.is_some() {
                 resolve_new_artwork(
                     self.device,
+                    destination,
                     track,
                     &mut running_sizes,
                     &mut next_image_id,
@@ -1134,6 +1249,13 @@ pub struct StagedSqliteEdit {
     deletions: Vec<ManifestDeletionFile>,
     source_generation: GenerationFingerprint,
     manifest: PathBuf,
+    /// Persistent ids assigned to this edit's additions, in addition
+    /// order. NOTE(vendored patch): additions get their pids during
+    /// `resolve_additions`, so callers that queue `replace_track`
+    /// batches can pair their old ids with the staged replacements
+    /// (old[i] → addition_pids[i]) only through this accessor — the
+    /// mapping is unobservable otherwise.
+    addition_pids: Vec<PersistentId>,
 }
 
 /// Verification policy for a staged installation.
@@ -1151,6 +1273,13 @@ pub enum InstallMode {
 }
 
 impl StagedSqliteEdit {
+    /// Persistent ids assigned to this edit's additions, in addition
+    /// order (see the field docs).
+    #[must_use]
+    pub fn addition_pids(&self) -> &[PersistentId] {
+        &self.addition_pids
+    }
+
     /// Installs the staged transaction on the device the session was opened
     /// from.
     ///
@@ -1367,10 +1496,22 @@ fn generate_unique_pid(existing: &BTreeSet<PersistentId>) -> PersistentId {
 /// Finds an album-mate with on-device artwork and builds a reused-artwork
 /// link for a new track: a fresh `mhii` image ID plus the album-mate's slot
 /// references copied verbatim.
+/// Resolves a reused-artwork link by finding an album mate that is NOT
+/// queued for removal (a sole mate being removed means honest artwork
+/// loss: `Ok(None)`, and the item row stores `artwork_status = 0`).
+///
+/// NOTE(vendored patch): the ArtworkDB read is staged-first — in mixed
+/// sessions the removal reindex has already repacked the staged copy,
+/// so the copied slot refs are valid against the final `.ithmb`. The
+/// mate's pid is recorded on the link for the same reason: staging
+/// re-derives the refs from the mate's STAGED record before appending
+/// (`write_artwork_additions`).
 fn resolve_reused_artwork(
     device: &Device,
+    directory: &Path,
     track: &TrackToAdd,
     next_image_id: &mut u32,
+    removals: &BTreeSet<PersistentId>,
 ) -> Result<Option<ArtworkLink>> {
     let album = track.album.as_deref().unwrap_or("");
     let album_artist = track
@@ -1383,6 +1524,7 @@ fn resolve_reused_artwork(
         .and_then(|library| {
             library.tracks().iter().find(|candidate| {
                 candidate.has_artwork
+                    && !removals.contains(&candidate.id)
                     && candidate.album == album
                     && (if candidate.album_artist.is_empty() {
                         candidate.artist.clone()
@@ -1395,9 +1537,7 @@ fn resolve_reused_artwork(
     let Some(mate) = mate else {
         return Ok(None);
     };
-    let relative = IpodPath::new("iPod_Control/Artwork/ArtworkDB")?;
-    let artwork_path = device.mount().resolve_existing(&relative)?;
-    let bytes = read_limited(&artwork_path, MAX_ARTWORK_BYTES, "ArtworkDB")?;
+    let bytes = read_artwork_database(device, directory)?;
     let records = crate::artwork::parse_artwork_records(&bytes)?;
     let record = records
         .iter()
@@ -1414,15 +1554,27 @@ fn resolve_reused_artwork(
         src_img_size: record.src_img_size,
         child_count,
         mhod_children,
+        mate: Some(mate.id),
         frames: Vec::new(),
     }))
 }
 
-/// The next free `mhii` image ID on the device.
-fn base_image_id(device: &Device) -> Result<u32> {
+/// Reads the ArtworkDB the edit must build on: the staged copy when a
+/// previous staging phase (artwork reindex) already wrote one, the
+/// pristine mount otherwise. Same staged-first rule as the CDB writers.
+fn read_artwork_database(device: &Device, directory: &Path) -> Result<Vec<u8>> {
+    let staged = directory.join("ArtworkDB");
+    if staged.is_file() {
+        return read_limited(&staged, MAX_ARTWORK_BYTES, "staged ArtworkDB");
+    }
     let relative = IpodPath::new("iPod_Control/Artwork/ArtworkDB")?;
-    let artwork_path = device.mount().resolve_existing(&relative)?;
-    let bytes = read_limited(&artwork_path, MAX_ARTWORK_BYTES, "ArtworkDB")?;
+    let path = device.mount().resolve_existing(&relative)?;
+    read_limited(&path, MAX_ARTWORK_BYTES, "ArtworkDB")
+}
+
+/// The next free `mhii` image ID on the device.
+fn base_image_id(device: &Device, directory: &Path) -> Result<u32> {
+    let bytes = read_artwork_database(device, directory)?;
     let records = crate::artwork::parse_artwork_records(&bytes)?;
     records
         .iter()
@@ -1440,6 +1592,7 @@ fn base_image_id(device: &Device) -> Result<u32> {
 /// a fresh `.ithmb` slot after the running end of each active format file.
 fn resolve_new_artwork(
     device: &Device,
+    directory: &Path,
     track: &TrackToAdd,
     running_sizes: &mut std::collections::HashMap<String, u64>,
     next_image_id: &mut u32,
@@ -1476,7 +1629,14 @@ fn resolve_new_artwork(
         .filter(|frame| active_format_ids.contains(&frame.format_id))
     {
         let relative = IpodPath::new(format!("iPod_Control/Artwork/{}", frame.filename))?;
-        let device_size = if device.mount().contains(&relative)? {
+        // Staged-first: after the reorder the reindexed staged `.ithmb`
+        // is the allocation base; the pristine mount is only a fallback.
+        let staged_frame = directory.join("iPod_Control/Artwork").join(&frame.filename);
+        let device_size = if staged_frame.is_file() {
+            fs::metadata(&staged_frame)
+                .map_err(|error| io_error("inspect staged artwork frame", &staged_frame, error))?
+                .len()
+        } else if device.mount().contains(&relative)? {
             let path = device.mount().resolve_existing(&relative)?;
             fs::metadata(&path)
                 .map_err(|error| io_error("inspect artwork frame file", &path, error))?
@@ -1521,18 +1681,20 @@ fn resolve_new_artwork(
         src_img_size: u32::try_from(source_bytes.len()).unwrap_or(u32::MAX),
         child_count,
         mhod_children,
+        mate: None,
         frames: out_frames,
     }))
 }
 
 fn addition_artwork_format_ids(
     device: &Device,
+    directory: &Path,
     formats: &[crate::ArtworkFormatProfile],
     removals: &BTreeSet<PersistentId>,
     additions: &[TrackToAdd],
 ) -> Result<BTreeSet<u32>> {
     if additions.iter().any(|track| track.artwork_source.is_some()) {
-        active_artwork_format_ids(device, formats, removals)
+        active_artwork_format_ids(device, directory, formats, removals)
     } else {
         Ok(BTreeSet::new())
     }
@@ -1554,12 +1716,11 @@ fn choose_artwork_format_ids(
 
 fn active_artwork_format_ids(
     device: &Device,
+    directory: &Path,
     formats: &[crate::ArtworkFormatProfile],
     removals: &BTreeSet<PersistentId>,
 ) -> Result<BTreeSet<u32>> {
-    let relative = IpodPath::new("iPod_Control/Artwork/ArtworkDB")?;
-    let source = device.mount().resolve_existing(&relative)?;
-    let bytes = read_limited(&source, MAX_ARTWORK_BYTES, "ArtworkDB")?;
+    let bytes = read_artwork_database(device, directory)?;
     let records: Vec<_> = crate::artwork::parse_artwork_records(&bytes)?
         .into_iter()
         .filter(|record| !removals.contains(&record.track_id))
@@ -1571,8 +1732,11 @@ fn active_artwork_format_ids(
         .map(|reference| reference.format_id)
         .collect();
     for name in referenced_files.keys() {
+        // Staged-first: the reindexed staged file satisfies the
+        // reference even when the mount copy is stale.
+        let staged = directory.join("iPod_Control/Artwork").join(name);
         let relative = IpodPath::new(format!("iPod_Control/Artwork/{name}"))?;
-        if !device.mount().contains(&relative)? {
+        if !staged.is_file() && !device.mount().contains(&relative)? {
             return Err(Error::Verification {
                 format: "ArtworkDB",
                 reason: format!("{name} is referenced but missing from the device"),
@@ -1582,11 +1746,14 @@ fn active_artwork_format_ids(
 
     let mut existing = BTreeSet::new();
     for format in formats {
+        let staged = directory
+            .join("iPod_Control/Artwork")
+            .join(format!("F{}_1.ithmb", format.format_id));
         let relative = IpodPath::new(format!(
             "iPod_Control/Artwork/F{}_1.ithmb",
             format.format_id
         ))?;
-        if device.mount().contains(&relative)? {
+        if staged.is_file() || device.mount().contains(&relative)? {
             existing.insert(format.format_id);
         }
     }
@@ -2025,12 +2192,15 @@ fn write_cdb_preview(
     directory: &Path,
     guid: [u8; 8],
     removals: &BTreeSet<PersistentId>,
+    renames: &[(PersistentId, PersistentId)],
 ) -> Result<()> {
     let relative = IpodPath::new("iPod_Control/iTunes/iTunesCDB")?;
     let source = device.mount().resolve_existing(&relative)?;
     let bytes = read_limited(&source, MAX_CDB_BYTES, "iTunesCDB")?;
     let requested: Vec<_> = removals.iter().copied().collect();
-    let rewritten = remove_tracks_from_cdb(&bytes, guid, &requested)?;
+    // Renamed (removed-and-re-added) pids keep their user-playlist mhips
+    // through the removal; the additions step re-points them below.
+    let rewritten = remove_tracks_from_cdb(&bytes, guid, &requested, renames)?;
     let output = directory.join("iTunesCDB");
     let mut file = File::create(&output)
         .map_err(|source| io_error("create staged iTunesCDB", &output, source))?;
@@ -2046,11 +2216,24 @@ fn write_cdb_additions(
     directory: &Path,
     guid: [u8; 8],
     additions: &[ResolvedAddition],
+    replacements: &BTreeMap<PersistentId, usize>,
     progress: &mut Progress<'_>,
 ) -> Result<()> {
     let relative = IpodPath::new("iPod_Control/iTunes/iTunesCDB")?;
-    let source = device.mount().resolve_existing(&relative)?;
+    // Mixed sessions (removals AND additions — every metadata edit) must
+    // ACCUMULATE in the staged file: the removal preview already rewrote
+    // the staged copy, so re-reading the pristine device file here would
+    // resurrect removed mhips and type-1 rows on every edit.
+    let staged = directory.join("iTunesCDB");
+    let source = if staged.is_file() {
+        staged
+    } else {
+        device.mount().resolve_existing(&relative)?
+    };
     let mut bytes = read_limited(&source, MAX_CDB_BYTES, "iTunesCDB")?;
+    // CDB track ids are assigned per addition below; kept for the
+    // playlist-mhip remap once every addition is in place.
+    let mut track_ids = Vec::with_capacity(additions.len());
     for (index, addition) in additions.iter().enumerate() {
         progress(ProgressEvent::Item {
             operation: "Updating binary companion", current: index + 1, total: additions.len(),
@@ -2085,7 +2268,17 @@ fn write_cdb_additions(
                 src_img_size: art.src_img_size,
             }),
         };
-        bytes = add_track_to_cdb(&bytes, guid, &cdb_addition)?;
+        let (added_bytes, assigned_track_id) = add_track_to_cdb(&bytes, guid, &cdb_addition)?;
+        bytes = added_bytes;
+        // Mirrors the loop invariant: one CDB track id per queued addition.
+        track_ids.push(assigned_track_id);
+    }
+    // Re-point kept user-playlist mhips at the replacements now that
+    // their CDB track ids are known. Runs before the staged file is
+    // written, so the companion lands on disk already remapped.
+    if !replacements.is_empty() {
+        let renames = resolve_cdb_renames(replacements, additions, &track_ids)?;
+        bytes = rename_tracks_in_cdb(&bytes, guid, &renames)?;
     }
     let output = directory.join("iTunesCDB");
     let mut file = File::create(&output)
@@ -2185,6 +2378,13 @@ fn write_artwork_preview(
 
 /// Appends a reused-artwork `mhii` record for every added track that
 /// inherits an existing album's slots. A no-op when nothing was reused.
+///
+/// NOTE(vendored patch): the base ArtworkDB is staged-first — in mixed
+/// sessions the removal reindex already rewrote the staged copy, and
+/// building on the pristine one would resurrect removed records. For
+/// reused links the slot refs are re-derived from the mate's STAGED
+/// record: the reindex repacked its `.ithmb` offsets after resolution
+/// read the pristine database, so the copied refs are stale.
 fn write_artwork_additions(
     device: &Device,
     directory: &Path,
@@ -2205,22 +2405,12 @@ fn write_artwork_additions(
     {
         return Ok(());
     }
-    let relative = IpodPath::new("iPod_Control/Artwork/ArtworkDB")?;
-    let source = device.mount().resolve_existing(&relative)?;
-    let bytes = read_limited(&source, MAX_ARTWORK_BYTES, "ArtworkDB")?;
-    let records: Vec<crate::artwork::NewArtworkRecord> = linked
+    let bytes = read_artwork_database(device, directory)?;
+    let staged_records = crate::artwork::parse_artwork_records(&bytes)?;
+    let records = linked
         .iter()
-        .map(|addition| {
-            let artwork = addition.artwork.as_ref().expect("filtered above");
-            crate::artwork::NewArtworkRecord {
-                image_id: artwork.image_id,
-                track_id: addition.pid,
-                src_img_size: artwork.src_img_size,
-                child_count: artwork.child_count,
-                mhod_children: artwork.mhod_children.clone(),
-            }
-        })
-        .collect();
+        .map(|addition| staged_addition_record(addition, &staged_records))
+        .collect::<Result<Vec<_>>>()?;
     let rewritten = crate::artwork::append_artwork_records(&bytes, &records)?;
     let remaining = crate::artwork::parse_artwork_records(&rewritten)?;
     for addition in &linked {
@@ -2254,6 +2444,50 @@ fn write_artwork_additions(
     file.sync_all()
         .map_err(|source| io_error("flush staged ArtworkDB", &output, source))?;
     Ok(())
+}
+
+/// Builds the `mhii` record for one artwork-bearing addition from the
+/// STAGED database state. Reused links re-derive the slot refs from the
+/// mate's staged record (the reindex repacked its offsets after
+/// resolution read the pristine database); fresh links keep their
+/// resolved refs (write_artwork_frames lands them exactly there).
+fn staged_addition_record(
+    addition: &ResolvedAddition,
+    staged_records: &[crate::artwork::ArtworkRecord],
+) -> Result<crate::artwork::NewArtworkRecord> {
+    let artwork = addition.artwork.as_ref().ok_or_else(|| Error::Verification {
+        format: "artwork reuse",
+        reason: "a linked addition carries no artwork link".to_owned(),
+    })?;
+    let (src_img_size, child_count, mhod_children) = if artwork.frames.is_empty() {
+        let mate = artwork.mate.ok_or_else(|| Error::Verification {
+            format: "artwork reuse",
+            reason: "a reused link carries no album mate".to_owned(),
+        })?;
+        let mate_record = staged_records
+            .iter()
+            .find(|record| record.track_id == mate)
+            .ok_or_else(|| Error::Verification {
+                format: "artwork reuse",
+                reason: "album-mate record missing from the staged ArtworkDB".to_owned(),
+            })?;
+        let (mhod_children, child_count) =
+            crate::artwork::build_reused_children(&mate_record.formats);
+        (mate_record.src_img_size, child_count, mhod_children)
+    } else {
+        (
+            artwork.src_img_size,
+            artwork.child_count,
+            artwork.mhod_children.clone(),
+        )
+    };
+    Ok(crate::artwork::NewArtworkRecord {
+        image_id: artwork.image_id,
+        track_id: addition.pid,
+        src_img_size,
+        child_count,
+        mhod_children,
+    })
 }
 
 /// Appends the encoded `.ithmb` frames of every addition with new artwork.
@@ -2392,11 +2626,65 @@ fn validate_staged_set(directory: &Path) -> Result<()> {
 }
 
 #[allow(clippy::too_many_lines)]
+/// Resolves the old→new pid pairs for every queued replacement. A
+/// dangling addition index means the `replace_track` invariant (the
+/// replacement and its addition are recorded atomically) is broken —
+/// that is a staging error, never a silent partial remap.
+fn resolve_replacements(
+    replacements: &BTreeMap<PersistentId, usize>,
+    resolved: &[ResolvedAddition],
+) -> Result<Vec<(PersistentId, PersistentId)>> {
+    replacements
+        .iter()
+        .map(|(old, index)| {
+            let addition = resolved.get(*index).ok_or_else(|| Error::Verification {
+                format: "staged replacement remap",
+                reason: format!(
+                    "queued replacement {old:?} points at addition #{index} that was never staged"
+                ),
+            })?;
+            Ok((*old, addition.pid))
+        })
+        .collect()
+}
+
+/// CDB form of [`resolve_replacements`]: the remap also needs each
+/// replacement's assigned CDB track id (one per addition, in order).
+fn resolve_cdb_renames(
+    replacements: &BTreeMap<PersistentId, usize>,
+    additions: &[ResolvedAddition],
+    track_ids: &[u32],
+) -> Result<Vec<CdbTrackRename>> {
+    replacements
+        .iter()
+        .map(|(old, index)| {
+            let addition = additions.get(*index).ok_or_else(|| Error::Verification {
+                format: "staged replacement remap",
+                reason: format!(
+                    "queued replacement {old:?} points at addition #{index} that was never staged"
+                ),
+            })?;
+            let new_track_id = track_ids.get(*index).copied().ok_or_else(|| Error::Verification {
+                format: "staged replacement remap",
+                reason: format!(
+                    "addition #{index} has no assigned CDB track id for the playlist remap"
+                ),
+            })?;
+            Ok(CdbTrackRename {
+                old: *old,
+                new: addition.pid,
+                new_track_id,
+            })
+        })
+        .collect()
+}
+
 fn validate_semantics(
     before: &Library,
     after: &Library,
     removals: &BTreeSet<PersistentId>,
     additions: &[ResolvedAddition],
+    replacements: &BTreeMap<PersistentId, usize>,
     playlist_edits: &BTreeMap<PersistentId, PlaylistEdit>,
 ) -> Result<()> {
     let expected_tracks = before
@@ -2465,6 +2753,37 @@ fn validate_semantics(
 
     let mut added_in_playlists = 0_usize;
     let mut expected_ids = BTreeSet::new();
+    // NOTE(vendored patch): replacements re-point user-playlist
+    // memberships old→new during staging, so those playlists legitimately
+    // gain the replacement pid — the validator must expect it instead of
+    // counting it as a master join (only the master earns
+    // `added_in_playlists`, keeping the «joined to master» check exact).
+    // Playlists with an explicit membership edit are excluded: their
+    // requested list replaces everything, including the relink.
+    let mut relinked_members: BTreeMap<PersistentId, Vec<PersistentId>> = BTreeMap::new();
+    for old in before.playlists() {
+        if old.is_hidden && old.distinguished_kind == 0 {
+            // Master: rebuilt by the addition stage itself.
+            continue;
+        }
+        if matches!(
+            playlist_edits.get(&old.id),
+            Some(PlaylistEdit::Update {
+                track_ids: Some(_),
+                ..
+            })
+        ) {
+            continue;
+        }
+        for member in old.track_ids() {
+            if let Some(new) = replacements
+                .get(member)
+                .and_then(|index| additions.get(*index).map(|addition| addition.pid))
+            {
+                relinked_members.entry(old.id).or_default().push(new);
+            }
+        }
+    }
     for old in before.playlists() {
         let edit = playlist_edits.get(&old.id);
         if matches!(edit, Some(PlaylistEdit::Delete)) {
@@ -2520,10 +2839,26 @@ fn validate_semantics(
             }
             continue;
         }
+        let relinked = relinked_members.get(&old.id);
         let mut expected_with_additions = expected.clone();
         expected_with_additions.extend(additions.iter().map(|addition| addition.pid));
-        if new.track_ids() == expected_with_additions {
+        if new.track_ids() == expected_with_additions && relinked.is_none() {
             added_in_playlists += additions.len();
+        } else if let Some(members) = relinked {
+            // Position-free comparison: the relink appends memberships at
+            // the container tail, so the replacement contract fixes the
+            // member SET, not the order within the playlist.
+            let mut got = new.track_ids().to_vec();
+            got.sort_unstable();
+            let mut want = expected;
+            want.extend(members.iter().copied());
+            want.sort_unstable();
+            if got != want {
+                return Err(Error::Verification {
+                    format: "staged library edit",
+                    reason: "playlist membership differs from the requested edit".to_owned(),
+                });
+            }
         } else if new.track_ids() != expected {
             return Err(Error::Verification {
                 format: "staged library edit",

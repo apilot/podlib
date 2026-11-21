@@ -56,6 +56,13 @@ pub(crate) struct ArtworkLink {
     pub src_img_size: u32,
     pub child_count: u32,
     pub mhod_children: Vec<u8>,
+    /// The album-mate track a reused link inherited its slots from.
+    /// NOTE(vendored patch): staged-ArtworkDB additions re-derive the
+    /// reused slot refs from the mate's record, because the removal
+    /// reindex repacks `.ithmb` offsets AFTER the resolution read the
+    /// pristine database. Fresh links carry `None` (their refs are
+    /// computed from the staged running sizes directly).
+    pub mate: Option<crate::PersistentId>,
     /// Encoded `.ithmb` frames to append, in format order.
     pub frames: Vec<ArtworkFrameOut>,
 }

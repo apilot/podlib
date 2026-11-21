@@ -14,3 +14,9 @@ plist = { workspace = true }
 # `hidden_items` in the libopod adapter); version and bundled feature
 # match the vendored libopod so one SQLite build serves both.
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+
+[dev-dependencies]
+# Direct staged-iTunesCDB inspection in fixture_tests (M1): zlib payload
+# decode + mhip walk. Same pin as the vendored libopod so one flate2
+# build serves both.
+flate2 = "1.1.9"

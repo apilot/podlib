@@ -111,7 +111,7 @@ pub(crate) fn add_track_to_cdb(
     bytes: &[u8],
     firewire_guid: [u8; 8],
     addition: &CdbTrackAddition,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, u32)> {
     let header_length = usize::try_from(read_u32(bytes, 4)?)
         .map_err(|_| malformed(4, "mhbd header length does not fit this host"))?;
     let payload = decode_payload(bytes, header_length)?;
@@ -165,7 +165,10 @@ pub(crate) fn add_track_to_cdb(
     for dataset in datasets {
         uncompressed.extend_from_slice(&dataset);
     }
-    finalize_cdb(&bytes[..header_length], &uncompressed, firewire_guid)
+    let finalized = finalize_cdb(&bytes[..header_length], &uncompressed, firewire_guid)?;
+    // Callers that re-point playlist mhips at this addition (edit
+    // replacements) need the CDB track id assigned here.
+    Ok((finalized, next_track_id))
 }
 
 /// A parsed existing track with everything needed for index rebuilds.
@@ -1508,13 +1511,14 @@ mod tests {
             date_mac: 0,
             artwork: None,
         };
-        let added = super::add_track_to_cdb(&bytes, [0u8; 8], &addition)
+        let (added, _) = super::add_track_to_cdb(&bytes, [0u8; 8], &addition)
             .unwrap_or_else(|error| panic!("addition to the copied device CDB failed: {error:?}"));
         // The rewritten CDB must re-parse: remove the track we just added.
         let removed = super::super::cdb_edit::remove_tracks_from_cdb(
             &added,
             [0u8; 8],
             &[addition.persistent_id],
+            &[],
         );
         assert!(
             removed.is_ok(),
@@ -1553,12 +1557,13 @@ mod tests {
             date_mac: 0,
             artwork: None,
         };
-        let added = super::add_track_to_cdb(&bytes, [0; 8], &addition)
+        let (added, _) = super::add_track_to_cdb(&bytes, [0; 8], &addition)
             .unwrap_or_else(|error| panic!("bootstrap CDB addition failed: {error:?}"));
         let removed = super::super::cdb_edit::remove_tracks_from_cdb(
             &added,
             [0; 8],
             &[addition.persistent_id],
+            &[],
         );
         assert!(
             removed.is_ok(),
@@ -1601,7 +1606,7 @@ mod tests {
             date_mac: 0,
             artwork: None,
         };
-        let rewritten = super::add_track_to_cdb(&bytes, [0u8; 8], &addition)
+        let (rewritten, _) = super::add_track_to_cdb(&bytes, [0u8; 8], &addition)
             .unwrap_or_else(|error| panic!("addition to the fixture CDB failed: {error:?}"));
         let rewritten_header = u32::from_le_bytes(rewritten[4..8].try_into().unwrap()) as usize;
         let rewritten_payload =
