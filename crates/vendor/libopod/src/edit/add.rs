@@ -791,6 +791,12 @@ fn insert_location_row(
             |row| row.get(0),
         )
         .map_err(|source| sqlite_error("resolve music base location", path, source))?;
+    // file_type stays the 'MP3 ' fourcc (0x4D503320) for every format on
+    // purpose: the format support patch changes only the staging gate and
+    // the staged file extension, one variable per change. Every live
+    // device row verified so far is an mp3 payload, so firmware behavior
+    // for other fourcc values is unknown; a real fourcc map is the
+    // follow-up patch if the live format check shows playback issues.
     transaction
         .execute(
             "INSERT INTO locations.location (item_pid, sub_id, base_location_id, location_type, \

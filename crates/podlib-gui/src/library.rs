@@ -369,7 +369,7 @@ fn add_tracks_command(
     // a book) get 1..N numbering and the shared count before writing.
     assign_album_track_numbers(&mut drafts);
     let total = drafts.len();
-    // Round 5.2: firmware-unplayable formats (flac/ogg/wav) are
+    // Round 5.2: firmware-unplayable formats (flac/ogg/oga) are
     // transcoded to AAC in this worker thread; the batch tempdir
     // lives until the batch ends and cleans itself up on drop.
     let transcode_dir = match tempfile::tempdir() {
@@ -563,13 +563,25 @@ pub(crate) fn panic_message(payload: Box<dyn Any + Send>) -> String {
 }
 
 /// File extensions accepted from drag-and-drop (case-insensitive).
-/// `m4b` = audiobook container → drafts get audiobook bits (round 5.1).
-/// flac/ogg/oga/wav are transcoded in the worker (round 5.2): Nano 7G
-/// firmware plays AAC-family audio only.
-pub const AUDIO_EXTENSIONS: [&str; 8] = ["mp3", "m4a", "m4b", "aac", "wav", "flac", "ogg", "oga"];
+/// Native Nano 7G firmware formats per the Apple spec pass through
+/// untouched: mp3, AAC-family (m4a/m4b/aac), WAV (since 2026-11-21),
+/// AIFF (aiff/aif) and Audible (aa/aax). `m4b`/`aa`/`aax` are
+/// audiobook containers → drafts get audiobook bits (round 5.1 and
+/// 2026-11-21). flac/ogg/oga have no firmware decoder and are
+/// transcoded in the worker (round 5.2).
+///
+/// The DB write is format-agnostic: vendored libopod hardcodes the
+/// `'MP3 '` fourcc for every track, and the actual file keeps its
+/// own extension. Playback of passthrough formats other than mp3
+/// still needs the live device check (release gate) — the vendor
+/// media gate accepted mp3 sources only until 2026-11-21.
+pub const AUDIO_EXTENSIONS: [&str; 12] = [
+    "mp3", "m4a", "m4b", "aac", "wav", "aiff", "aif", "aa", "aax", "flac", "ogg", "oga",
+];
 
-/// The extension that marks an audiobook file.
-const AUDIOBOOK_EXTENSION: &str = "m4b";
+/// Extensions that mark an audiobook file (bits 8): the AAC audiobook
+/// container and the native Audible formats.
+const AUDIOBOOK_EXTENSIONS: [&str; 3] = ["m4b", "aa", "aax"];
 
 /// Raw iTunesDB media-kind bit of audiobooks (round 5.1). Checks use
 /// the semantic bit test (`bits & AUDIOBOOK_BIT != 0`) — an exact
@@ -584,10 +596,24 @@ pub(crate) fn path_extension(path: &std::path::Path) -> String {
         .unwrap_or_default()
 }
 
-/// True for formats the Nano 7G firmware cannot play (flac/ogg/wav):
-/// the worker must transcode them to AAC before add_track.
+/// True for formats the Nano 7G firmware cannot play (flac/ogg/oga
+/// have no firmware decoder): the worker must transcode them before
+/// add_track. WAV joined the passthrough on 2026-11-21 — the
+/// spec lists it as native (round 5.2 had bundled it with flac/ogg).
 pub(crate) fn needs_transcode(extension: &str) -> bool {
-    matches!(extension, "flac" | "ogg" | "oga" | "wav")
+    matches!(extension, "flac" | "ogg" | "oga")
+}
+
+/// Codec routing of the transcode by source extension: FLAC is
+/// lossless, so it re-wraps into ALAC bit-perfectly (the e2e PCM test
+/// proves it); Ogg sources are lossy — a zero-additional-loss path
+/// does not exist, so they re-encode to VBR AAC (owner decision
+/// 2026-11-21: compact wins over size).
+fn transcode_codec(extension: &str) -> &'static str {
+    match extension {
+        "flac" => "alac",
+        _ => "aac", // ogg, oga
+    }
 }
 
 /// Target container extension of a transcode: audiobook bits get the
@@ -601,10 +627,15 @@ fn transcode_target_extension(media_kind_bits: u32) -> &'static str {
 }
 
 /// Exact argument list of the transcode command: silence the banner,
-/// drop any cover video stream, keep chapter metadata, encode AAC at a
-/// fixed bitrate and mux into the iPod container.
-fn ffmpeg_transcode_args(source: &std::path::Path, target: &std::path::Path) -> Vec<String> {
-    vec![
+/// drop any cover video stream, keep chapter metadata, encode with the
+/// routed codec (ALAC for lossless sources, VBR AAC otherwise) and mux
+/// into the iPod container.
+fn ffmpeg_transcode_args(
+    source: &std::path::Path,
+    target: &std::path::Path,
+    codec: &str,
+) -> Vec<String> {
+    let mut args = vec![
         "-hide_banner".to_owned(),
         "-loglevel".to_owned(),
         "error".to_owned(),
@@ -615,13 +646,17 @@ fn ffmpeg_transcode_args(source: &std::path::Path, target: &std::path::Path) -> 
         "-map_chapters".to_owned(),
         "0".to_owned(),
         "-c:a".to_owned(),
-        "aac".to_owned(),
-        "-b:a".to_owned(),
-        "192k".to_owned(),
-        "-f".to_owned(),
-        "ipod".to_owned(),
-        target.display().to_string(),
-    ]
+        codec.to_owned(),
+    ];
+    if codec == "aac" {
+        // Native AAC VBR quality 5 (~250k average).
+        args.push("-q:a".to_owned());
+        args.push("5".to_owned());
+    }
+    args.push("-f".to_owned());
+    args.push("ipod".to_owned());
+    args.push(target.display().to_string());
+    args
 }
 
 /// Honest batch tail for transcoding failures, appended to the summary.
@@ -661,7 +696,8 @@ fn collect_audio_files(directory: &std::path::Path, out: &mut Vec<PathBuf>) {
 /// Maps dropped file paths into track drafts. Returns the drafts plus
 /// human-readable names of skipped paths (not an audio extension, or a
 /// stem that cannot serve as a title) so the UI can show what was
-/// ignored. `.m4b` drafts carry audiobook media-kind bits. A dropped
+/// ignored. `.m4b`/`.aa`/`.aax` drafts carry audiobook media-kind
+/// bits. A dropped
 /// DIRECTORY expands recursively (sorted by full path; hidden entries
 /// and non-audio files skipped) and every audio file inside becomes an
 /// audiobook (bits 8 — the owner's rule: directory = book); a
@@ -715,10 +751,11 @@ pub fn drafts_from_paths(paths: &[PathBuf]) -> (Vec<TrackDraft>, Vec<String>) {
                 // part of the dropped book; a single dropped file keeps
                 // its own extension-based kind (round 6 tail minor-4:
                 // per-path provenance, not a global directory flag).
-                let draft = if *from_directory || extension == AUDIOBOOK_EXTENSION {
-                    draft.with_media_kind_bits(8)
-                } else {
-                    draft
+                let draft =
+                    if *from_directory || AUDIOBOOK_EXTENSIONS.contains(&extension.as_str()) {
+                        draft.with_media_kind_bits(8)
+                    } else {
+                        draft
                 };
                 drafts.push(draft);
             }
@@ -741,8 +778,9 @@ fn transcode_draft(
         "podlib-transcode-{index}.{}",
         transcode_target_extension(draft.media_kind_bits)
     ));
+    let codec = transcode_codec(&path_extension(&draft.source_path));
     let output = std::process::Command::new("ffmpeg")
-        .args(ffmpeg_transcode_args(&draft.source_path, &target))
+        .args(ffmpeg_transcode_args(&draft.source_path, &target, codec))
         .output()
         .map_err(|_| "ffmpeg не найден".to_owned())?;
     if !output.status.success() {
@@ -1093,6 +1131,46 @@ mod tests {
         assert_eq!(drafts[2].media_kind_bits, 1, "plain .mp3 stays a song");
     }
 
+    // ---- 2026-11-21: full iPod audio-format support ----
+
+    /// AIFF plays natively on Nano 7G per the Apple spec; the drafts
+    /// pass through as songs (round 5.2 had skipped both extensions).
+    #[test]
+    fn aiff_drafts_pass_through_as_songs() {
+        let dir = TempDir::new().unwrap();
+        let (drafts, skipped) = drafts_from_paths(&[
+            write_file(dir.path(), "Track.aiff"),
+            write_file(dir.path(), "Short.AIF"),
+            write_file(dir.path(), "cover.txt"),
+        ]);
+        assert_eq!(skipped, vec!["cover.txt"], "only non-audio is skipped");
+        assert_eq!(drafts.len(), 2);
+        assert_eq!(drafts[0].title, "Track");
+        assert_eq!(drafts[0].media_kind_bits, 1, ".aiff is a song");
+        assert_eq!(drafts[1].title, "Short", "extension match is case-insensitive");
+        assert_eq!(drafts[1].media_kind_bits, 1, ".AIF is a song");
+    }
+
+    /// Audible formats 2/3/4 (.aa) and Enhanced/AAX/AAX+ (.aax) play
+    /// natively; they are audiobooks — the drafts carry bits 8 like
+    /// .m4b, case-insensitively.
+    #[test]
+    fn audible_drafts_carry_audiobook_bits() {
+        let dir = TempDir::new().unwrap();
+        let (drafts, skipped) = drafts_from_paths(&[
+            write_file(dir.path(), "Book.aa"),
+            write_file(dir.path(), "Novel.AAX"),
+            write_file(dir.path(), "Plain.mp3"),
+        ]);
+        assert!(skipped.is_empty(), "aa/aax are audio files");
+        assert_eq!(drafts.len(), 3);
+        assert_eq!(drafts[0].title, "Book");
+        assert_eq!(drafts[0].media_kind_bits, 8, ".aa is an audiobook");
+        assert_eq!(drafts[1].title, "Novel");
+        assert_eq!(drafts[1].media_kind_bits, 8, "uppercase .AAX");
+        assert_eq!(drafts[2].media_kind_bits, 1, "plain .mp3 stays a song");
+    }
+
     // ---- round 5.2: directory drops + transcode ----
 
     /// Owner's decision: a dropped DIRECTORY is one audiobook — every
@@ -1146,23 +1224,36 @@ mod tests {
         write_file(dir.path(), "book/02.mp3");
         let single = write_file(dir.path(), "top.mp3");
         let m4b = write_file(dir.path(), "audio.m4b");
+        let audible = write_file(dir.path(), "book-direct.aa");
 
         for order in 0..2 {
             // Both orders prove the per-path (not first-seen) logic.
             let paths: Vec<PathBuf> = if order == 0 {
-                vec![dir.path().join("book"), single.clone(), m4b.clone()]
+                vec![
+                    dir.path().join("book"),
+                    single.clone(),
+                    m4b.clone(),
+                    audible.clone(),
+                ]
             } else {
-                vec![single.clone(), m4b.clone(), dir.path().join("book")]
+                vec![
+                    single.clone(),
+                    m4b.clone(),
+                    audible.clone(),
+                    dir.path().join("book"),
+                ]
             };
             let (drafts, skipped) = drafts_from_paths(&paths);
             assert!(skipped.is_empty());
-            assert_eq!(drafts.len(), 4, "2 book files + 2 direct files: {order}");
+            assert_eq!(drafts.len(), 5, "2 book files + 3 direct files: {order}");
             for draft in &drafts {
                 let bits = draft.media_kind_bits;
                 if draft.source_path.starts_with(dir.path().join("book")) {
                     assert_eq!(bits, 8, "directory expansion is a book: {order}");
                 } else if draft.source_path == m4b {
                     assert_eq!(bits, 8, ".m4b is a book by extension: {order}");
+                } else if draft.source_path == audible {
+                    assert_eq!(bits, 8, ".aa is a book by extension: {order}");
                 } else {
                     assert_eq!(bits, 1, "direct mp3 stays a song: {order}");
                 }
@@ -1181,12 +1272,15 @@ mod tests {
 
     #[test]
     fn needs_transcode_matches_firmware_unplayable_formats() {
-        // Nano 7G firmware plays AAC (and mp3) only: flac/ogg/wav must
-        // be transcoded, the AAC-family passes through untouched.
-        for playable in ["mp3", "m4a", "m4b", "aac"] {
+        // Nano 7G firmware formats per the Apple spec (SP112039): mp3,
+        // AAC-family (m4a/m4b/aac), WAV, AIFF and Audible play as-is;
+        // flac/ogg have no firmware decoder and are transcoded to AAC
+        // (round 5.2). WAV joined passthrough on 2026-11-21 (owner's
+        // decision: round 5.2 had bundled it with flac/ogg by mistake).
+        for playable in ["mp3", "m4a", "m4b", "aac", "wav", "aiff", "aif", "aa", "aax"] {
             assert!(!needs_transcode(playable), "{playable} passes through");
         }
-        for unplayable in ["flac", "ogg", "oga", "wav"] {
+        for unplayable in ["flac", "ogg", "oga"] {
             assert!(needs_transcode(unplayable), "{unplayable} needs transcode");
         }
         // Unknown extensions never reach the worker, but stay honest.
@@ -1203,10 +1297,19 @@ mod tests {
     }
 
     #[test]
+    fn transcode_codec_follows_source_losslessness() {
+        assert_eq!(transcode_codec("flac"), "alac", "lossless → lossless");
+        assert_eq!(transcode_codec("ogg"), "aac");
+        assert_eq!(transcode_codec("oga"), "aac");
+    }
+
+    #[test]
     fn ffmpeg_transcode_args_are_exact() {
+        // FLAC is a lossless source: wrap into ALAC, no rate control.
         let args = ffmpeg_transcode_args(
             std::path::Path::new("/src/Skazka.flac"),
             std::path::Path::new("/tmp/book.m4b"),
+            transcode_codec("flac"),
         );
         assert_eq!(
             args,
@@ -1221,12 +1324,38 @@ mod tests {
                 "-map_chapters",
                 "0",
                 "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
+                "alac",
                 "-f",
                 "ipod",
                 "/tmp/book.m4b",
+            ]
+        );
+        // Ogg is lossy: VBR AAC quality 5 — compact wins over zero
+        // additional loss (owner decision 2026-11-21).
+        let args = ffmpeg_transcode_args(
+            std::path::Path::new("/src/Mix.ogg"),
+            std::path::Path::new("/tmp/mix.m4a"),
+            transcode_codec("ogg"),
+        );
+        assert_eq!(
+            args,
+            [
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                "/src/Mix.ogg",
+                "-vn",
+                "-map_chapters",
+                "0",
+                "-c:a",
+                "aac",
+                "-q:a",
+                "5",
+                "-f",
+                "ipod",
+                "/tmp/mix.m4a",
             ]
         );
     }
@@ -1244,29 +1373,112 @@ mod tests {
         );
     }
 
-    /// End-to-end transcode: a synthetic 16-bit PCM WAV is transcoded
-    /// into a real AAC file by the installed ffmpeg.
+    /// End-to-end lossless path: a real FLAC fixture (generated by the
+    /// installed ffmpeg) is transcoded into ALAC-in-m4a and the decoded
+    /// PCM must stay bit-identical — the whole point of ALAC routing.
     #[test]
-    fn transcode_draft_converts_wav_to_aac() {
+    fn transcode_draft_wraps_flac_into_alac_losslessly() {
         let dir = TempDir::new().unwrap();
-        // Minimal 8 kHz mono 16-bit WAV: 0.1 s of silence.
-        let data_size: u32 = 1600;
-        let mut wav = Vec::new();
-        wav.extend_from_slice(b"RIFF");
-        wav.extend_from_slice(&(36 + data_size).to_le_bytes());
-        wav.extend_from_slice(b"WAVEfmt ");
-        wav.extend_from_slice(&16u32.to_le_bytes());
-        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
-        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
-        wav.extend_from_slice(&8000u32.to_le_bytes());
-        wav.extend_from_slice(&16000u32.to_le_bytes()); // byte rate
-        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
-        wav.extend_from_slice(&16u16.to_le_bytes()); // bits
-        wav.extend_from_slice(b"data");
-        wav.extend_from_slice(&data_size.to_le_bytes());
-        wav.extend(std::iter::repeat_n(0u8, data_size as usize));
-        let source = dir.path().join("chapter.wav");
-        std::fs::write(&source, &wav).unwrap();
+        let source = dir.path().join("song.flac");
+        let generated = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner".to_owned(),
+                "-loglevel".to_owned(),
+                "error".to_owned(),
+                "-y".to_owned(),
+                "-f".to_owned(),
+                "lavfi".to_owned(),
+                "-i".to_owned(),
+                "sine=frequency=440:duration=2".to_owned(),
+                "-c:a".to_owned(),
+                "flac".to_owned(),
+                source.display().to_string(),
+            ])
+            .output()
+            .expect("run ffmpeg");
+        assert!(
+            generated.status.success(),
+            "fixture ffmpeg failed: {}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+
+        let draft = TrackDraft::new(source.clone(), "Трек").unwrap();
+        let transcoded = transcode_draft(&draft, dir.path(), 0).expect("ffmpeg transcode");
+        assert_eq!(
+            transcoded.source_path.extension().and_then(|e| e.to_str()),
+            Some("m4a"),
+            "music draft lands in the m4a container"
+        );
+        assert_ne!(transcoded.source_path, draft.source_path, "in batch tempdir");
+        assert_eq!(
+            probe_stream_codec(&transcoded.source_path).as_deref(),
+            Some("alac"),
+            "flac must wrap into ALAC"
+        );
+
+        // Bit-perfect: decode source and result to PCM and compare.
+        let decode_pcm = |input: &std::path::Path, output: &std::path::Path| {
+            let decoded = std::process::Command::new("ffmpeg")
+                .args([
+                    "-hide_banner".to_owned(),
+                    "-loglevel".to_owned(),
+                    "error".to_owned(),
+                    "-y".to_owned(),
+                    "-i".to_owned(),
+                    input.display().to_string(),
+                    "-c:a".to_owned(),
+                    "pcm_s16le".to_owned(),
+                    "-f".to_owned(),
+                    "wav".to_owned(),
+                    output.display().to_string(),
+                ])
+                .output()
+                .expect("run ffmpeg");
+            assert!(
+                decoded.status.success(),
+                "decode {input:?} failed: {}",
+                String::from_utf8_lossy(&decoded.stderr)
+            );
+        };
+        let source_pcm = dir.path().join("source.wav");
+        let result_pcm = dir.path().join("result.wav");
+        decode_pcm(&source, &source_pcm);
+        decode_pcm(&transcoded.source_path, &result_pcm);
+        assert_eq!(
+            std::fs::read(&source_pcm).unwrap(),
+            std::fs::read(&result_pcm).unwrap(),
+            "FLAC→ALAC must keep the PCM bit-identical"
+        );
+    }
+
+    /// The lossy path: an Ogg Vorbis fixture re-encodes into VBR AAC
+    /// (quality 5) — the accepted second generation (owner decision
+    /// 2026-11-21). Audiobook bits still land in the .m4b container.
+    #[test]
+    fn transcode_draft_reencodes_ogg_to_vbr_aac() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("mix.ogg");
+        let generated = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner".to_owned(),
+                "-loglevel".to_owned(),
+                "error".to_owned(),
+                "-y".to_owned(),
+                "-f".to_owned(),
+                "lavfi".to_owned(),
+                "-i".to_owned(),
+                "sine=frequency=330:duration=2".to_owned(),
+                "-c:a".to_owned(),
+                "libvorbis".to_owned(),
+                source.display().to_string(),
+            ])
+            .output()
+            .expect("run ffmpeg");
+        assert!(
+            generated.status.success(),
+            "fixture ffmpeg failed: {}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
 
         let draft = TrackDraft::new(source, "Глава 1")
             .unwrap()
@@ -1275,14 +1487,40 @@ mod tests {
         assert_eq!(
             transcoded.source_path.extension().and_then(|e| e.to_str()),
             Some(transcode_target_extension(8)),
+            "audiobook container .m4b"
         );
         assert_eq!(transcoded.media_kind_bits, 8);
         assert_eq!(transcoded.title, "Глава 1");
-        assert!(
-            transcoded.source_path.is_file(),
-            "ffmpeg must produce the target file"
+        assert_eq!(
+            probe_stream_codec(&transcoded.source_path).as_deref(),
+            Some("aac"),
+            "ogg must re-encode to AAC"
         );
-        assert_ne!(transcoded.source_path, draft.source_path, "in batch tempdir");
+    }
+
+    /// Reads the audio codec name of a file via the installed ffprobe
+    /// (`None` when the tool or the stream is missing).
+    fn probe_stream_codec(path: &std::path::Path) -> Option<String> {
+        let output = std::process::Command::new("ffprobe")
+            .args([
+                "-v".to_owned(),
+                "error".to_owned(),
+                "-select_streams".to_owned(),
+                "a:0".to_owned(),
+                "-show_entries".to_owned(),
+                "stream=codec_name".to_owned(),
+                "-of".to_owned(),
+                "default=noprint_wrappers=1:nokey=1".to_owned(),
+                path.display().to_string(),
+            ])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     }
 
     #[test]

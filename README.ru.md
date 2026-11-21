@@ -48,7 +48,7 @@ GUI дополнительно требует ffmpeg и desktop GL-стек в �
 
 - Rust 1.95 или новее (рекомендуется через [rustup](https://rustup.rs))
 - C-компилятор (gcc/clang) — SQLite бандлится через libopod и собирается при сборке
-- [ffmpeg](https://ffmpeg.org) — рантайм, используется GUI для transcode FLAC/OGG/WAV → AAC при добавлении
+- [ffmpeg](https://ffmpeg.org) — рантайм, используется GUI для transcode FLAC (в lossless ALAC) и OGG (в VBR AAC) при добавлении
 - GUI (`podlib-gui`) дополнительно требует desktop GL-стек (клиентские библиотеки Wayland или X11) — есть на любом обычном десктопе
 
 ```sh

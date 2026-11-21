@@ -48,7 +48,7 @@ Requirements:
 
 - Rust 1.95 or newer (via [rustup](https://rustup.rs) recommended)
 - A C compiler (gcc/clang) — SQLite is bundled via libopod and compiled at build time
-- [ffmpeg](https://ffmpeg.org) — runtime, used by the GUI to transcode FLAC/OGG/WAV files to AAC on add
+- [ffmpeg](https://ffmpeg.org) — runtime, used by the GUI to transcode FLAC (to lossless ALAC) and OGG (to VBR AAC) files on add
 - The GUI (`podlib-gui`) additionally needs a desktop GL stack (Wayland or X11 client libraries) — present on any regular desktop installation
 
 ```sh
