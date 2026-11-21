@@ -36,6 +36,18 @@ pub(crate) struct ResolvedAddition {
     pub artwork: Option<ArtworkLink>,
 }
 
+impl ResolvedAddition {
+    /// Display artist of the item: the draft artist, falling back to the
+    /// album artist. The nano firmware hides artist-less items from the
+    /// «Песни» menu (live forensics 21.11.2026: all 227 tool-added rows
+    /// of the owner's library), and the GUI tag-review modal only fills
+    /// the album/author pair — so the author name the user typed must
+    /// surface as the item artist instead of a hidden NULL.
+    pub(crate) fn display_artist(&self) -> Option<&str> {
+        self.artist.as_deref().or(self.album_artist.as_deref())
+    }
+}
+
 /// A reused or freshly encoded artwork link: a fresh `mhii` image ID plus the
 /// slot references and (for new art) the encoded frames to write.
 #[derive(Clone, Debug)]
@@ -175,7 +187,7 @@ fn insert_track(
         transaction,
         path,
         "track_artist",
-        addition.artist.as_deref(),
+        addition.display_artist(),
         &mut next_pid,
         &[
             "pid, name, name_order, sort_name, has_songs, has_music_videos, \
@@ -648,7 +660,7 @@ pub(crate) fn insert_item_row(
     orders: &ItemOrders,
 ) -> Result<()> {
     let sort_title = (!addition.title.is_empty()).then(|| sort_key(&addition.title));
-    let sort_artist = non_empty_sort(addition.artist.as_deref());
+    let sort_artist = non_empty_sort(addition.display_artist());
     let sort_album = non_empty_sort(addition.album.as_deref());
     let sort_album_artist = addition
         .album_artist
@@ -718,7 +730,7 @@ pub(crate) fn insert_item_row(
                 ":artist_pid": artist_pid,
                 ":composer_pid": composer_pid,
                 ":title": opt_text(&addition.title),
-                ":artist": addition.artist.as_deref(),
+                ":artist": addition.display_artist(),
                 ":album": addition.album.as_deref(),
                 ":album_artist": addition.album_artist.as_deref(),
                 ":composer": addition.composer.as_deref(),

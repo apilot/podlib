@@ -462,6 +462,100 @@ fn staged_edits_preserve_artist_invariants() {
     assert!(added_media.is_file(), "added media missing");
 }
 
+/// (f) The firmware «Песни» filter (live forensics 21.11.2026): iTunes-era
+/// items always carry a non-NULL `item.artist` and a linked `track_artist`
+/// row, while tool-added items without an artist tag were invisible in the
+/// Songs menu (all 227 of them in the live library) yet still listed under
+/// Artists. An artist-less draft must fall back to the album artist for
+/// the display artist, its sort key and the track_artist dimension — the
+/// same name the user types into the tag-review modal as the author.
+#[test]
+fn artist_less_adds_fall_back_to_album_artist_for_the_songs_view() {
+    let device_dir = copy_fixture();
+    let library = library_path(device_dir.path());
+    for index in 0..20 {
+        fs::create_dir_all(
+            device_dir
+                .path()
+                .join(format!("iPod_Control/Music/F{index:02}")),
+        )
+        .unwrap();
+    }
+    let device = Device::open(device_dir.path()).unwrap();
+    let source_media = device_dir.path().join("added-source.mp3");
+    fs::write(&source_media, vec![0x55; 150_000]).unwrap();
+
+    let mut edit = device.edit().unwrap();
+    edit.add_track(TrackToAdd {
+        source_path: source_media,
+        title: "Котэ Песенка".to_owned(),
+        artist: None,
+        album: Some("Котэ".to_owned()),
+        album_artist: Some("Котэ".to_owned()),
+        genre: None,
+        composer: None,
+        year: 0,
+        track_number: 1,
+        total_tracks: 1,
+        disc_number: 1,
+        total_discs: 1,
+        bitrate: 128,
+        sample_rate: 44100,
+        length_ms: 1_000,
+        compilation: false,
+        media_kind: MediaKind::Song,
+        reuse_album_art: false,
+        artwork_source: None,
+    })
+    .unwrap();
+
+    let bundle = tempdir().unwrap();
+    let staged = edit.stage_sqlite_preview(bundle.path()).unwrap();
+    assert_eq!(staged.added_tracks(), 1);
+    create_virtual_media_dirs(device_dir.path(), staged.added_media());
+    let reopened = staged
+        .install_and_open(&device, InstallMode::Full, |_| {})
+        .unwrap();
+    assert_eq!(reopened.library().unwrap().track_count(), 812);
+
+    let con = read_only(&library);
+    let (artist, sort_artist, track_artist_pid, artist_order): (
+        String,
+        Option<String>,
+        i64,
+        i64,
+    ) = con
+        .query_row(
+            "SELECT artist, sort_artist, track_artist_pid, artist_order \
+             FROM item WHERE title = 'Котэ Песенка'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        artist, "Котэ",
+        "item.artist falls back to the album artist"
+    );
+    assert_eq!(sort_artist.as_deref(), Some("котэ"), "sort key follows");
+    assert_ne!(track_artist_pid, 0, "track_artist row must be linked");
+    assert_ne!(
+        artist_order, 100,
+        "browse rank must come from real values, not the NULL fallback"
+    );
+    let linked: i64 = con
+        .query_row(
+            "SELECT COUNT(*) FROM track_artist \
+             WHERE name = 'Котэ' AND has_songs = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        linked, 1,
+        "track_artist dimension row exists and counts songs"
+    );
+}
+
 #[test]
 fn removing_an_audiobook_end_to_end() {
     // Round 5.7: audiobooks (media_kind 8) are invisible to the public
