@@ -57,6 +57,13 @@ const SIDEBAR_ROW_INSET: f32 = 8.0;
 /// own (`Frame::popup`), only the breathing room is ours.
 const MODAL_MARGIN: f32 = 16.0;
 const MODAL_GAP: f32 = 12.0;
+/// Corner radius of row highlights (selection/hover bands) in every
+/// list-like view: sidebar rows, book-file rows, group bands,
+/// tag-review rows — and the book-file card, so the rounded chrome
+/// agrees everywhere. The track table keeps its full-width square
+/// band (a deliberate convention, outside this radius); popup and
+/// modal radii stay themed (menu_corner_radius via Frame::popup).
+const ROW_HIGHLIGHT_RADIUS: f32 = 4.0;
 /// Edit-dialog field grid spacing: column and row gaps. Shared with
 /// the numeric pair row so the two layouts line up pixel-for-pixel.
 const FIELD_COLUMN_SPACING: f32 = 8.0;
@@ -1796,7 +1803,7 @@ impl PodlibApp {
         let response = podlib_modal(ctx, egui::Id::unique("confirm_close")).show(ctx, |ui| {
             ui.set_width(440.0);
             ui.heading(title);
-            ui.add_space(4.0);
+            ui.add_space(MODAL_GAP);
             ui.label(body);
             ui.separator();
             // Enter confirms the primary action («Закрыть») at the
@@ -1877,7 +1884,7 @@ impl PodlibApp {
             podlib_modal(ctx, egui::Id::unique("confirm_delete_track")).show(ctx, |ui| {
             ui.set_width(440.0);
             ui.heading(title_line);
-            ui.add_space(4.0);
+            ui.add_space(MODAL_GAP);
             ui.label("Треки исчезнут из библиотеки и всех плейлистов.");
             if let Some(library) = self.library.as_mut() {
                 // The checkbox lives in the state so it survives frames.
@@ -1960,7 +1967,7 @@ impl PodlibApp {
             podlib_modal(ctx, egui::Id::unique("confirm_delete_playlist")).show(ctx, |ui| {
                 ui.set_width(400.0);
                 ui.heading(format!("Удалить плейлист «{name}»?"));
-                ui.add_space(4.0);
+                ui.add_space(MODAL_GAP);
                 ui.label("Сами треки останутся в библиотеке.");
                 ui.separator();
                 // Enter confirms the primary action («Удалить») at the
@@ -2179,7 +2186,7 @@ impl PodlibApp {
                     "Присвоить исполнителя «{value_trimmed}» выбранным трекам ({count})?"
                 ));
             }
-            ui.add_space(4.0);
+            ui.add_space(MODAL_GAP);
             ui.horizontal(|ui| {
                 ui.label("Исполнитель:");
                 let field = ui.add(
@@ -2387,7 +2394,7 @@ impl PodlibApp {
             );
             ui.set_width(560.0);
             ui.heading(title);
-            ui.add_space(4.0);
+            ui.add_space(MODAL_GAP);
             ui.label("Общее для всех файлов");
             ui.horizontal(|ui| {
                 ui.label(texts.title_field);
@@ -2407,7 +2414,7 @@ impl PodlibApp {
                 );
                 text_menu::attach_text_menu(&author);
             });
-            ui.add_space(6.0);
+            ui.add_space(MODAL_GAP);
             if let Some(prefix) = review.prefix.clone() {
                 if ui
                     .checkbox(
@@ -2446,7 +2453,7 @@ impl PodlibApp {
                             if selected {
                                 ui.painter().rect_filled(
                                     ui.max_rect(),
-                                    2.0,
+                                    ROW_HIGHLIGHT_RADIUS,
                                     ui.visuals().selection.bg_fill,
                                 );
                             }
@@ -2549,7 +2556,7 @@ impl PodlibApp {
         let response = podlib_modal(ctx, egui::Id::unique("add_to_playlist")).show(ctx, |ui| {
             ui.set_width(360.0);
             ui.heading("Добавить в плейлист");
-            ui.add_space(4.0);
+            ui.add_space(MODAL_GAP);
             egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                 for playlist in &playlists {
                     let guarded = guard_playlist_mutation(playlist).is_err();
@@ -3797,10 +3804,18 @@ fn groups_view(ui: &mut egui::Ui, params: GroupsViewParams<'_>) -> TrackRowActio
                 let painter = ui.painter();
                 let visuals = ui.visuals();
                 if is_expanded {
-                    painter.rect_filled(rect, 4.0, visuals.widgets.inactive.bg_fill);
+                    painter.rect_filled(
+                        rect,
+                        ROW_HIGHLIGHT_RADIUS,
+                        visuals.widgets.inactive.bg_fill,
+                    );
                 }
                 if response.hovered() {
-                    painter.rect_filled(rect, 4.0, visuals.widgets.hovered.bg_fill);
+                    painter.rect_filled(
+                        rect,
+                        ROW_HIGHLIGHT_RADIUS,
+                        visuals.widgets.hovered.bg_fill,
+                    );
                 }
                 let inner = rect.shrink2(egui::vec2(8.0, 0.0));
                 let middle = rect.center().y;
@@ -3834,7 +3849,7 @@ fn groups_view(ui: &mut egui::Ui, params: GroupsViewParams<'_>) -> TrackRowActio
                     // блоке»); faint fill reads as a single card.
                     egui::Frame::default()
                         .fill(ui.visuals().extreme_bg_color)
-                        .corner_radius(4.0)
+                        .corner_radius(ROW_HIGHLIGHT_RADIUS)
                         .inner_margin(egui::Margin::same(6))
                         .show(ui, |ui| {
                             let files_text = format!(
@@ -3906,9 +3921,9 @@ fn book_file_row(
     let painter = ui.painter();
     let visuals = ui.visuals();
     if selected {
-        painter.rect_filled(rect, 2.0, visuals.selection.bg_fill);
+        painter.rect_filled(rect, ROW_HIGHLIGHT_RADIUS, visuals.selection.bg_fill);
     } else if response.hovered() {
-        painter.rect_filled(rect, 2.0, visuals.widgets.hovered.bg_fill);
+        painter.rect_filled(rect, ROW_HIGHLIGHT_RADIUS, visuals.widgets.hovered.bg_fill);
     }
     let inner = rect.shrink2(egui::vec2(4.0, 0.0));
     let middle = rect.center().y;
@@ -4395,9 +4410,9 @@ fn sidebar_row(ui: &mut egui::Ui, selected: bool, name: &str, count: &str) -> eg
     let painter = ui.painter();
     let visuals = ui.visuals();
     if selected {
-        painter.rect_filled(rect, 4.0, visuals.selection.bg_fill);
+        painter.rect_filled(rect, ROW_HIGHLIGHT_RADIUS, visuals.selection.bg_fill);
     } else if response.hovered() {
-        painter.rect_filled(rect, 4.0, visuals.widgets.hovered.bg_fill);
+        painter.rect_filled(rect, ROW_HIGHLIGHT_RADIUS, visuals.widgets.hovered.bg_fill);
     }
     let inner = rect.shrink2(egui::vec2(SIDEBAR_ROW_INSET, 0.0));
     let middle = rect.center().y;
@@ -4719,7 +4734,11 @@ fn draw_drop_overlay(ui: &egui::Ui, names: &[String]) {
     let painter =
         ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("drop_overlay")));
     let rect = ctx.content_rect();
-    painter.rect_filled(rect, 12.0, egui::Color32::from_black_alpha(160));
+    painter.rect_filled(
+        rect,
+        ui.style().visuals.menu_corner_radius,
+        egui::Color32::from_black_alpha(160),
+    );
     let font = egui::TextStyle::Heading.resolve(&ctx.global_style());
     let text = if names.len() == 1 {
         format!("Отпустите, чтобы добавить: {}", names[0])
@@ -4818,9 +4837,9 @@ fn password_modal(
     let response = podlib_modal(ctx, egui::Id::unique(id_salt)).show(ctx, |ui| {
         ui.set_width(440.0);
         ui.heading(heading);
-        ui.add_space(4.0);
+        ui.add_space(MODAL_GAP);
         ui.label(body);
-        ui.add_space(6.0);
+        ui.add_space(MODAL_GAP);
         ui.horizontal(|ui| {
             ui.label("Пароль sudo:");
             // WHY full width: a narrow 220px field in a wide modal read
@@ -5252,6 +5271,16 @@ mod tests {
         assert_eq!(settle(1.5), 1.0);
         assert_eq!(settle(-0.5), 0.0);
         assert_eq!(settle(0.5), 0.5);
+    }
+
+    #[test]
+    fn row_highlights_share_the_sidebar_radius_convention() {
+        // WHY an assert on the constant: every list-like highlight is
+        // painted through ROW_HIGHLIGHT_RADIUS — this locks the
+        // sidebar's 4px rounding as the single convention against
+        // per-site ad-hoc values (the «rounded sidebar, square
+        // playlist» report).
+        assert_eq!(ROW_HIGHLIGHT_RADIUS, 4.0);
     }
 
     #[test]
