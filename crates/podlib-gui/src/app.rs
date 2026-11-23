@@ -3965,11 +3965,32 @@ fn sortable_header(
     };
     let response = ui
         .add(
-            egui::Label::new(egui::RichText::new(format!("{label}{suffix}")).strong())
-                .sense(egui::Sense::click()),
+            egui::Label::new(
+                egui::RichText::new(format!("{label}{suffix}"))
+                    .small()
+                    .strong(),
+            )
+            .sense(egui::Sense::click()),
         )
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     response.clicked().then_some(column)
+}
+
+/// Header-cell chrome (round: distinct table header): a surface tint
+/// across the cell plus the theme's borders hairline at the bottom.
+/// WHY expand2 by half the item spacing: strip cells sit one spacing
+/// apart — the expansion closes the gaps, so the sum over cells reads
+/// as one continuous band (the same trick egui itself uses for
+/// striped/selected row fills).
+fn paint_header_chrome(ui: &egui::Ui, fill: egui::Color32, stroke: egui::Stroke) {
+    let rect = ui.max_rect().expand2(0.5 * ui.spacing().item_spacing);
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, fill);
+    let y = rect.bottom() - stroke.width / 2.0;
+    painter.line_segment(
+        [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+        stroke,
+    );
 }
 
 /// One checkbox cell of a table row (round 6 П2): an explicit toggle
@@ -4005,9 +4026,15 @@ fn track_table(
     // processes clicks within their frame.
     let ctx = ui.ctx().clone();
     let visible_ids: Vec<TrackId> = tracks.iter().map(|track| track.id).collect();
+    // WHY tint + hairline: the header must read as table chrome, not
+    // as another striped data row — the theme's surface color above
+    // its borders hairline separates the two; both from visuals only.
+    let header_fill = ui.visuals().widgets.inactive.bg_fill;
+    let header_stroke = ui.visuals().widgets.inactive.bg_stroke;
     track_table_builder(ui, table_id)
         .header(ROW_HEIGHT, |mut header| {
             header.col(|ui| {
+                paint_header_chrome(ui, header_fill, header_stroke);
                 if let Some(check) =
                     header_select_all(ui, select_all_state(selected_tracks, &visible_ids))
                 {
@@ -4015,12 +4042,14 @@ fn track_table(
                 }
             });
             header.col(|ui| {
+                paint_header_chrome(ui, header_fill, header_stroke);
                 if let Some(column) = sortable_header(ui, "Название", TrackSortColumn::Title, sort)
                 {
                     actions.sort_toggle = Some(column);
                 }
             });
             header.col(|ui| {
+                paint_header_chrome(ui, header_fill, header_stroke);
                 if let Some(column) =
                     sortable_header(ui, "Исполнитель", TrackSortColumn::Artist, sort)
                 {
@@ -4028,11 +4057,13 @@ fn track_table(
                 }
             });
             header.col(|ui| {
+                paint_header_chrome(ui, header_fill, header_stroke);
                 if let Some(column) = sortable_header(ui, "Альбом", TrackSortColumn::Album, sort) {
                     actions.sort_toggle = Some(column);
                 }
             });
             header.col(|ui| {
+                paint_header_chrome(ui, header_fill, header_stroke);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(column) =
                         sortable_header(ui, "Длит.", TrackSortColumn::Duration, sort)
