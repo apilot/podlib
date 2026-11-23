@@ -1134,21 +1134,10 @@ impl PodlibApp {
         let Some(library) = self.library.as_mut() else {
             return PlaylistPanelActions::default();
         };
-        // Round 8: compact «+» right of the heading opens the existing
-        // create modal (same state as the bottom button).
-        ui.horizontal(|ui| {
-            ui.heading("Плейлисты");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let add = ui
-                    .small_button("+")
-                    .on_hover_text("Новый плейлист");
-                if add.clicked() {
-                    library.create_open = true;
-                    library.new_playlist_name.clear();
-                }
-            });
-        });
-        ui.add_space(4.0);
+        // Round 8: the «+» affordance rides the section header (round:
+        // unified captions — the old top heading duplicated the
+        // «Плейлисты» group caption below and the faint caption was
+        // barely visible; now ONE visible header per section).
         let ordered = master_first(&library.snapshot.playlists);
         let master = ordered.iter().find(|playlist| playlist.is_master).copied();
         let views: Vec<&Playlist> = ordered
@@ -1178,7 +1167,7 @@ impl PodlibApp {
                     ));
                 }
                 if !views.is_empty() {
-                    ui.label(egui::RichText::new("Устройство").weak().small());
+                    sidebar_section_header(ui, "Устройство");
                     for playlist in &views {
                         actions.merge(playlist_row(
                             ui,
@@ -1190,7 +1179,18 @@ impl PodlibApp {
                     }
                 }
                 if !user.is_empty() {
-                    ui.label(egui::RichText::new("Плейлисты").weak().small());
+                    // The «+» affordance rides the header row (moved
+                    // from the old duplicated heading); it opens the
+                    // same create modal as the bottom button.
+                    let add_rect = sidebar_section_header(ui, "Плейлисты");
+                    if ui
+                        .put(add_rect, egui::Button::new("+"))
+                        .on_hover_text("Новый плейлист")
+                        .clicked()
+                    {
+                        library.create_open = true;
+                        library.new_playlist_name.clear();
+                    }
                     for playlist in &user {
                         actions.merge(playlist_row(
                             ui,
@@ -4011,17 +4011,23 @@ fn sortable_header(
         }
         _ => "",
     };
-    let response = ui
-        .add(
-            egui::Label::new(
-                egui::RichText::new(format!("{label}{suffix}"))
-                    .small()
-                    .strong(),
-            )
-            .sense(egui::Sense::click()),
-        )
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    response.clicked().then_some(column)
+    // WHY centered: header labels read as column captions — centered
+    // on the tinted band they line up uniformly across ALL columns,
+    // including the right-aligned «Длит.» one. Body size (not small):
+    // captions must stay readable at header height. Cell CONTENT
+    // alignment is unaffected — this wraps only the caption.
+    let clicked = ui
+        .vertical_centered(|ui| {
+            let response = ui
+                .add(
+                    egui::Label::new(egui::RichText::new(format!("{label}{suffix}")).strong())
+                        .sense(egui::Sense::click()),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            response.clicked()
+        })
+        .inner;
+    clicked.then_some(column)
 }
 
 /// Header-cell chrome (round: distinct table header): a surface tint
@@ -4320,6 +4326,41 @@ fn cell_text_color(visuals: &egui::Visuals, selected: bool) -> egui::Color32 {
     } else {
         visuals.text_color()
     }
+}
+
+/// Sidebar section caption («Устройство» / «Плейлисты»): body-strong
+/// title on the same tinted band + hairline the track-table header
+/// uses, so sections read as titled groups instead of faint floating
+/// labels (live report: the caption was barely visible). Returns the
+/// free right-side square of the band for an optional affordance
+/// (the «+» button rides the «Плейлисты» header).
+fn sidebar_section_header(ui: &mut egui::Ui, title: &str) -> egui::Rect {
+    // WHY the spacing: the band must read as a divider between
+    // groups, not glued to the previous row.
+    ui.add_space(6.0);
+    let visuals = ui.visuals().clone();
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), SIDEBAR_ROW_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, visuals.widgets.inactive.bg_fill);
+    painter.line_segment(
+        [rect.left_bottom(), rect.right_bottom()],
+        visuals.widgets.inactive.bg_stroke,
+    );
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    painter.text(
+        rect.left_top() + egui::vec2(SIDEBAR_ROW_INSET, 0.0),
+        egui::Align2::LEFT_TOP,
+        title,
+        font,
+        visuals.text_color(),
+    );
+    egui::Rect::from_min_size(
+        rect.right_top() - egui::vec2(SIDEBAR_ROW_HEIGHT, 0.0),
+        egui::vec2(SIDEBAR_ROW_HEIGHT, SIDEBAR_ROW_HEIGHT),
+    )
 }
 
 /// One sidebar row (round 6 П1): the selection spans the FULL panel
