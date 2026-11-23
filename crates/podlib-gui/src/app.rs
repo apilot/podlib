@@ -4697,10 +4697,15 @@ fn password_modal(
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label("Пароль sudo:");
+            // WHY full width: a narrow 220px field in a wide modal read
+            // as «no input here»; the themed hairline stroke needs the
+            // box to be visible to do its job. The placeholder is fine
+            // for a secret — it never echoes typed content.
             let password_field = ui.add(
                 egui::TextEdit::singleline(password)
                     .password(true)
-                    .desired_width(220.0)
+                    .hint_text("Пароль sudo…")
+                    .desired_width(ui.available_width())
                     .id(field_id),
             );
             text_menu::attach_secret_text_menu(&password_field);
