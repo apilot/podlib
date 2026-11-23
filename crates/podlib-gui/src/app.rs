@@ -57,6 +57,10 @@ const SIDEBAR_ROW_INSET: f32 = 8.0;
 /// own (`Frame::popup`), only the breathing room is ours.
 const MODAL_MARGIN: f32 = 16.0;
 const MODAL_GAP: f32 = 12.0;
+/// Edit-dialog field grid spacing: column and row gaps. Shared with
+/// the numeric pair row so the two layouts line up pixel-for-pixel.
+const FIELD_COLUMN_SPACING: f32 = 8.0;
+const FIELD_ROW_SPACING: f32 = 6.0;
 /// Gap kept between a (clipped) row name and the right-aligned count.
 const SIDEBAR_NAME_COUNT_GAP: f32 = 8.0;
 
@@ -2005,7 +2009,7 @@ impl PodlibApp {
                     let name = ui.add(
                         egui::TextEdit::singleline(&mut library.new_playlist_name)
                             .hint_text("Название плейлиста…")
-                            .desired_width(240.0),
+                            .desired_width(ui.available_width()),
                     );
                     text_menu::attach_text_menu(&name);
                 });
@@ -2088,7 +2092,7 @@ impl PodlibApp {
                     let name = ui.add(
                         egui::TextEdit::singleline(&mut dialog.name)
                             .hint_text("Новое название…")
-                            .desired_width(240.0),
+                            .desired_width(ui.available_width()),
                     );
                     text_menu::attach_text_menu(&name);
                 });
@@ -2178,7 +2182,7 @@ impl PodlibApp {
                 let field = ui.add(
                     egui::TextEdit::singleline(&mut dialog.value)
                         .hint_text("Артист")
-                        .desired_width(300.0),
+                        .desired_width(ui.available_width()),
                 );
                 text_menu::attach_text_menu(&field);
                 field.request_focus();
@@ -4458,14 +4462,67 @@ fn playlist_row(
 /// the placeholder hint) + the right-click text menu. A real grid
 /// replaces the padded-label hack («Название:      ») — columns align
 /// without magic whitespace.
-fn dialog_field(ui: &mut egui::Ui, label: &str, text: &mut String, hint: &str, width: f32) {
+/// Framed single-line field with a placeholder hint — the shared
+/// shape of every modal field (the frame/stroke itself is themed).
+fn field_with<'a>(text: &'a mut String, hint: &'a str, width: f32) -> egui::TextEdit<'a> {
+    egui::TextEdit::singleline(text)
+        .hint_text(hint)
+        .desired_width(width)
+}
+
+/// Rendered width of a label string in the current body text style —
+/// lets form rows split by real measurements instead of pixel
+/// constants. Color is irrelevant to the size; the themed text color
+/// keeps it literal-free.
+fn label_width(ui: &egui::Ui, text: &str) -> f32 {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let color = ui.style().visuals.text_color();
+    // WHY fonts_mut: layout_no_wrap mutates the galley cache (egui
+    // 0.37 read view is immutable by design).
+    ui.ctx().fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap(text.to_owned(), font, color)
+            .size()
+            .x
+    })
+}
+
+/// Width of one field in an evenly split row: what is left of the
+/// available width after the OTHER field's label and the inter-widget
+/// spacings, halved; floored at 0 so a squeezed row degrades instead
+/// of inverting.
+fn even_split(available: f32, other_label: f32, gaps: f32) -> f32 {
+    ((available - other_label - gaps) * 0.5).max(0.0)
+}
+
+/// One edit-dialog row: label + a framed field that fills the rest of
+/// the row (placeholder hint, right-click text menu).
+fn dialog_field(ui: &mut egui::Ui, label: &str, text: &mut String, hint: &str) {
     ui.label(label);
-    let field = ui.add(
-        egui::TextEdit::singleline(text)
-            .hint_text(hint)
-            .desired_width(width),
-    );
+    let field = ui.add(field_with(text, hint, ui.available_width()));
     text_menu::attach_text_menu(&field);
+}
+
+/// The «Трек № / Диск №» pair: one row, an even half of the row
+/// remainder each. WHY outside the grid: grid columns are global
+/// across rows — the full-width text fields above would widen their
+/// column and push the second pair off the modal edge.
+fn numeric_fields_row(ui: &mut egui::Ui, track: &mut String, disc: &mut String) {
+    // WHY the measured inset: lines the pair's fields up with the
+    // grid's field column (the widest label above defines it).
+    ui.add_space(
+        label_width(ui, "Альбом-артист:") - label_width(ui, "Трек №:") + FIELD_COLUMN_SPACING,
+    );
+    ui.label("Трек №:");
+    // WHY measured, not magic: the split depends on the real label
+    // widths and the layout's own spacing.
+    let gaps = 2.0 * ui.spacing().item_spacing.x;
+    let half = even_split(ui.available_width(), label_width(ui, "Диск №:"), gaps);
+    let track_number = ui.add(field_with(track, "Трек №…", half));
+    text_menu::attach_text_menu(&track_number);
+    ui.label("Диск №:");
+    let disc_number = ui.add(field_with(disc, "Диск №…", half));
+    text_menu::attach_text_menu(&disc_number);
 }
 
 fn edit_track_dialog_fields(ui: &mut egui::Ui, dialog: &mut EditDialogState) -> bool {
@@ -4473,27 +4530,19 @@ fn edit_track_dialog_fields(ui: &mut egui::Ui, dialog: &mut EditDialogState) -> 
     // Local copy: egui closures each need their own `&mut` field handle.
     let mut fields = dialog.fields.clone();
     egui::Grid::new("edit_track_fields")
-        .num_columns(4)
-        .spacing([8.0, 6.0])
+        .num_columns(2)
+        .spacing([FIELD_COLUMN_SPACING, FIELD_ROW_SPACING])
         .show(ui, |ui| {
-            dialog_field(ui, "Название:", &mut fields.title, "Название трека…", 320.0);
+            dialog_field(ui, "Название:", &mut fields.title, "Название трека…");
             ui.end_row();
-            dialog_field(ui, "Исполнитель:", &mut fields.artist, "Исполнитель…", 320.0);
+            dialog_field(ui, "Исполнитель:", &mut fields.artist, "Исполнитель…");
             ui.end_row();
-            dialog_field(ui, "Альбом:", &mut fields.album, "Альбом…", 320.0);
+            dialog_field(ui, "Альбом:", &mut fields.album, "Альбом…");
             ui.end_row();
-            dialog_field(
-                ui,
-                "Альбом-артист:",
-                &mut fields.album_artist,
-                "Альбом-артист…",
-                320.0,
-            );
-            ui.end_row();
-            dialog_field(ui, "Трек №:", &mut fields.track_number, "Трек №…", 60.0);
-            dialog_field(ui, "Диск №:", &mut fields.disc_number, "Диск №…", 60.0);
+            dialog_field(ui, "Альбом-артист:", &mut fields.album_artist, "Альбом-артист…");
             ui.end_row();
         });
+    numeric_fields_row(ui, &mut fields.track_number, &mut fields.disc_number);
     dialog.fields = fields;
     if let Some(error) = &dialog.error {
         ui.colored_label(ui.visuals().error_fg_color, error);
@@ -5051,6 +5100,15 @@ mod tests {
             track_cell_id(track, 0),
             track_cell_id(TrackId::from_bits(0xABCE), 0)
         );
+    }
+
+    #[test]
+    fn even_split_halves_remainder_and_floors_at_zero() {
+        // 300 available, the other label 50 wide, two gaps of 8:
+        // (300 − 50 − 16) / 2 = 117 per field.
+        assert_eq!(even_split(300.0, 50.0, 16.0), 117.0);
+        // A squeezed row degrades to zero instead of inverting.
+        assert_eq!(even_split(20.0, 50.0, 16.0), 0.0);
     }
 
     #[test]
