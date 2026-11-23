@@ -3031,17 +3031,38 @@ fn resolve_selection_actions(
     }
 
     // «выбрать все» edits the row set only: the cursor stays put
-    // (review 🟡-1) — a bulk selection is not a navigation act.
+    // (review 🟡-1) — a bulk selection is not a navigation act. The
+    // one exception is the cursor invariant (see the checkbox rule):
+    // an uncheck that sweeps the cursor's own visible row re-anchors
+    // it to the last surviving selection — selections made elsewhere
+    // survive apply_select_all — or clears it; otherwise the row
+    // would stay highlighted while its checkbox is off.
     if let Some(check) = select_all {
-        selection.selected_tracks = apply_select_all(&selection.selected_tracks, visible_ids, check);
+        selection.selected_tracks =
+            apply_select_all(&selection.selected_tracks, visible_ids, check);
+        if let Some(cursor) = selection.selected_track {
+            let swept = !check
+                && visible_ids.contains(&cursor)
+                && !selection.selected_tracks.contains(&cursor);
+            if swept {
+                selection.selected_track = selection.selected_tracks.last().copied();
+            }
+        }
     }
 
     // A checkbox check moves the cursor to the toggled row (Enter
-    // targets the last touched row); an uncheck leaves it where it is.
+    // targets the last touched row). WHY the uncheck rule — the
+    // cursor invariant: the cursor must always point at a SELECTED
+    // row, otherwise the row stays highlighted while unchecked (the
+    // live «чекбокс снял, выделение осталось» report). Unchecking the
+    // cursor row re-anchors it to the last remaining selection or
+    // clears it; unchecking any other row never navigates.
     if let Some(id) = checkbox_toggle {
         selection.selected_tracks = toggle_selected(&selection.selected_tracks, id);
         if selection.selected_tracks.contains(&id) {
             selection.selected_track = Some(id);
+        } else if selection.selected_track == Some(id) {
+            selection.selected_track = selection.selected_tracks.last().copied();
         }
     }
 
@@ -7504,7 +7525,12 @@ mod tests {
     }
 
     #[test]
-    fn resolution_uncheck_all_clears_only_visible_and_keeps_the_cursor() {
+    fn resolution_uncheck_all_clears_only_visible_and_reanchors_a_swept_cursor() {
+        // Review 🟡-1 stands as far as possible: the bulk edit never
+        // navigates on its own — but the invariant wins when the
+        // cursor's own visible row is swept (checked, now unchecked):
+        // it re-anchors to the last surviving selection (the hidden
+        // id 9 here) instead of ghost-highlighting a cleared row.
         let visible = ids(&[1, 2, 3]);
         let update = resolve_selection_actions(
             &ids(&[1, 2, 3, 9]),
@@ -7516,7 +7542,11 @@ mod tests {
             None,
         );
         assert_eq!(update.selected_tracks, ids(&[9]), "out-of-view rows survive");
-        assert_eq!(update.selected_track, Some(TrackId::from_bits(3)), "cursor put");
+        assert_eq!(
+            update.selected_track,
+            Some(TrackId::from_bits(9)),
+            "cursor re-anchored to the survivor"
+        );
     }
 
     #[test]
@@ -7546,6 +7576,84 @@ mod tests {
         );
         assert_eq!(uncheck.selected_tracks, ids(&[1]));
         assert_eq!(uncheck.selected_track, Some(TrackId::from_bits(1)), "cursor put");
+    }
+
+    #[test]
+    fn checkbox_uncheck_moves_the_cursor_to_the_last_remaining() {
+        // Invariant: the cursor always points at a SELECTED row —
+        // unchecking it must not leave a highlighted-but-unchecked
+        // ghost (live report); it re-anchors to the last remaining.
+        let visible = ids(&[1, 2, 3]);
+        let update = resolve_selection_actions(
+            &ids(&[1, 2]),
+            None,
+            Some(TrackId::from_bits(2)),
+            &visible,
+            None,
+            None,
+            Some(TrackId::from_bits(2)),
+        );
+        assert_eq!(update.selected_tracks, ids(&[1]));
+        assert_eq!(
+            update.selected_track,
+            Some(TrackId::from_bits(1)),
+            "cursor re-anchored"
+        );
+    }
+
+    #[test]
+    fn checkbox_uncheck_of_the_last_selected_row_clears_the_cursor() {
+        // Nothing left to point at: the cursor becomes None instead of
+        // hovering over a row the user just deselected.
+        let visible = ids(&[5]);
+        let update = resolve_selection_actions(
+            &ids(&[5]),
+            None,
+            Some(TrackId::from_bits(5)),
+            &visible,
+            None,
+            None,
+            Some(TrackId::from_bits(5)),
+        );
+        assert_eq!(update.selected_tracks, ids(&[]));
+        assert_eq!(update.selected_track, None);
+    }
+
+    #[test]
+    fn checkbox_uncheck_of_a_non_cursor_row_never_navigates() {
+        // The invariant only bites when the cursor's own row is swept:
+        // an uncheck elsewhere leaves it exactly where it was.
+        let visible = ids(&[1, 2, 3]);
+        let update = resolve_selection_actions(
+            &ids(&[1, 3]),
+            None,
+            Some(TrackId::from_bits(1)),
+            &visible,
+            None,
+            None,
+            Some(TrackId::from_bits(3)),
+        );
+        assert_eq!(update.selected_tracks, ids(&[1]));
+        assert_eq!(update.selected_track, Some(TrackId::from_bits(1)), "cursor put");
+    }
+
+    #[test]
+    fn uncheck_all_with_nothing_left_outside_clears_the_cursor() {
+        // «выбрать все» uncheck variant of the invariant: everything
+        // visible is swept and no out-of-view selection survives, so
+        // the cursor has no selected row to point at.
+        let visible = ids(&[1, 2]);
+        let update = resolve_selection_actions(
+            &ids(&[1, 2]),
+            Some((0, TrackId::from_bits(1))),
+            Some(TrackId::from_bits(2)),
+            &visible,
+            None,
+            Some(false),
+            None,
+        );
+        assert_eq!(update.selected_tracks, ids(&[]));
+        assert_eq!(update.selected_track, None);
     }
 
     // ---- table columns fit the panel (round 4.1 Ф4) ----
