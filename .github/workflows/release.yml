@@ -1,6 +1,6 @@
 # Release: builds podlib (CLI) + podlib-gui and uploads tarballs to GitHub
-# Releases on a v* tag push. The release itself is created automatically by
-# upload-rust-binary-action if it does not exist yet.
+# Releases on a v* tag push. The release is created by create-gh-release-action;
+# upload-rust-binary-action only attaches assets to an existing release.
 #
 # Asset naming CONTRACT with cargo-binstall (do not rename!): every target
 # produces `podlib-<target>.tar.gz` (+ .sha256) — it must stay byte-identical
@@ -22,7 +22,23 @@ on:
   workflow_dispatch: # re-run uploads/publish without retagging
 
 jobs:
+  create-release:
+    name: Create GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release
+    steps:
+      - uses: actions/checkout@v6
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          changelog: CHANGELOG.md # release notes = the tag's changelog section
+
   upload-assets:
+    # skipped create-release (workflow_dispatch rerun: release already exists)
+    # must not skip the dependent job
+    needs: create-release
+    if: always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
     strategy:
       matrix:
         include:
