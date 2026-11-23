@@ -1989,35 +1989,51 @@ impl PodlibApp {
         }
         let mut confirmed = false;
         let mut name = String::new();
-        let response = egui::Modal::new(egui::Id::unique("create_playlist")).show(ctx, |ui| {
-            ui.set_width(380.0);
-            ui.heading("Новый плейлист");
-            ui.add_space(4.0);
-            let Some(library) = self.library.as_mut() else {
-                return;
-            };
-            ui.horizontal(|ui| {
-                ui.label("Название:");
-                let name = ui.add(
-                    egui::TextEdit::singleline(&mut library.new_playlist_name)
-                        .hint_text("Название плейлиста…")
-                        .desired_width(240.0),
-                );
-                text_menu::attach_text_menu(&name);
-            });
-            name = library.new_playlist_name.clone();
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui.button("Отмена").clicked() {
-                    ui.close();
-                }
+        // WHY Frame::popup: the theme's own popup chrome, only wider
+        // inner margins — one look with the edit modal (MODAL_MARGIN).
+        let response = egui::Modal::new(egui::Id::unique("create_playlist"))
+            .frame(egui::Frame::popup(&ctx.global_style()).inner_margin(MODAL_MARGIN))
+            .show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.heading("Новый плейлист");
+                ui.add_space(MODAL_GAP);
+                let Some(library) = self.library.as_mut() else {
+                    return;
+                };
+                ui.horizontal(|ui| {
+                    ui.label("Название:");
+                    let name = ui.add(
+                        egui::TextEdit::singleline(&mut library.new_playlist_name)
+                            .hint_text("Название плейлиста…")
+                            .desired_width(240.0),
+                    );
+                    text_menu::attach_text_menu(&name);
+                });
+                name = library.new_playlist_name.clone();
+                // Enter confirms when the name is real — the same rule
+                // the «Создать» button uses (rename-dialog convention);
+                // Esc closes via the Modal default.
                 let ready = !library.new_playlist_name.trim().is_empty();
-                if ui.add_enabled(ready, egui::Button::new("Создать")).clicked() {
+                if ready && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
                     confirmed = true;
                     ui.close();
                 }
+                ui.add_space(MODAL_GAP);
+                ui.separator();
+                ui.add_space(MODAL_GAP);
+                // Primary action hugs the bottom-right corner; first
+                // added = rightmost (right_to_left layout).
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let ready = !library.new_playlist_name.trim().is_empty();
+                    if ui.add_enabled(ready, egui::Button::new("Создать")).clicked() {
+                        confirmed = true;
+                        ui.close();
+                    }
+                    if ui.button("Отмена").clicked() {
+                        ui.close();
+                    }
+                });
             });
-        });
         if confirmed || response.should_close() {
             if let Some(library) = self.library.as_mut() {
                 library.create_open = false;
@@ -2053,49 +2069,54 @@ impl PodlibApp {
             .map(|playlist| playlist.name.clone());
         let mut confirmed = false;
         let mut typed = String::new();
-        let response = egui::Modal::new(egui::Id::unique("rename_playlist")).show(ctx, |ui| {
-            ui.set_width(380.0);
-            ui.heading("Переименовать плейлист");
-            ui.add_space(4.0);
-            let Some(library) = self.library.as_mut() else {
-                return;
-            };
-            let Some(dialog) = library.rename_dialog.as_mut() else {
-                return;
-            };
-            ui.horizontal(|ui| {
-                ui.label("Название:");
-                let name = ui.add(
-                    egui::TextEdit::singleline(&mut dialog.name)
-                        .hint_text("Новое название…")
-                        .desired_width(240.0),
-                );
-                text_menu::attach_text_menu(&name);
-            });
-            typed = dialog.name.clone();
-            ui.separator();
-            // Enter confirms the primary action («Сохранить») only when
-            // the name is real and different — the same rule the button
-            // uses (D2 convention, as the confirm modals).
-            let ready = !typed.trim().is_empty()
-                && current_name.as_deref() != Some(typed.trim());
-            if ready && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
-                confirmed = true;
-                ui.close();
-            }
-            ui.horizontal(|ui| {
-                if ui.button("Отмена").clicked() {
-                    ui.close();
-                }
-                if ui
-                    .add_enabled(ready, egui::Button::new("Сохранить"))
-                    .clicked()
-                {
+        // WHY Frame::popup: the theme's own popup chrome, only wider
+        // inner margins — one look with the edit modal (MODAL_MARGIN).
+        let response = egui::Modal::new(egui::Id::unique("rename_playlist"))
+            .frame(egui::Frame::popup(&ctx.global_style()).inner_margin(MODAL_MARGIN))
+            .show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.heading("Переименовать плейлист");
+                ui.add_space(MODAL_GAP);
+                let Some(library) = self.library.as_mut() else {
+                    return;
+                };
+                let Some(dialog) = library.rename_dialog.as_mut() else {
+                    return;
+                };
+                ui.horizontal(|ui| {
+                    ui.label("Название:");
+                    let name = ui.add(
+                        egui::TextEdit::singleline(&mut dialog.name)
+                            .hint_text("Новое название…")
+                            .desired_width(240.0),
+                    );
+                    text_menu::attach_text_menu(&name);
+                });
+                typed = dialog.name.clone();
+                // Enter confirms the primary action («Сохранить») only
+                // when the name is real and different — the same rule
+                // the button uses (D2 convention, as the confirm modals).
+                let ready =
+                    !typed.trim().is_empty() && current_name.as_deref() != Some(typed.trim());
+                if ready && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
                     confirmed = true;
                     ui.close();
                 }
+                ui.add_space(MODAL_GAP);
+                ui.separator();
+                ui.add_space(MODAL_GAP);
+                // Primary action hugs the bottom-right corner; first
+                // added = rightmost (right_to_left layout).
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Отмена").clicked() {
+                        ui.close();
+                    }
+                    if ui.add_enabled(ready, egui::Button::new("Сохранить")).clicked() {
+                        confirmed = true;
+                        ui.close();
+                    }
+                });
             });
-        });
         if confirmed || response.should_close() {
             if let Some(library) = self.library.as_mut() {
                 library.rename_dialog = None;
