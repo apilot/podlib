@@ -4044,37 +4044,65 @@ fn track_table(
                             actions.checkbox_toggle = Some(id);
                         }
                     });
-                    // WHY the same id for every cell: egui keys the drag
-                    // payload by id; identical ids + identical payloads
-                    // make all four cells drag the one row.
-                    let row_id = egui::Id::unique(("track_row", track.id.to_bits()));
+                    // WHY per-cell ids (see [`track_cell_id`]): the
+                    // payload is context-global, NOT keyed by id, so
+                    // identical payloads keep the row dragging as one
+                    // unit from any of the four cells.
                     let payload = DraggedTracks(vec![track.id]);
                     let clicked = Cell::new(false);
                     let double_clicked = Cell::new(false);
                     row.col(|ui| {
-                        draggable_cell(ui, row_id, &payload, &clicked, &double_clicked, |ui| {
-                            ui.label(egui::RichText::new(&track.title).strong());
-                        });
+                        draggable_cell(
+                            ui,
+                            track_cell_id(track.id, 0),
+                            &payload,
+                            &clicked,
+                            &double_clicked,
+                            |ui| {
+                                ui.label(egui::RichText::new(&track.title).strong());
+                            },
+                        );
                     });
                     row.col(|ui| {
-                        draggable_cell(ui, row_id, &payload, &clicked, &double_clicked, |ui| {
-                            tooltip_label(ui, &track.artist);
-                        });
+                        draggable_cell(
+                            ui,
+                            track_cell_id(track.id, 1),
+                            &payload,
+                            &clicked,
+                            &double_clicked,
+                            |ui| {
+                                tooltip_label(ui, &track.artist);
+                            },
+                        );
                     });
                     row.col(|ui| {
-                        draggable_cell(ui, row_id, &payload, &clicked, &double_clicked, |ui| {
-                            tooltip_label(ui, &track.album);
-                        });
+                        draggable_cell(
+                            ui,
+                            track_cell_id(track.id, 2),
+                            &payload,
+                            &clicked,
+                            &double_clicked,
+                            |ui| {
+                                tooltip_label(ui, &track.album);
+                            },
+                        );
                     });
                     row.col(|ui| {
-                        draggable_cell(ui, row_id, &payload, &clicked, &double_clicked, |ui| {
-                            // Table numbers read better right-aligned to
-                            // the column edge.
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| ui.label(format_duration(track.duration_ms)),
-                            );
-                        });
+                        draggable_cell(
+                            ui,
+                            track_cell_id(track.id, 3),
+                            &payload,
+                            &clicked,
+                            &double_clicked,
+                            |ui| {
+                                // Table numbers read better right-aligned to
+                                // the column edge.
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| ui.label(format_duration(track.duration_ms)),
+                                );
+                            },
+                        );
                     });
                     // Double-click wins over plain click: the second
                     // click of a double-click also registers as clicked.
@@ -4120,6 +4148,18 @@ fn track_table(
             }
         });
     actions
+}
+
+/// Stable id of one track-table cell. WHY per-cell: every cell is its
+/// own `dnd_drag_source` and registers its id via `Ui::interact` in
+/// the same frame — a shared row id is a duplicate-id collision, and
+/// egui paints «First use of widget ID» error overlays over the row.
+/// The drag payload is context-global state (`DragAndDrop` stores a
+/// single `Option<Arc<dyn Any>>`, NOT keyed by id), so identical
+/// payloads keep the whole row dragging as one unit from any cell.
+/// Pure hash (no counters): deterministic across frames/restarts.
+fn track_cell_id(track_id: TrackId, cell_index: usize) -> egui::Id {
+    egui::Id::unique(("track_row", track_id.to_bits(), cell_index))
 }
 
 /// One draggable table cell: drag payload + click/double-click flags.
@@ -4890,6 +4930,27 @@ mod tests {
             "boxed panic"
         );
         assert_eq!(panic_message(Box::new(7u32)), "причина не сообщена");
+    }
+
+    #[test]
+    fn track_cell_ids_unique_per_cell_and_deterministic() {
+        let track = TrackId::from_bits(0xABCD);
+        // Four cells of one row: distinct ids — every cell is its own
+        // dnd_drag_source registering in the same frame; a shared id
+        // is an egui duplicate-id collision (error overlays).
+        let ids: Vec<egui::Id> = (0..4).map(|cell| track_cell_id(track, cell)).collect();
+        for (i, id) in ids.iter().enumerate() {
+            for (j, other) in ids.iter().enumerate().skip(i + 1) {
+                assert_ne!(id, other, "cells {i} and {j} share an id");
+            }
+        }
+        // Deterministic per (track, cell): stable across frames and
+        // restarts; a different track never reuses a cell id.
+        assert_eq!(track_cell_id(track, 0), track_cell_id(track, 0));
+        assert_ne!(
+            track_cell_id(track, 0),
+            track_cell_id(TrackId::from_bits(0xABCE), 0)
+        );
     }
 
     #[test]
