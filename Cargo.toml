@@ -17,13 +17,14 @@ repository = "https://github.com/apilot/podlib"
 rust-version = "1.95"
 
 [workspace.dependencies]
-# Vendored copy of github.com/koriwi/libopod @ rev 0eef69a2730aea6e9b8eb6a9b39c95deac05163d:
+# Vendored fork of github.com/koriwi/libopod @ rev 0eef69a2730aea6e9b8eb6a9b39c95deac05163d,
+# published to crates.io as `podlib-libopod` (upstream owns `libopod-rs` and its
 # crates.io 0.1.0 lacks playlist mutations and classic-device support that the
-# adapter depends on. Database-layer fixes (NULL-safe rank queries against real
+# adapter depends on). Database-layer fixes (NULL-safe rank queries against real
 # firmware DBs, orphan-artist delete guard, empty-key reindex) are merged
 # upstream (koriwi/libopod#1); podlib-specific edit-session fixes stay local.
 # Switch back to the upstream crate once a crates.io release carries playlists.
-libopod = { package = "libopod-rs", path = "crates/vendor/libopod" }
+libopod = { package = "podlib-libopod", version = "0.1.0", path = "crates/vendor/libopod" }
 thiserror = "2"
 tempfile = "3"
 plist = "1.7"

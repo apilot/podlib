@@ -5,6 +5,8 @@ version.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+description = "GUI for managing music libraries on USB-connected iPods (Nano 7G and classic click-wheel), built with egui/eframe"
+readme = "../../README.md"
 
 [[bin]]
 name = "podlib-gui"
@@ -23,6 +25,6 @@ pkg-fmt = "tgz"
 eframe = { workspace = true }
 egui = { workspace = true }
 egui_extras = { workspace = true }
-podlib = { path = "../podlib" }
+podlib = { path = "../podlib", version = "0.1.0" }
 tempfile = { workspace = true } # transcode batch tempdir (worker, round 5.2)
 thiserror = { workspace = true }

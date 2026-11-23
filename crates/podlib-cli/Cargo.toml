@@ -5,6 +5,8 @@ version.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+description = "CLI for managing music libraries on USB-connected iPods (Nano 7G and classic click-wheel)"
+readme = "../../README.md"
 
 [[bin]]
 name = "podlib"
@@ -24,5 +26,5 @@ bin-dir = "{ bin }{ binary-ext }"
 pkg-fmt = "tgz"
 
 [dependencies]
-podlib = { path = "../podlib" }
+podlib = { path = "../podlib", version = "0.1.0" }
 clap = { version = "4", features = ["derive"] }

@@ -1,13 +1,13 @@
 [package]
-name = "libopod-rs"
+name = "podlib-libopod"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
-description = "Safe Rust library for mounted, storage-backed iPods"
-repository = "https://github.com/koriwi/libopod"
-homepage = "https://github.com/koriwi/libopod"
-documentation = "https://docs.rs/libopod-rs"
+description = "Safe Rust library for mounted, storage-backed iPods — podlib's fork of koriwi/libopod with playlist mutations and classic-device support"
+repository = "https://github.com/apilot/podlib"
+homepage = "https://github.com/apilot/podlib"
+documentation = "https://docs.rs/podlib-libopod"
 readme = "README.md"
 keywords = ["ipod", "itunesdb", "music", "sync"]
 categories = ["filesystem", "multimedia"]
@@ -29,7 +29,7 @@ include = [
 ]
 
 [lib]
-# Keep the Rust import path `libopod` while publishing the package as `libopod-rs`.
+# Keep the Rust import path `libopod` while publishing the package as `podlib-libopod`.
 name = "libopod"
 
 [features]

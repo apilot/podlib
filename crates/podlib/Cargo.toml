@@ -4,6 +4,8 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Domain model and firmware-safe backend for managing music libraries on USB-connected iPods (Nano 7G and classic click-wheel)"
+readme = "../../README.md"
 
 [dependencies]
 libopod = { workspace = true }
