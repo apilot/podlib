@@ -233,6 +233,8 @@ struct TrackRowActions {
     /// Round 6 П2: a row checkbox was clicked → explicit toggle of
     /// that id in the shared selection.
     checkbox_toggle: Option<TrackId>,
+    /// Round 7: a sortable header was clicked → which column.
+    sort_toggle: Option<TrackSortColumn>,
 }
 
 impl TrackRowActions {
@@ -247,6 +249,7 @@ impl TrackRowActions {
             .or(self.remove_from_playlist.take());
         self.select_all = other.select_all.or(self.select_all.take());
         self.checkbox_toggle = other.checkbox_toggle.or(self.checkbox_toggle.take());
+        self.sort_toggle = other.sort_toggle.or(self.sort_toggle.take());
     }
 }
 
@@ -330,6 +333,10 @@ struct LibraryUi {
     books_mode: SectionMode,
     /// Toolbar search box; empty string = no filter.
     search_query: String,
+    /// Round 7: active column sort of the flat track table (`None` =
+    /// default device order). Display state only — never written to
+    /// the device.
+    track_sort: Option<TrackSort>,
 }
 
 pub struct PodlibApp {
@@ -552,6 +559,7 @@ impl PodlibApp {
             music_mode: SectionMode::List,
             books_mode: SectionMode::Books,
             search_query: String::new(),
+            track_sort: None,
         });
     }
 
@@ -1179,7 +1187,11 @@ impl PodlibApp {
                 .copied()
                 .filter(|track| matches_query(track, &query))
                 .collect();
-            let visible_ids: Vec<TrackId> = filtered.iter().map(|track| track.id).collect();
+            // Round 7: `displayed` starts as the filtered list; the
+            // flat-list branch re-sorts it (and only it) below, so the
+            // grouped views keep their own internal order.
+            let mut displayed: Vec<&Track> = filtered;
+            let mut visible_ids: Vec<TrackId> = displayed.iter().map(|track| track.id).collect();
             let empty_view = matches!(view, LibraryView::Media { .. }) && total == 0;
             let empty_playlist = matches!(view, LibraryView::Playlist(_)) && total == 0;
 
@@ -1190,7 +1202,7 @@ impl PodlibApp {
                 SearchToolbarParams {
                     ctx: &ctx,
                     query: &mut library.search_query,
-                    shown: filtered.len(),
+                    shown: displayed.len(),
                     total,
                     idle,
                     selection_len: library.selected_tracks.len(),
@@ -1238,7 +1250,7 @@ impl PodlibApp {
                 }
             };
 
-            if filtered.is_empty() {
+            if displayed.is_empty() {
                 ui.centered_and_justified(|ui| {
                     ui.label(egui::RichText::new(empty_state_text(
                         library.snapshot.tracks.is_empty(),
@@ -1251,9 +1263,9 @@ impl PodlibApp {
                 // Grouped views (round 5 books + round 6 П3) share ONE
                 // component; each mode keeps its own expanded set.
                 let groups = match mode {
-                    SectionMode::Albums => group_by_album(filtered.iter().copied()),
-                    SectionMode::Artists => group_by_artist(filtered.iter().copied()),
-                    _ => group_books(filtered.iter().copied()),
+                    SectionMode::Albums => group_by_album(displayed.iter().copied()),
+                    SectionMode::Artists => group_by_artist(displayed.iter().copied()),
+                    _ => group_books(displayed.iter().copied()),
                 };
                 let expanded = if mode == SectionMode::Books {
                     &mut library.expanded_books
@@ -1264,7 +1276,7 @@ impl PodlibApp {
                     ui,
                     GroupsViewParams {
                         ctx: &ctx,
-                        tracks: &filtered,
+                        tracks: &displayed,
                         groups: &groups,
                         selected_tracks: &library.selected_tracks,
                         cursor,
@@ -1274,15 +1286,27 @@ impl PodlibApp {
                     },
                 ));
             } else {
+                // Round 7: the flat list sorts AFTER the filter, BEFORE
+                // the render; visible_ids re-derive from the sorted
+                // order so row-click indices stay in sync.
+                displayed = sort_tracks(displayed, library.track_sort);
+                visible_ids = displayed.iter().map(|track| track.id).collect();
                 actions.merge(track_table(
                     ui,
-                    &filtered,
+                    &displayed,
                     &library.selected_tracks,
                     cursor,
                     view,
                     menus_allowed,
                     table_id,
+                    library.track_sort,
                 ));
+            }
+
+            // Round 7: a header click cycles the sort state (pure
+            // [`next_track_sort`]).
+            if let Some(column) = actions.sort_toggle.take() {
+                library.track_sort = next_track_sort(library.track_sort, column);
             }
 
             // Row-click / «выбрать все» / checkbox resolution lives in
@@ -2485,6 +2509,81 @@ fn section_modes(distinguished_kind: i64) -> &'static [SectionMode] {
     }
 }
 
+// ---- round 7: column sort of the flat track table ----
+
+/// Sortable column of the track table header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrackSortColumn {
+    Title,
+    Artist,
+    Album,
+    Duration,
+}
+
+/// Active column sort (round 7). Pure UI state: it lives in
+/// [`LibraryUi`] and is never written to the device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TrackSort {
+    column: TrackSortColumn,
+    descending: bool,
+}
+
+/// Header-click cycle (round 7): first click sorts ascending, the
+/// second descending, the third returns to the default order. WHY the
+/// explicit reset: a playlist view has a meaningful device order
+/// (curated member sequence) and needs a way back to it; asc/desc
+/// alone would trap the view in a sorted state forever.
+fn next_track_sort(current: Option<TrackSort>, clicked: TrackSortColumn) -> Option<TrackSort> {
+    match current {
+        Some(sort) if sort.column == clicked => match sort.descending {
+            false => Some(TrackSort {
+                column: clicked,
+                descending: true,
+            }),
+            true => None,
+        },
+        _ => Some(TrackSort {
+            column: clicked,
+            descending: false,
+        }),
+    }
+}
+
+/// One sort key of a track; an absent artist/album is an empty string.
+/// Naive `Ord` (code-point order, case-sensitive): predictable, no
+/// locale dependency, and desc is the exact reverse of asc.
+fn sort_key(track: &Track, column: TrackSortColumn) -> std::borrow::Cow<'_, str> {
+    match column {
+        TrackSortColumn::Title => track.title.as_str().into(),
+        TrackSortColumn::Artist => track.artist.as_deref().unwrap_or_default().into(),
+        TrackSortColumn::Album => track.album.as_deref().unwrap_or_default().into(),
+        TrackSortColumn::Duration => format!("{:012}", track.duration_ms).into(),
+    }
+}
+
+/// Stable sort of the (already filtered) flat list, round 7. Applied
+/// AFTER the search filter, BEFORE the render; equal keys keep their
+/// incoming relative order, so «Обновить» never shuffles rows. The
+/// duration sorts numerically via a zero-padded key.
+fn sort_tracks(tracks: Vec<&Track>, sort: Option<TrackSort>) -> Vec<&Track> {
+    let Some(sort) = sort else {
+        return tracks;
+    };
+    let mut sorted = tracks;
+    // Reverse the ORDERING, not the vec: sorting with a reversed
+    // comparator keeps equal keys in their incoming order, so desc is
+    // as stable as asc.
+    sorted.sort_by(|a, b| {
+        let ordering = sort_key(a, sort.column).cmp(&sort_key(b, sort.column));
+        if sort.descending {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    });
+    sorted
+}
+
 /// The unified view switcher (round 6 П3): a segmented row of labels
 /// directly over the table/content. Returns true when the active mode
 /// changed. Theme-driven `selectable_label` — no custom colors, the
@@ -3203,6 +3302,52 @@ struct ToolbarActions {
     set_artist: bool,
 }
 
+/// Pictogram + tooltip of ONE action (round 7): glyph and label travel
+/// together so no call site can pair them inconsistently. The glyphs
+/// come from egui's bundled monochrome emoji fonts — the
+/// `monochrome_emoji_fonts` feature (see workspace Cargo.toml);
+/// coverage is pinned by a test.
+struct ActionIcon {
+    glyph: &'static str,
+    tooltip: &'static str,
+}
+
+const ICON_REFRESH: ActionIcon = ActionIcon {
+    glyph: "🔄",
+    tooltip: "Обновить",
+};
+const ICON_EDIT: ActionIcon = ActionIcon {
+    glyph: "✏",
+    tooltip: "Изменить…",
+};
+const ICON_SET_ARTIST: ActionIcon = ActionIcon {
+    glyph: "👤",
+    tooltip: "Задать исполнителя…",
+};
+const ICON_ADD_TO_PLAYLIST: ActionIcon = ActionIcon {
+    glyph: "📋",
+    tooltip: "Добавить в плейлист…",
+};
+const ICON_REMOVE_FROM_PLAYLIST: ActionIcon = ActionIcon {
+    glyph: "🚫",
+    tooltip: "Убрать из плейлиста",
+};
+const ICON_DELETE: ActionIcon = ActionIcon {
+    glyph: "🗑",
+    tooltip: "Удалить…",
+};
+
+/// One pictogram button (round 7): glyph + hover tooltip with the
+/// former label. Replaces the text labels to save toolbar width (the
+/// owner's finding: text buttons crowded the search box at the 616px
+/// worst case). THE single helper for every site offering these
+/// actions — toolbar and context menus alike; tooltips keep the «…».
+fn icon_button(ui: &mut egui::Ui, icon: &ActionIcon, enabled: bool) -> bool {
+    ui.add_enabled(enabled, egui::Button::new(icon.glyph))
+        .on_hover_text(icon.tooltip)
+        .clicked()
+}
+
 /// Aggregated arguments for [`search_toolbar`] (UI chrome above the
 /// track table); `ui` stays a plain argument per egui convention.
 struct SearchToolbarParams<'a> {
@@ -3251,38 +3396,26 @@ fn search_toolbar(ui: &mut egui::Ui, params: SearchToolbarParams<'_>) -> Toolbar
         ui.label(tracks_counter(shown, total, &query_before));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let enabled = idle && selection_len > 0;
+            // Round 7: pictograms, first added = rightmost (unchanged
+            // order). The delete button becomes «Убрать из плейлиста»
+            // in a playlist context.
             if playlist_context {
-                if ui
-                    .add_enabled(enabled, egui::Button::new("Убрать из плейлиста"))
-                    .clicked()
-                {
+                if icon_button(ui, &ICON_REMOVE_FROM_PLAYLIST, enabled) {
                     toolbar.remove = true;
                 }
-            } else if ui.add_enabled(enabled, egui::Button::new("Удалить…")).clicked() {
+            } else if icon_button(ui, &ICON_DELETE, enabled) {
                 toolbar.remove = true;
             }
-            if ui
-                .add_enabled(enabled, egui::Button::new("Добавить в плейлист…"))
-                .clicked()
-            {
+            if icon_button(ui, &ICON_ADD_TO_PLAYLIST, enabled) {
                 toolbar.add = true;
             }
-            if ui
-                .add_enabled(enabled, egui::Button::new("Задать исполнителя…"))
-                .clicked()
-            {
+            if icon_button(ui, &ICON_SET_ARTIST, enabled) {
                 toolbar.set_artist = true;
             }
-            if ui
-                .add_enabled(idle && selection_len == 1, egui::Button::new("Изменить…"))
-                .clicked()
-            {
+            if icon_button(ui, &ICON_EDIT, idle && selection_len == 1) {
                 toolbar.edit = true;
             }
-            if ui
-                .add_enabled(idle, egui::Button::new("Обновить"))
-                .clicked()
-            {
+            if icon_button(ui, &ICON_REFRESH, idle) {
                 toolbar.refresh = true;
             }
         });
@@ -3546,16 +3679,16 @@ fn book_file_row(
     if menus_allowed {
         let mut choice = TrackRowActions::default();
         response.context_menu(|ui| {
-            if ui.button("Изменить…").clicked() {
+            if icon_button(ui, &ICON_EDIT, true) {
                 choice.edit = Some(track_id);
                 ui.close();
             }
-            if ui.button("Добавить в плейлист…").clicked() {
+            if icon_button(ui, &ICON_ADD_TO_PLAYLIST, true) {
                 choice.add_to_playlist = Some(vec![track_id]);
                 ui.close();
             }
             ui.separator();
-            if ui.button("Удалить…").clicked() {
+            if icon_button(ui, &ICON_DELETE, true) {
                 choice.delete = Some(track_id);
                 ui.close();
             }
@@ -3579,6 +3712,34 @@ fn header_select_all(ui: &mut egui::Ui, state: SelectAllState) -> Option<bool> {
     response.changed().then_some(checked)
 }
 
+/// One sortable header cell (round 7): the strong label, suffixed
+/// ▲/▼ while its column is the active sort. A click reports the
+/// column — the caller owns the state machine ([`next_track_sort`]).
+fn sortable_header(
+    ui: &mut egui::Ui,
+    label: &str,
+    column: TrackSortColumn,
+    sort: Option<TrackSort>,
+) -> Option<TrackSortColumn> {
+    let suffix = match sort {
+        Some(sort) if sort.column == column => {
+            if sort.descending {
+                " ▼"
+            } else {
+                " ▲"
+            }
+        }
+        _ => "",
+    };
+    let response = ui
+        .add(
+            egui::Label::new(egui::RichText::new(format!("{label}{suffix}")).strong())
+                .sense(egui::Sense::click()),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    response.clicked().then_some(column)
+}
+
 /// One checkbox cell of a table row (round 6 П2): an explicit toggle
 /// of the row in the shared selection. A plain widget on purpose —
 /// unlike the draggable title/artist/album/duration cells it must not
@@ -3593,8 +3754,10 @@ fn row_checkbox(ui: &mut egui::Ui, selected_tracks: &[TrackId], id: TrackId) -> 
 /// rows, per-context scroll state, clip + hover-tooltips, a right
 /// aligned duration column, multi-row selection (Ф3: plain/ctrl/shift
 /// clicks, toolbar actions; round 6 П2: checkbox column + «выбрать
-/// все») and full-row drag. Collects row choices without holding an
-/// app-state borrow.
+/// все») and full-row drag. Round 7: the four data headers are
+/// sortable (click → column, the caller owns the state). Collects row
+/// choices without holding an app-state borrow.
+#[allow(clippy::too_many_arguments)]
 fn track_table(
     ui: &mut egui::Ui,
     tracks: &[&Track],
@@ -3603,6 +3766,7 @@ fn track_table(
     view: LibraryView,
     menus_allowed: bool,
     table_id: egui::Id,
+    sort: Option<TrackSort>,
 ) -> TrackRowActions {
     let mut actions = TrackRowActions::default();
     // Modifiers at click time are the current input state: egui
@@ -3619,17 +3783,30 @@ fn track_table(
                 }
             });
             header.col(|ui| {
-                ui.strong("Название");
+                if let Some(column) = sortable_header(ui, "Название", TrackSortColumn::Title, sort)
+                {
+                    actions.sort_toggle = Some(column);
+                }
             });
             header.col(|ui| {
-                ui.strong("Исполнитель");
+                if let Some(column) =
+                    sortable_header(ui, "Исполнитель", TrackSortColumn::Artist, sort)
+                {
+                    actions.sort_toggle = Some(column);
+                }
             });
             header.col(|ui| {
-                ui.strong("Альбом");
+                if let Some(column) = sortable_header(ui, "Альбом", TrackSortColumn::Album, sort) {
+                    actions.sort_toggle = Some(column);
+                }
             });
             header.col(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.strong("Длит.");
+                    if let Some(column) =
+                        sortable_header(ui, "Длит.", TrackSortColumn::Duration, sort)
+                    {
+                        actions.sort_toggle = Some(column);
+                    }
                 });
             });
         })
@@ -3695,24 +3872,24 @@ fn track_table(
                         // a right-click anywhere in the row. Menu actions
                         // stay single-row (round 4.1: ПКМ unchanged).
                         row.response().context_menu(|ui| {
-                            if ui.button("Изменить…").clicked() {
+                            if icon_button(ui, &ICON_EDIT, true) {
                                 choice.edit = Some(track.id);
                                 ui.close();
                             }
-                            if ui.button("Добавить в плейлист…").clicked() {
+                            if icon_button(ui, &ICON_ADD_TO_PLAYLIST, true) {
                                 choice.add_to_playlist = Some(vec![track.id]);
                                 ui.close();
                             }
                             if let LibraryView::Playlist(playlist_id) = view {
                                 ui.separator();
-                                if ui.button("Убрать из плейлиста").clicked() {
+                                if icon_button(ui, &ICON_REMOVE_FROM_PLAYLIST, true) {
                                     choice.remove_from_playlist =
                                         Some((playlist_id, track.id));
                                     ui.close();
                                 }
                             }
                             ui.separator();
-                            if ui.button("Удалить…").clicked() {
+                            if icon_button(ui, &ICON_DELETE, true) {
                                 choice.delete = Some(track.id);
                                 ui.close();
                             }
@@ -3862,7 +4039,7 @@ fn playlist_row(
             if menus_allowed && !is_view {
                 let mut refused_master = false;
                 row.context_menu(|ui| {
-                    if ui.button("Удалить…").clicked() {
+                    if icon_button(ui, &ICON_DELETE, true) {
                         if playlist.is_master {
                             refused_master = true;
                         } else {
@@ -6731,5 +6908,242 @@ mod tests {
         });
         let rect = rect.borrow().expect("the row must render");
         assert!((rect.width() - 240.0).abs() < 0.5, "full width, got {rect:?}");
+    }
+
+    // ---- toolbar pictograms (round 7) ----
+
+    /// The pictograms and sort arrows ride on fonts bundled INTO egui
+    /// (the `monochrome_emoji_fonts` feature — see workspace
+    /// Cargo.toml). This test pins the feature: drop it and every
+    /// toolbar icon silently becomes tofu.
+    #[test]
+    fn toolbar_glyphs_are_covered_by_the_bundled_fonts() {
+        let ctx = egui::Context::default();
+        // Fonts initialize on the first pass; the atlas delta is
+        // dropped explicitly (same as egui::__run_test_ui).
+        let output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        output.drop_without_applying_deltas();
+        // has_glyphs needs &mut; fonts_mut is the mutating reader.
+        ctx.fonts_mut(|fonts| {
+            for text in [
+                ICON_REFRESH.glyph,
+                ICON_EDIT.glyph,
+                ICON_SET_ARTIST.glyph,
+                ICON_ADD_TO_PLAYLIST.glyph,
+                ICON_REMOVE_FROM_PLAYLIST.glyph,
+                ICON_DELETE.glyph,
+            ] {
+                assert!(
+                    fonts.has_glyphs(&egui::FontId::default(), text),
+                    "no bundled font covers {text:?}"
+                );
+            }
+        });
+    }
+
+    /// The owner's finding (23.11): the text buttons crowded out the
+    /// search box at the 616px worst case. The pictogram row must stay
+    /// clear of the search box: its leftmost extent sits right of the
+    /// search box's right edge plus the item spacing. Both toolbar
+    /// variants checked (playlist «🚫» and library «🗑» as the first
+    /// right-to-left button).
+    #[test]
+    fn icon_row_clears_the_search_box_at_the_narrow_panel() {
+        for first_icon in [ICON_DELETE, ICON_REMOVE_FROM_PLAYLIST] {
+            let search_right: std::rc::Rc<std::cell::Cell<f32>> = Default::default();
+            let icons_left: std::rc::Rc<std::cell::Cell<f32>> = Default::default();
+            let spacing_x: std::rc::Rc<std::cell::Cell<f32>> = Default::default();
+            let search_sink = search_right.clone();
+            let icons_sink = icons_left.clone();
+            let spacing_sink = spacing_x.clone();
+            let mut query = String::new();
+            egui::__run_test_ui(|ui| {
+                ui.allocate_ui(egui::vec2(616.0, 60.0), |ui| {
+                    // The toolbar composition: search box → counter →
+                    // the right-aligned action row.
+                    let search = ui.add(
+                        egui::TextEdit::singleline(&mut query)
+                            .hint_text("Поиск…")
+                            .desired_width(240.0),
+                    );
+                    ui.label(tracks_counter(123, 456, "поиск"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        icon_button(ui, &first_icon, true);
+                        icon_button(ui, &ICON_ADD_TO_PLAYLIST, true);
+                        icon_button(ui, &ICON_SET_ARTIST, true);
+                        icon_button(ui, &ICON_EDIT, true);
+                        icon_button(ui, &ICON_REFRESH, true);
+                        icons_sink.set(ui.min_rect().left());
+                    });
+                    search_sink.set(search.rect.right());
+                    spacing_sink.set(ui.spacing().item_spacing.x);
+                });
+            });
+            let limit = search_right.get() + spacing_x.get();
+            assert!(
+                icons_left.get() >= limit,
+                "{:?}: icon row (left {}) overlaps the search box (right {} + spacing {})",
+                first_icon.glyph,
+                icons_left.get(),
+                search_right.get(),
+                spacing_x.get()
+            );
+        }
+    }
+
+    // ---- column sort of the flat table (round 7) ----
+
+    #[test]
+    fn header_click_cycles_asc_desc_then_back_to_default() {
+        let asc = Some(TrackSort {
+            column: TrackSortColumn::Title,
+            descending: false,
+        });
+        let desc = Some(TrackSort {
+            column: TrackSortColumn::Title,
+            descending: true,
+        });
+        assert_eq!(next_track_sort(None, TrackSortColumn::Title), asc);
+        assert_eq!(next_track_sort(asc, TrackSortColumn::Title), desc);
+        assert_eq!(
+            next_track_sort(desc, TrackSortColumn::Title),
+            None,
+            "the third click returns to the default (device) order — a \
+             playlist view needs a way back to its curated order"
+        );
+        // A click on another column restarts ascending.
+        assert_eq!(
+            next_track_sort(desc, TrackSortColumn::Duration),
+            Some(TrackSort {
+                column: TrackSortColumn::Duration,
+                descending: false,
+            })
+        );
+    }
+
+    #[test]
+    fn sort_orders_titles_and_reverses_with_the_direction() {
+        let tracks = [
+            book_track(1, "Вишня", None, None, None, 1, 1, 10_000),
+            book_track(2, "Азбука", None, None, None, 1, 1, 20_000),
+            book_track(3, "Море", None, None, None, 1, 1, 30_000),
+        ];
+        let refs: Vec<&Track> = tracks.iter().collect();
+        fn titles(sorted: Vec<&Track>) -> Vec<&str> {
+            sorted.iter().map(|track| track.title.as_str()).collect()
+        }
+        assert_eq!(
+            titles(sort_tracks(
+                refs.clone(),
+                Some(TrackSort {
+                    column: TrackSortColumn::Title,
+                    descending: false,
+                })
+            )),
+            ["Азбука", "Вишня", "Море"]
+        );
+        assert_eq!(
+            titles(sort_tracks(
+                refs,
+                Some(TrackSort {
+                    column: TrackSortColumn::Title,
+                    descending: true,
+                })
+            )),
+            ["Море", "Вишня", "Азбука"]
+        );
+    }
+
+    #[test]
+    fn equal_keys_keep_their_order_across_sorts() {
+        // «Обновить» re-lists the tracks from the device: rows with
+        // equal keys must not shuffle between two sorts of the same
+        // input (the sort is stable).
+        let tracks = [
+            book_track(1, "Same", None, None, Some("A"), 1, 1, 10_000),
+            book_track(2, "Same", None, None, Some("B"), 1, 1, 20_000),
+            book_track(3, "Same", None, None, Some("C"), 1, 1, 30_000),
+        ];
+        let refs: Vec<&Track> = tracks.iter().collect();
+        let sort = Some(TrackSort {
+            column: TrackSortColumn::Title,
+            descending: false,
+        });
+        let ids = |sorted: Vec<&Track>| -> Vec<u64> {
+            sorted.iter().map(|track| track.id.to_bits()).collect()
+        };
+        let first = ids(sort_tracks(refs.clone(), sort));
+        let second = ids(sort_tracks(refs.clone(), sort));
+        assert_eq!(first, [1, 2, 3], "equal titles keep the input order");
+        assert_eq!(first, second, "stable across «Обновить» re-lists");
+        let desc = Some(TrackSort {
+            column: TrackSortColumn::Title,
+            descending: true,
+        });
+        // All keys equal → the descending pass reorders nothing either.
+        assert_eq!(ids(sort_tracks(refs, desc)), [1, 2, 3]);
+    }
+
+    #[test]
+    fn sort_applies_after_the_search_filter() {
+        // library_view composes filter first, sort second: the sort
+        // orders the filtered subset, not the whole list.
+        let tracks = [
+            book_track(1, "джаз утро", None, None, None, 1, 1, 10_000),
+            book_track(2, "рок вечер", None, None, None, 1, 1, 20_000),
+            book_track(3, "джаз ночь", None, None, None, 1, 1, 30_000),
+        ];
+        let refs: Vec<&Track> = tracks.iter().collect();
+        let filtered: Vec<&Track> = refs
+            .into_iter()
+            .filter(|track| matches_query(track, "джаз"))
+            .collect();
+        let sorted = sort_tracks(
+            filtered,
+            Some(TrackSort {
+                column: TrackSortColumn::Title,
+                descending: false,
+            }),
+        );
+        let titles: Vec<&str> = sorted.iter().map(|track| track.title.as_str()).collect();
+        assert_eq!(titles, ["джаз ночь", "джаз утро"]);
+    }
+
+    #[test]
+    fn missing_artist_sorts_as_empty_text() {
+        // Naive Ord: an absent key is an empty string, so it sorts
+        // first ascending — and desc is the exact reverse.
+        let tracks = [
+            book_track(1, "T", Some("Alb1"), None, Some("Певец"), 1, 1, 10_000),
+            book_track(2, "T", Some("Alb2"), None, None, 1, 1, 20_000),
+        ];
+        let refs: Vec<&Track> = tracks.iter().collect();
+        let sorted = sort_tracks(
+            refs,
+            Some(TrackSort {
+                column: TrackSortColumn::Artist,
+                descending: false,
+            }),
+        );
+        assert_eq!(sorted[0].id.to_bits(), 2, "the artist-less track sorts first");
+    }
+
+    #[test]
+    fn duration_sorts_numerically_not_lexically() {
+        let tracks = [
+            book_track(1, "a", None, None, None, 1, 1, 9_500),
+            book_track(2, "b", None, None, None, 1, 1, 600_000),
+            book_track(3, "c", None, None, None, 1, 1, 65_000),
+        ];
+        let refs: Vec<&Track> = tracks.iter().collect();
+        let sorted = sort_tracks(
+            refs,
+            Some(TrackSort {
+                column: TrackSortColumn::Duration,
+                descending: false,
+            }),
+        );
+        let ids: Vec<u64> = sorted.iter().map(|track| track.id.to_bits()).collect();
+        assert_eq!(ids, [1, 3, 2]);
     }
 }

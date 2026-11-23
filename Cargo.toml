@@ -30,6 +30,12 @@ plist = "1.7"
 # eframe/egui ecosystem releases in lockstep — keep all egui-family deps
 # on the same 0.37 line. wgpu is the default renderer since 0.34.
 eframe = "0.37"
+# Direct dep ONLY for the feature flag (round 7): bundle the
+# monochrome NotoEmoji + emoji-icon fonts so the toolbar pictograms
+# render — without the feature they are tofu. Coverage is pinned by a
+# gui test. egui itself ships via eframe; feature unification applies
+# this to that same egui.
+egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }
 # TableBuilder for the track table (round 4 UX revision). Underscore
 # name: the ustc mirror does not resolve the dashed alias.
 egui_extras = "0.37"

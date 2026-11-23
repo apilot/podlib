@@ -21,6 +21,7 @@ pkg-fmt = "tgz"
 
 [dependencies]
 eframe = { workspace = true }
+egui = { workspace = true }
 egui_extras = { workspace = true }
 podlib = { path = "../podlib" }
 tempfile = { workspace = true } # transcode batch tempdir (worker, round 5.2)
