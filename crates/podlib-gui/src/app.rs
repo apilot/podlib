@@ -68,6 +68,12 @@ const ROW_HIGHLIGHT_RADIUS: f32 = 4.0;
 /// the numeric pair row so the two layouts line up pixel-for-pixel.
 const FIELD_COLUMN_SPACING: f32 = 8.0;
 const FIELD_ROW_SPACING: f32 = 6.0;
+/// Content transition (round: smooth view changes): fade-in length
+/// and the rise distance. Same timing family as the modal fade-in;
+/// the shift applies to painting and its hit area alike (they move
+/// together inside the scoped Ui), so clicks never land on a ghost.
+const CONTENT_FADE_SECS: f32 = 0.18;
+const CONTENT_FADE_RISE: f32 = 6.0;
 /// Modal scrim: alpha of the theme-tinted backdrop (a touch denser
 /// than egui's stock black 100) and the open-animation time. The
 /// whole modal chrome fades in over it; no fade-out — egui modals
@@ -433,6 +439,12 @@ pub struct PodlibApp {
     /// here before the regular AddTracks dispatch; lives on the app so
     /// it survives even while the library is opening.
     tag_review: Option<TagReview>,
+    /// Content fade-in state (round: smooth view changes): the
+    /// signature of what the central table shows plus when the
+    /// current fade started. Steady state keeps the last entry (the
+    /// timer is simply expired — full alpha, no per-frame cost beyond
+    /// one comparison).
+    content_transition: Option<(ContentSignature, std::time::Instant)>,
     /// A confirmed close waits for the eject to finish before the
     /// window actually closes (round 5.3: close = safe unmount when
     /// the app created the mount).
@@ -477,6 +489,7 @@ impl PodlibApp {
             pending_remove_from_playlist: None,
             mounted_by_us: false,
             pending_close_after_eject: false,
+            content_transition: None,
             palette_accent,
             tag_review: None,
         };
@@ -1233,7 +1246,49 @@ impl PodlibApp {
     /// and the track table for the selected sidebar context. Applies
     /// everything it collects itself (borrow discipline: the render
     /// pass holds the library borrow, requests fire afterwards).
+    /// Central panel frame: restarts the content fade only when the
+    /// signature of what the table shows changes (view/section,
+    /// grouping modes, search, sort), then paints the content in a
+    /// scoped Ui carrying the fade opacity and rise.
     fn library_view(&mut self, ui: &mut egui::Ui) {
+        // Scrolling, selection and repaints never restart the timer:
+        // steady state is full alpha with no per-frame cost.
+        if let Some(library) = self.library.as_ref() {
+            let next = ContentSignature {
+                view: library.view,
+                music_mode: library.music_mode,
+                books_mode: library.books_mode,
+                query: library.search_query.clone(),
+                sort: library.track_sort,
+            };
+            if transition_restarts(
+                self.content_transition
+                    .as_ref()
+                    .map(|(signature, _)| signature),
+                &next,
+            ) {
+                self.content_transition = Some((next, std::time::Instant::now()));
+            }
+        }
+        let progress = self
+            .content_transition
+            .as_ref()
+            .map_or(1.0, |(_, started)| {
+                transition_alpha(started.elapsed().as_secs_f32(), CONTENT_FADE_SECS)
+            });
+        // WHY the rise rides the scoped Ui: painting and hit areas move
+        // together, so a click during the fade never lands on a ghost.
+        let rise = (1.0 - progress) * CONTENT_FADE_RISE;
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(ui.max_rect().translate(egui::vec2(0.0, rise))),
+            |ui| {
+                ui.set_opacity(progress);
+                self.library_view_content(ui);
+            },
+        );
+    }
+
+    fn library_view_content(&mut self, ui: &mut egui::Ui) {
         let menus_allowed = context_menu_allowed(self);
         let mut actions = TrackRowActions::default();
         let toolbar;
@@ -2763,6 +2818,37 @@ fn section_modes(distinguished_kind: i64) -> &'static [SectionMode] {
         5 => &[SectionMode::List, SectionMode::Books],
         _ => &[SectionMode::List],
     }
+}
+
+/// What the central table shows, folded into one comparable value
+/// (round: content transitions): the view (master / device section /
+/// playlist), its grouping modes, the search query and the column
+/// sort. Deliberately NOT part of it: scroll position, selection,
+/// expanded groups — none of them swap the row set wholesale, so
+/// they never fade.
+#[derive(Clone, Debug, PartialEq)]
+struct ContentSignature {
+    view: LibraryView,
+    music_mode: SectionMode,
+    books_mode: SectionMode,
+    query: String,
+    sort: Option<TrackSort>,
+}
+
+/// Ease-out fade-in progress: 0 at zero elapsed, 1 at or beyond the
+/// duration; negative elapsed clamps to 0 (a timer never runs
+/// backwards). Quad ease-out — fast start, gentle settle, the same
+/// character as the modal fade-in.
+fn transition_alpha(elapsed_secs: f32, duration: f32) -> f32 {
+    let t = (elapsed_secs / duration).clamp(0.0, 1.0);
+    1.0 - (1.0 - t) * (1.0 - t)
+}
+
+/// Whether the content fade restarts: only an actual signature change
+/// (or the very first frame) starts a new timer — steady-state
+/// repaints hold full alpha and cost nothing.
+fn transition_restarts(prev: Option<&ContentSignature>, next: &ContentSignature) -> bool {
+    prev.is_none_or(|previous| *previous != *next)
 }
 
 // ---- round 7: column sort of the flat track table ----
@@ -5298,6 +5384,58 @@ mod tests {
         // per-site ad-hoc values (the «rounded sidebar, square
         // playlist» report).
         assert_eq!(ROW_HIGHLIGHT_RADIUS, 4.0);
+    }
+
+    #[test]
+    fn transition_alpha_eases_out_and_clamps() {
+        assert_eq!(transition_alpha(0.0, 0.2), 0.0);
+        // Quad ease-out: the midpoint is already 75% there.
+        assert_eq!(transition_alpha(0.1, 0.2), 0.75);
+        assert_eq!(transition_alpha(0.2, 0.2), 1.0);
+        assert_eq!(transition_alpha(5.0, 0.2), 1.0);
+        // A timer never runs backwards.
+        assert_eq!(transition_alpha(-0.3, 0.2), 0.0);
+    }
+
+    #[test]
+    fn transition_restarts_only_on_signature_change() {
+        let base = ContentSignature {
+            view: LibraryView::Master,
+            music_mode: SectionMode::List,
+            books_mode: SectionMode::Books,
+            query: String::new(),
+            sort: None,
+        };
+        // The very first frame starts the fade.
+        assert!(transition_restarts(None, &base));
+        // Steady state: an unchanged signature never restarts — no
+        // stutter on unrelated repaints (selection, scroll, hover).
+        assert!(!transition_restarts(Some(&base), &base));
+        // Any signature member restarts: view, query, sort.
+        assert!(transition_restarts(
+            Some(&base),
+            &ContentSignature {
+                view: LibraryView::Media { distinguished: 4 },
+                ..base.clone()
+            }
+        ));
+        assert!(transition_restarts(
+            Some(&base),
+            &ContentSignature {
+                query: "ac/dc".to_owned(),
+                ..base.clone()
+            }
+        ));
+        assert!(transition_restarts(
+            Some(&base),
+            &ContentSignature {
+                sort: Some(TrackSort {
+                    column: TrackSortColumn::Title,
+                    descending: true,
+                }),
+                ..base.clone()
+            }
+        ));
     }
 
     #[test]
