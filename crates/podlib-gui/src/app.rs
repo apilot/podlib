@@ -3986,10 +3986,7 @@ fn book_file_row(
 /// clicked.
 fn header_select_all(ui: &mut egui::Ui, state: SelectAllState) -> Option<bool> {
     let mut checked = state == SelectAllState::All;
-    let response = ui.add(
-        egui::Checkbox::without_text(&mut checked)
-            .indeterminate(state == SelectAllState::Some),
-    );
+    let response = centered_checkbox(ui, &mut checked, state == SelectAllState::Some);
     response.changed().then_some(checked)
 }
 
@@ -4052,9 +4049,29 @@ fn paint_header_chrome(ui: &egui::Ui, fill: egui::Color32, stroke: egui::Stroke)
 /// of the row in the shared selection. A plain widget on purpose —
 /// unlike the draggable title/artist/album/duration cells it must not
 /// intercept or emit row clicks.
+/// The table checkbox (a row toggle and the tri-state «выбрать все»
+/// header): centered in its cell. WHY: the box is the cell's only
+/// content and hugging the left edge read as an accident; the vertical
+/// half comes from the cell layout (Align::Center), this adds the
+/// horizontal one. Click semantics stay with the caller (round 6 П2:
+/// outside the drag/click machinery).
+fn centered_checkbox(ui: &mut egui::Ui, checked: &mut bool, indeterminate: bool) -> egui::Response {
+    ui.with_layout(
+        egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+        |ui| {
+            let mut checkbox = egui::Checkbox::without_text(checked);
+            if indeterminate {
+                checkbox = checkbox.indeterminate(true);
+            }
+            ui.add(checkbox)
+        },
+    )
+    .inner
+}
+
 fn row_checkbox(ui: &mut egui::Ui, selected_tracks: &[TrackId], id: TrackId) -> Option<TrackId> {
     let mut checked = selected_tracks.contains(&id);
-    let response = ui.add(egui::Checkbox::without_text(&mut checked));
+    let response = centered_checkbox(ui, &mut checked, false);
     response.changed().then_some(id)
 }
 
@@ -7771,6 +7788,27 @@ mod tests {
     /// sidebar − panel margins − vscroll bar. All five columns must be
     /// visible with a ≥100px title (round 6 П2: the checkbox column
     /// shares the same width — the title's worst case is 104px).
+    #[test]
+    fn checkbox_sits_centered_in_its_column() {
+        // Headless render of one checkbox cell: the box must sit at the
+        // horizontal center of the 28px column, not hug the left edge
+        // (the vertical half comes from the cell layout Align::Center).
+        let rect: std::rc::Rc<std::cell::RefCell<Option<egui::Rect>>> = Default::default();
+        let sink = rect.clone();
+        egui::__run_test_ui(|ui| {
+            ui.allocate_ui(egui::vec2(CHECK_COLUMN, ROW_HEIGHT), |ui| {
+                let mut checked = false;
+                let response = centered_checkbox(ui, &mut checked, false);
+                *sink.borrow_mut() = Some(response.rect);
+            });
+        });
+        let box_rect = rect.borrow().expect("checkbox must render");
+        assert!(
+            (box_rect.center().x - CHECK_COLUMN / 2.0).abs() < 1.0,
+            "checkbox must be centered in the {CHECK_COLUMN}px column, got {box_rect:?}"
+        );
+    }
+
     #[test]
     fn table_columns_fit_narrow_panel_with_100px_title() {
         let rects: std::rc::Rc<std::cell::RefCell<Vec<egui::Rect>>> = Default::default();
