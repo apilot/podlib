@@ -22,22 +22,25 @@ podlib построен на [libopod](https://github.com/koriwi/libopod) (vendo
 
 ## Установка
 
-Установка из репозитория через cargo (нужны Rust 1.95+ и C-компилятор):
+Установка с crates.io (нужны Rust 1.95+ и C-компилятор):
+
+```sh
+cargo install podlib-cli
+# и/или GUI:
+cargo install podlib-gui
+```
+
+Установка напрямую из репозитория тоже работает:
 
 ```sh
 cargo install --git https://github.com/apilot/podlib podlib-cli
-# и/или GUI:
-cargo install --git https://github.com/apilot/podlib podlib-gui
 ```
 
 Готовые бинарники (`podlib` + `podlib-gui`, Linux x86_64/aarch64) также
 прикладываются к [GitHub Releases](https://github.com/apilot/podlib/releases)
 на каждый тег `v*` — скачайте tarball под свою платформу и распакуйте в
-`~/.cargo/bin`.
-
-`cargo binstall podlib-cli podlib-gui` заработает после публикации крейтов
-на crates.io — сейчас блокировано: нужен релиз upstream libopod с поддержкой
-плейлистов (vendored-копию опубликовать нельзя).
+`~/.cargo/bin`. `cargo binstall podlib-cli podlib-gui` использует те же
+release-ассеты.
 
 GUI дополнительно требует ffmpeg и desktop GL-стек в рантайме — см.
 [Заметки по дистрибутивам](#заметки-по-дистрибутивам).
@@ -120,7 +123,7 @@ GUI (`podlib-gui`) умеет подключение в один клик (эт�
 
 - `crates/podlib` — библиотека: небольшая доменная модель (треки, плейлисты), трейт `LibraryBackend` и адаптер над [libopod](https://github.com/koriwi/libopod)
 - `crates/podlib-cli` — консольная утилита `podlib`
-- `crates/vendor/libopod` — запиненная копия libopod; её фиксы уровня БД смержены upstream ([koriwi/libopod#1](https://github.com/koriwi/libopod/pull/1)), специфичные для podlib фиксы edit-session живут локально до выхода crates.io-релиза с поддержкой плейлистов (см. [CONTRIBUTING.ru.md](CONTRIBUTING.ru.md))
+- `crates/vendor/libopod` — запиненный форк libopod, опубликованный на crates.io как [`podlib-libopod`](https://crates.io/crates/podlib-libopod); её фиксы уровня БД смержены upstream ([koriwi/libopod#1](https://github.com/koriwi/libopod/pull/1)), специфичные для podlib фиксы edit-session (playlist-мутации, поддержка classic) живут в форке, пока upstream их не понесёт (см. [CONTRIBUTING.ru.md](CONTRIBUTING.ru.md))
 
 Запись никогда не трогает живую БД напрямую: edit-session стейджится во временную директорию и устанавливается атомарно, а контрольные файлы Nano 7G (CBK) переподписываются FireWire GUID'ом устройства. Весь флоу проверен end-to-end на Nano 7G: плейлисты создаются и удаляются, треки добавляются и удаляются, прошивка после этого стартует штатно.
 

@@ -19,6 +19,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch: # re-run uploads/publish without retagging
 
 jobs:
   upload-assets:
@@ -55,3 +56,43 @@ jobs:
           tar: unix
           zip: none
           checksum: sha256
+
+  publish:
+    name: Publish to crates.io
+    needs: upload-assets
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish (dependency order, index-propagation retries)
+        # skipped (not failed) until the CARGO_REGISTRY_TOKEN secret is set
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' }}
+        run: |
+          publish_with_retry() {
+            local crate="$1"
+            for attempt in 1 2 3 4 5; do
+              if cargo publish --locked -p "$crate"; then
+                echo "::notice::$crate published"
+                sleep 20 # index propagation before the dependent crate
+                return 0
+              fi
+              echo "::warning::$crate attempt $attempt failed — retrying in 30s"
+              sleep 30
+            done
+            echo "::error::$crate failed to publish after 5 attempts"
+            return 1
+          }
+          # podlib-libopod first: podlib resolves it from the registry.
+          publish_with_retry podlib-libopod
+          publish_with_retry podlib
+          publish_with_retry podlib-cli
+          publish_with_retry podlib-gui
+
+      - name: Notice (secret not set)
+        if: ${{ env.CARGO_REGISTRY_TOKEN == '' }}
+        run: echo "::notice::CARGO_REGISTRY_TOKEN is not set — skipped crates.io publish"

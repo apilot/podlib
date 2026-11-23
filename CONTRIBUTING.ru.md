@@ -40,17 +40,19 @@ cargo test
 
 ## Vendored libopod
 
-`crates/vendor/libopod` — запиненная копия
-[koriwi/libopod](https://github.com/koriwi/libopod) с локальными фиксами.
-Политика:
+`crates/vendor/libopod` — запиненный форк
+[koriwi/libopod](https://github.com/koriwi/libopod), опубликованный на
+crates.io как [`podlib-libopod`](https://crates.io/crates/podlib-libopod)
+(имя `libopod-rs` на crates.io принадлежит upstream). Политика:
 
 - Без нужды её не править. Фиксы уровня БД идут upstream первыми — наш
   [koriwi/libopod#1](https://github.com/koriwi/libopod/pull/1) (NULL-safe
   rank-запросы, защита от orphan-артистов, reindex пустых ключей) — пример
   такого пути — и затем попадают в вендорку.
 - Специфичное для podlib поведение (книжка edit-session, безопасное
-  удаление artwork) живёт в vendored-модуле `edit`, пока upstream его не
-  примет или не выйдет crates.io-релиз с поддержкой плейлистов.
+  удаление artwork, playlist-мутации, поддержка classic) живёт в форке,
+  пока upstream его не примет или не выйдет crates.io-релиз с этим; каждое
+  опубликованное изменение форка поднимает версию форк-крейта.
 
 ## Сообщение о проблемах
 

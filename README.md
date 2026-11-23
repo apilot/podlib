@@ -22,22 +22,25 @@ podlib is built on [libopod](https://github.com/koriwi/libopod) (vendored, see b
 
 ## Installing
 
-Install from this repository with cargo (Rust 1.95+ and a C compiler):
+Install from crates.io (Rust 1.95+ and a C compiler):
+
+```sh
+cargo install podlib-cli
+# and/or the GUI:
+cargo install podlib-gui
+```
+
+Installing straight from this repository also works:
 
 ```sh
 cargo install --git https://github.com/apilot/podlib podlib-cli
-# and/or the GUI:
-cargo install --git https://github.com/apilot/podlib podlib-gui
 ```
 
 Prebuilt binaries (`podlib` + `podlib-gui`, Linux x86_64/aarch64) are also
 attached to the [GitHub Releases](https://github.com/apilot/podlib/releases)
 page on every `v*` tag — download the tarball for your target and unpack it
-into `~/.cargo/bin`.
-
-`cargo binstall podlib-cli podlib-gui` will start working once the crates are
-published to crates.io — currently blocked on an upstream libopod release
-that carries playlist support (the vendored copy can't be published).
+into `~/.cargo/bin`. `cargo binstall podlib-cli podlib-gui` picks the same
+release assets.
 
 The GUI additionally needs ffmpeg and a desktop GL stack at runtime — see
 [Distro notes](#distro-notes).
@@ -120,7 +123,11 @@ A GUI (`podlib-gui`) ships with one-click connect (this mount flow is automated 
 
 - `crates/podlib` — the library: a small domain model (tracks, playlists), a `LibraryBackend` trait, and an adapter over [libopod](https://github.com/koriwi/libopod)
 - `crates/podlib-cli` — the `podlib` command-line tool
-- `crates/vendor/libopod` — pinned copy of libopod; its database-layer fixes are merged upstream ([koriwi/libopod#1](https://github.com/koriwi/libopod/pull/1)), podlib-specific edit-session fixes stay local until a crates.io release with playlist support (see [CONTRIBUTING.md](CONTRIBUTING.md))
+- `crates/vendor/libopod` — pinned fork of libopod, published to crates.io as
+  [`podlib-libopod`](https://crates.io/crates/podlib-libopod); its
+  database-layer fixes are merged upstream ([koriwi/libopod#1](https://github.com/koriwi/libopod/pull/1)),
+  podlib-specific edit-session fixes (playlist mutations, classic-device
+  support) live in the fork until upstream carries them (see [CONTRIBUTING.md](CONTRIBUTING.md))
 
 Writes never touch the live database directly: an edit session is staged in a temporary directory and installed atomically, and the Nano 7G checksum files (CBK) are re-signed with the device's FireWire GUID. The whole flow is verified end-to-end on a Nano 7G: playlists created and deleted, tracks added and removed, firmware starts normally afterwards.
 

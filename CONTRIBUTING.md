@@ -40,17 +40,19 @@ cargo test
 
 ## The vendored libopod
 
-`crates/vendor/libopod` is a pinned copy of
-[koriwi/libopod](https://github.com/koriwi/libopod) with local fixes.
-The policy:
+`crates/vendor/libopod` is a pinned fork of
+[koriwi/libopod](https://github.com/koriwi/libopod), published to crates.io
+as [`podlib-libopod`](https://crates.io/crates/podlib-libopod) (upstream
+owns the `libopod-rs` name there). The policy:
 
 - Do not edit it casually. Fixes that belong to the database layer go
   upstream first — our [koriwi/libopod#1](https://github.com/koriwi/libopod/pull/1)
   (NULL-safe rank queries, orphan-artist delete guard, empty-key reindex)
   is an example of that flow — and then land in the vendored copy.
-- podlib-specific behavior (edit-session bookkeeping, artwork-safe removal)
-  lives in the vendored `edit` module until upstream picks it up or ships a
-  crates.io release with playlist support.
+- podlib-specific behavior (edit-session bookkeeping, artwork-safe removal,
+  playlist mutations, classic-device support) lives in the fork until
+  upstream picks it up or ships a crates.io release carrying it; the fork
+  crate version is bumped for every published change.
 
 ## Reporting issues
 
