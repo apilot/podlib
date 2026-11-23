@@ -24,7 +24,7 @@ on USB-connected iPods, verified end-to-end on iPod Nano 7G.
 
 ### CLI (`crates/podlib-cli`)
 
-- Browse tracks and playlists, add/remove/edit tracks, create/delete
+- Browse tracks and playlists, add/remove/edit tracks, create/rename/delete
   playlists, manage playlist members
 - iPod mount autodetection
 
@@ -36,8 +36,19 @@ on USB-connected iPods, verified end-to-end on iPod Nano 7G.
   tag-review modal for untagged files
 - Track tables with checkbox multi-select and select-all; batch
   add-to-playlist / remove actions
+- Compact toolbar icon buttons with tooltips and right-click context menus —
+  no button overflow on narrow windows
+- Column sorting in track tables: ascending → descending → back to the device
+  order, stable across refreshes
+- Playlist management from the sidebar: create, rename and delete playlists
+  (deleting a playlist keeps its tracks in the library)
 - Music views by albums and artists, unified with the audiobooks view;
   m4b chapter groups with ffprobe duration probing
+
+### Fixed
+
+- Tracks added through the transcode flow (FLAC → ALAC, OGG → AAC) now get
+  their real duration instead of 0:00
 
 ### Packaging
 

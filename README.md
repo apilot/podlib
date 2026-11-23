@@ -8,7 +8,7 @@ Also available in Russian: [README.ru.md](README.ru.md).
 
 - Browse tracks and playlists stored on the device
 - Add, remove and edit tracks (title, artist, album, genre, track/disc numbers)
-- Create and delete playlists, add and remove tracks from playlists
+- Create, rename and delete playlists, add and remove tracks from playlists
 - Firmware-safe writes: changes are staged and installed atomically, and the on-device checksum files (HASHAB/CBK) are re-signed automatically
 
 ## Supported devices
