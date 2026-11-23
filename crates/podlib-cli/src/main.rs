@@ -75,6 +75,13 @@ enum PlaylistCommand {
         /// Track ids to drop from the playlist.
         tracks: Vec<u64>,
     },
+    /// Rename a playlist in place (id and members untouched).
+    Rename {
+        /// Playlist name or id.
+        playlist: String,
+        /// The new name.
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -257,6 +264,11 @@ fn run_playlist(
                 println!("Removed {removed} track(s) from playlist {id}");
             }
         }
+        PlaylistCommand::Rename { playlist, name } => {
+            let id = resolve_playlist(backend, playlist)?;
+            backend.rename_playlist(id, name)?;
+            println!("Renamed playlist {id} to \"{name}\"");
+        }
     }
     Ok(())
 }
@@ -371,9 +383,12 @@ mod tests {
     use super::*;
     use podlib::{BackendError, Playlist};
 
-    /// In-memory backend stub: `resolve_playlist` only reads playlists.
+    /// In-memory backend stub: `resolve_playlist` only reads playlists,
+    /// `run_playlist` records the rename (the rename subcommand must
+    /// reach the backend untouched).
     struct FakeBackend {
         playlists: Vec<Playlist>,
+        renamed: Option<(PlaylistId, String)>,
     }
 
     impl LibraryBackend for FakeBackend {
@@ -409,6 +424,11 @@ mod tests {
             Ok(false)
         }
 
+        fn rename_playlist(&mut self, id: PlaylistId, name: &str) -> Result<(), BackendError> {
+            self.renamed = Some((id, name.to_owned()));
+            Ok(())
+        }
+
         fn add_to_playlist(
             &mut self,
             _playlist: PlaylistId,
@@ -442,6 +462,7 @@ mod tests {
                 playlist(101, "Rock", false),
                 playlist(999, "999", false),
             ],
+            renamed: None,
         }
     }
 
@@ -474,5 +495,35 @@ mod tests {
         let backend = fixture_playlists();
         let err = resolve_playlist(&backend, "Missing").unwrap_err();
         assert!(err.to_string().contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn rename_resolves_and_reaches_the_backend() {
+        let mut backend = fixture_playlists();
+        run_playlist(
+            &mut backend,
+            &PlaylistCommand::Rename {
+                playlist: "999".to_owned(),
+                name: "Jazz".to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            backend.renamed,
+            Some((PlaylistId::from_bits(999), "Jazz".to_owned())),
+            "the id wins over the name collision (999 names id 100)"
+        );
+        // An unresolvable key never reaches the backend.
+        let mut backend = fixture_playlists();
+        let error = run_playlist(
+            &mut backend,
+            &PlaylistCommand::Rename {
+                playlist: "Missing".to_owned(),
+                name: "Jazz".to_owned(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not found"), "got: {error}");
+        assert_eq!(backend.renamed, None);
     }
 }

@@ -37,6 +37,8 @@ pub enum LibraryCommand {
     SetArtist { track_ids: Vec<TrackId>, artist: String },
     CreatePlaylist { name: String },
     DeletePlaylist { id: PlaylistId },
+    /// Renames a user playlist in place (id and membership untouched).
+    RenamePlaylist { id: PlaylistId, name: String },
     AddToPlaylist { playlist: PlaylistId, track_ids: Vec<TrackId> },
     RemoveFromPlaylist { playlist: PlaylistId, track_ids: Vec<TrackId> },
     /// Drops the backend so the DB is closed before the device unmounts.
@@ -336,6 +338,12 @@ fn dispatch(backend: &mut dyn LibraryBackend, command: LibraryCommand) -> Librar
         },
         LibraryCommand::DeletePlaylist { id } => match backend.delete_playlist(id) {
             Ok(_) => finish(backend, "Плейлист удалён".to_owned()),
+            Err(error) => failure_outcome(error),
+        },
+        LibraryCommand::RenamePlaylist { id, name } => match backend.rename_playlist(id, &name) {
+            // The id never rotates (rename is in place), so the notice
+            // needs no id-change tail.
+            Ok(_) => finish(backend, format!("Плейлист переименован в «{name}»")),
             Err(error) => failure_outcome(error),
         },
         LibraryCommand::AddToPlaylist {
@@ -963,7 +971,8 @@ fn probe_duration_ms(path: &std::path::Path) -> Result<u32, String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DraggedTracks(pub Vec<TrackId>);
 
-/// Guards a playlist mutation before a command is sent.
+/// Guards a playlist mutation (add/remove members, rename, delete)
+/// before a command is sent.
 ///
 /// WHY the UI guards instead of trusting the backend: only the 7G
 /// (libopod) adapter rejects master-member mutations. The classic
@@ -972,10 +981,18 @@ pub struct DraggedTracks(pub Vec<TrackId>);
 /// mirror of the whole library, and adding to it is a no-op (duplicate
 /// members are ignored by contract). One consistent UI rule for both
 /// device kinds, explained up front without a round trip to the device.
+/// Firmware-owned views (`distinguished_kind != 0`: Аудиокниги, Видео
+/// and friends) are system property on every device kind — rename and
+/// delete are refused alongside membership changes.
 pub fn guard_playlist_mutation(playlist: &Playlist) -> Result<(), String> {
     if playlist.is_master {
         Err(format!(
             "«{}» — встроенный мастер-плейлист: в него нельзя ничего добавить или убрать",
+            playlist.name
+        ))
+    } else if playlist.distinguished_kind != 0 {
+        Err(format!(
+            "«{}» — системный плейлист устройства: его нельзя изменять",
             playlist.name
         ))
     } else {
@@ -1745,6 +1762,10 @@ mod tests {
             Ok(false)
         }
 
+        fn rename_playlist(&mut self, id: PlaylistId, _name: &str) -> Result<(), BackendError> {
+            Err(BackendError::PlaylistNotFound(id))
+        }
+
         fn add_to_playlist(
             &mut self,
             _playlist: PlaylistId,
@@ -1953,7 +1974,7 @@ mod tests {
     // ---- master-playlist guard ----
 
     #[test]
-    fn guard_rejects_master_and_allows_user_playlist() {
+    fn guard_rejects_master_system_and_allows_user_playlist() {
         let master = Playlist {
             id: PlaylistId::from_bits(1),
             name: "Медиатека".to_owned(),
@@ -1973,6 +1994,18 @@ mod tests {
         let error = guard_playlist_mutation(&master).unwrap_err();
         assert!(error.contains("встроенный"));
         assert!(guard_playlist_mutation(&user).is_ok());
+        // A firmware-owned view (Аудиокниги, Видео…) is system property:
+        // no rename/delete/add/remove may reach the worker for it.
+        let view = Playlist {
+            id: PlaylistId::from_bits(3),
+            name: "Аудиокниги".to_owned(),
+            track_ids: Vec::new(),
+            is_master: false,
+            is_smart: false,
+            distinguished_kind: 8,
+        };
+        let error = guard_playlist_mutation(&view).unwrap_err();
+        assert!(error.contains("системн"), "got: {error}");
     }
 
     // ---- panic_message (moved from app.rs round 1) ----
@@ -2116,6 +2149,73 @@ mod tests {
     }
 
     #[test]
+    fn worker_renames_playlist_and_keeps_members() {
+        let dir = fixture_mount(&[fixture_track("Alpha")], &[]);
+        let (worker, snapshot) = opened_worker(dir.path());
+        let track_id = snapshot.tracks[0].id;
+
+        let snapshot = applied_snapshot(run(
+            &worker,
+            LibraryCommand::CreatePlaylist {
+                name: "Mix".to_owned(),
+            },
+        ));
+        let playlist_id = snapshot
+            .playlists
+            .iter()
+            .find(|playlist| !playlist.is_master)
+            .expect("user playlist must appear")
+            .id;
+        applied_snapshot(run(
+            &worker,
+            LibraryCommand::AddToPlaylist {
+                playlist: playlist_id,
+                track_ids: vec![track_id],
+            },
+        ));
+
+        let snapshot = applied_snapshot(run(
+            &worker,
+            LibraryCommand::RenamePlaylist {
+                id: playlist_id,
+                name: "Renamed".to_owned(),
+            },
+        ));
+        let playlist = snapshot
+            .playlist(playlist_id)
+            .expect("the renamed playlist must stay");
+        assert_eq!(playlist.name, "Renamed");
+        // The id and the membership are untouched by the rename.
+        assert_eq!(playlist.track_ids, vec![track_id]);
+        worker.close_and_join();
+    }
+
+    #[test]
+    fn worker_refuses_master_playlist_rename() {
+        let dir = fixture_mount(&[fixture_track("Alpha")], &[]);
+        let (worker, snapshot) = opened_worker(dir.path());
+        let master_id = snapshot
+            .playlists
+            .iter()
+            .find(|playlist| playlist.is_master)
+            .expect("fixture exposes the master")
+            .id;
+        match run(
+            &worker,
+            LibraryCommand::RenamePlaylist {
+                id: master_id,
+                name: "Nope".to_owned(),
+            },
+        ) {
+            LibraryOutcome::Failed { message, .. } => {
+                assert!(message.contains("встроенный"), "got: {message}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        worker.close_and_join();
+    }
+
+    #[test]
     fn failure_from_maps_master_immutable_error_with_hint() {
         let (message, hint) = failure_from(BackendError::MasterPlaylistImmutable {
             id: PlaylistId::from_bits(16),
@@ -2242,6 +2342,10 @@ mod tests {
         }
 
         fn delete_playlist(&mut self, _id: PlaylistId) -> Result<bool, BackendError> {
+            panic!("backend exploded mid-write")
+        }
+
+        fn rename_playlist(&mut self, _id: PlaylistId, _name: &str) -> Result<(), BackendError> {
             panic!("backend exploded mid-write")
         }
 
@@ -2434,6 +2538,10 @@ mod tests {
 
         fn delete_playlist(&mut self, _id: PlaylistId) -> Result<bool, BackendError> {
             Ok(false)
+        }
+
+        fn rename_playlist(&mut self, id: PlaylistId, _name: &str) -> Result<(), BackendError> {
+            Err(BackendError::PlaylistNotFound(id))
         }
 
         fn add_to_playlist(

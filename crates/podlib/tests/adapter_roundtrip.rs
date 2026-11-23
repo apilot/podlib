@@ -248,6 +248,55 @@ fn playlist_create_add_remove_persist() {
 }
 
 #[test]
+fn playlist_rename_persists_and_keeps_members() {
+    let dir = fixture_simple();
+    let tracks = {
+        let backend = LibopodBackend::open(dir.path()).unwrap();
+        backend.tracks().unwrap()
+    };
+    let favourites_id = {
+        let mut backend = LibopodBackend::open(dir.path()).unwrap();
+        // Created through the backend, so the playlist lands in BOTH
+        // classic playlist datasets (the synthetic fixture's own kind-3
+        // dataset is empty — a fixture-layout quirk, not a rename path).
+        backend
+            .create_playlist(&PlaylistDraft::new("Favourites", vec![tracks[0].id]).unwrap())
+            .unwrap()
+    };
+
+    {
+        let mut backend = LibopodBackend::open(dir.path()).unwrap();
+        backend
+            .rename_playlist(favourites_id, "Renamed")
+            .unwrap();
+    }
+    let backend = LibopodBackend::open(dir.path()).unwrap();
+    let users = user_playlists(&backend);
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].name, "Renamed");
+    assert_eq!(users[0].id, favourites_id, "rename keeps the playlist id");
+    assert_eq!(users[0].track_ids, vec![tracks[0].id], "members survive the rename");
+
+    // Master stays immutable; an absent id is a not-found, not a
+    // silent success.
+    let mut backend = LibopodBackend::open(dir.path()).unwrap();
+    let master = backend
+        .playlists()
+        .unwrap()
+        .into_iter()
+        .find(|playlist| playlist.is_master)
+        .unwrap();
+    assert!(matches!(
+        backend.rename_playlist(master.id, "Nope"),
+        Err(BackendError::MasterPlaylistImmutable { .. })
+    ));
+    assert!(matches!(
+        backend.rename_playlist(podlib::PlaylistId::from_bits(42_000), "Ghost"),
+        Err(BackendError::PlaylistNotFound(_))
+    ));
+}
+
+#[test]
 fn create_playlist_rejects_unknown_track() {
     let dir = fixture_simple();
     let mut backend = LibopodBackend::open(dir.path()).unwrap();

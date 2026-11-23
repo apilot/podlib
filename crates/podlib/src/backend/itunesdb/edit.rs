@@ -268,6 +268,38 @@ impl ItunesDb {
         self.retile()
     }
 
+    /// Renames a standard playlist in both playlist datasets: the old
+    /// title mhod is replaced wholesale (a fresh UTF-16LE string mhod,
+    /// same builder `create_playlist` uses) — mhod bytes are length-
+    /// prefixed, so an in-place patch would mis-tile the chunk anyway.
+    ///
+    /// Master, podcast and smart playlists are refused — the same set
+    /// [`Self::delete_playlist`] refuses.
+    pub fn rename_playlist(&mut self, id: PlaylistId, name: &str) -> Result<(), EditError> {
+        self.ensure_playlist_editable(id)?;
+        let title = build_string_mhod(MHOD_TITLE, name)?;
+        let mut renamed = false;
+        for dataset in self.playlist_datasets_mut() {
+            let Some(list) = dataset.list.as_mut() else {
+                continue;
+            };
+            for item in &mut list.items {
+                let ListItem::Playlist(mhyp) = item else {
+                    continue;
+                };
+                if mhyp.playlist_id == id.to_bits() {
+                    mhyp.mhods.retain(|mhod| mhod.mhod_type != MHOD_TITLE);
+                    mhyp.mhods.push(title.clone());
+                    renamed = true;
+                }
+            }
+        }
+        if !renamed {
+            return Err(EditError::PlaylistNotFound(id));
+        }
+        self.retile()
+    }
+
     /// Appends a track to a playlist's tail in both playlist datasets.
     /// The playlist must be a standard (non-master, non-smart,
     /// non-podcast) list and the track must exist.

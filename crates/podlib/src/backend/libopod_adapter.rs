@@ -685,6 +685,20 @@ impl LibraryBackend for LibopodBackend {
         Ok(true)
     }
 
+    fn rename_playlist(&mut self, id: PlaylistId, name: &str) -> Result<(), BackendError> {
+        // Rejects absent and master/hidden playlists before staging;
+        // libopod's session re-checks editability and validates the name.
+        self.editable_playlist(id)?;
+        let stage_dir = Self::scratch_dir()?;
+        let staged = {
+            let mut session = self.session()?;
+            session.rename_playlist(PersistentId::from_bits(id.to_bits()), name)?;
+            session.stage_sqlite_preview(stage_dir.path())?
+        };
+        self.finish(staged)?;
+        Ok(())
+    }
+
     fn add_to_playlist(
         &mut self,
         playlist: PlaylistId,

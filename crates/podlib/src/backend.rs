@@ -123,6 +123,11 @@ pub trait LibraryBackend {
     /// Deletes a user playlist. Returns `false` if it was already absent.
     fn delete_playlist(&mut self, id: PlaylistId) -> Result<bool, BackendError>;
 
+    /// Renames a user playlist in place: the id and the membership stay
+    /// untouched, so the UI's open view and the CLI's resolved id remain
+    /// valid after the call. Master/smart playlists are refused.
+    fn rename_playlist(&mut self, id: PlaylistId, name: &str) -> Result<(), BackendError>;
+
     /// Appends tracks to a playlist's tail (duplicates are ignored).
     fn add_to_playlist(
         &mut self,

@@ -193,6 +193,7 @@ enum PendingKind {
     SetArtist,
     CreatePlaylist,
     DeletePlaylist,
+    RenamePlaylist,
     AddToPlaylist,
     RemoveFromPlaylist,
 }
@@ -210,6 +211,14 @@ struct EditDialogState {
 struct SetArtistDialog {
     track_ids: Vec<TrackId>,
     value: String,
+}
+
+/// Round 8: rename modal state — which playlist plus the typed name as
+/// shown on screen (prefilled with the current one at open time).
+#[derive(Clone)]
+struct RenamePlaylistDialog {
+    id: PlaylistId,
+    name: String,
 }
 
 /// Track-table choices collected during one frame, applied afterwards
@@ -263,9 +272,12 @@ struct PlaylistPanelActions {
     master_drop: Option<String>,
     /// Tracks dropped onto a built-in device view: refused with a hint.
     view_drop: Option<String>,
-    /// «Удалить…» chosen on the master row: refused honestly, no
-    /// round trip to the device.
-    master_delete: Option<String>,
+    /// «Переименовать…»/«Удалить плейлист…» chosen on the master row:
+    /// refused honestly (round 8: one shared refusal carries the name),
+    /// no round trip to the device.
+    master_rename: Option<String>,
+    /// «Переименовать…» chosen on a user playlist row.
+    rename_playlist: Option<PlaylistId>,
     delete_playlist: Option<PlaylistId>,
 }
 
@@ -274,7 +286,8 @@ impl PlaylistPanelActions {
         self.add_drop = other.add_drop.or(self.add_drop.take());
         self.master_drop = other.master_drop.or(self.master_drop.take());
         self.view_drop = other.view_drop.or(self.view_drop.take());
-        self.master_delete = other.master_delete.or(self.master_delete.take());
+        self.master_rename = other.master_rename.or(self.master_rename.take());
+        self.rename_playlist = other.rename_playlist.or(self.rename_playlist.take());
         self.delete_playlist = other.delete_playlist.or(self.delete_playlist.take());
     }
 }
@@ -293,6 +306,8 @@ struct LibraryUi {
     confirm_delete_track: Option<Vec<TrackId>>,
     purge_media: bool,
     confirm_delete_playlist: Option<PlaylistId>,
+    /// «Переименовать плейлист» modal state (round 8, sidebar ПКМ).
+    rename_dialog: Option<RenamePlaylistDialog>,
     create_open: bool,
     new_playlist_name: String,
     edit_dialog: Option<EditDialogState>,
@@ -337,6 +352,24 @@ struct LibraryUi {
     /// default device order). Display state only — never written to
     /// the device.
     track_sort: Option<TrackSort>,
+}
+
+impl LibraryUi {
+    /// Round 8 edge: after an Applied outcome the open playlist may be
+    /// gone (delete). The view must not dangle on a dead PlaylistId —
+    /// it falls back to the master view («Все треки»), and the stale
+    /// track selection goes with it (the same clearing a sidebar
+    /// switch performs). Any surviving view is untouched.
+    fn drop_dangling_view(&mut self) {
+        if let LibraryView::Playlist(id) = self.view {
+            if self.snapshot.playlist(id).is_none() {
+                self.view = LibraryView::Master;
+                self.selected_tracks.clear();
+                self.selection_anchor = None;
+                self.selected_track = None;
+            }
+        }
+    }
 }
 
 pub struct PodlibApp {
@@ -544,6 +577,7 @@ impl PodlibApp {
             confirm_delete_track: None,
             purge_media: false,
             confirm_delete_playlist: None,
+            rename_dialog: None,
             create_open: false,
             new_playlist_name: String::new(),
             edit_dialog: None,
@@ -672,6 +706,11 @@ impl PodlibApp {
                             .selection_anchor
                             .filter(|&(_, id)| snapshot.track(id).is_some());
                         library.snapshot = snapshot;
+                        // Round 8 edge: the applied operation may have
+                        // removed the OPEN playlist — the view must not
+                        // dangle on a dead PlaylistId. Any other outcome
+                        // (rename keeps the id) is untouched.
+                        library.drop_dangling_view();
                     }
                     self.status = summary;
                     // Multi-delete chaining: fire the next queued
@@ -1063,7 +1102,20 @@ impl PodlibApp {
         let Some(library) = self.library.as_mut() else {
             return PlaylistPanelActions::default();
         };
-        ui.heading("Плейлисты");
+        // Round 8: compact «+» right of the heading opens the existing
+        // create modal (same state as the bottom button).
+        ui.horizontal(|ui| {
+            ui.heading("Плейлисты");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let add = ui
+                    .small_button("+")
+                    .on_hover_text("Новый плейлист");
+                if add.clicked() {
+                    library.create_open = true;
+                    library.new_playlist_name.clear();
+                }
+            });
+        });
         ui.add_space(4.0);
         let ordered = master_first(&library.snapshot.playlists);
         let master = ordered.iter().find(|playlist| playlist.is_master).copied();
@@ -1462,14 +1514,15 @@ impl PodlibApp {
                 stderr: None,
             });
         }
-        if let Some(name) = actions.master_delete {
+        if let Some(name) = actions.master_rename {
             // Same honest-refusal pattern as master_drop: the master is
-            // the mirror of the library, deletion is a user-playlist
-            // operation — explained up front, no round trip to the device.
+            // the mirror of the library — deletion and renaming are
+            // user-playlist operations, explained up front, no round
+            // trip to the device.
             self.error = Some(UiError {
-                message: format!("«{name}» — мастер-плейлист: его нельзя удалить"),
+                message: format!("«{name}» — мастер-плейлист: его нельзя переименовать или удалить"),
                 hint: Some(
-                    "Удалять можно только пользовательские плейлисты.".to_owned(),
+                    "Изменять можно только пользовательские плейлисты.".to_owned(),
                 ),
                 stderr: None,
             });
@@ -1484,11 +1537,54 @@ impl PodlibApp {
                 "Добавляю в плейлист…",
             );
         }
-        if let Some(id) = actions.delete_playlist {
-            if let Some(library) = self.library.as_mut() {
-                library.confirm_delete_playlist = Some(id);
+        if let Some(id) = actions.rename_playlist {
+            // Round 8: every rename/delete flows through the guard, so
+            // master/system playlists can never reach the worker even
+            // from a future caller of these actions.
+            match self.guarded_playlist(id).map(|playlist| playlist.name.clone()) {
+                Ok(name) => {
+                    if let Some(library) = self.library.as_mut() {
+                        library.rename_dialog = Some(RenamePlaylistDialog { id, name });
+                    }
+                }
+                Err(message) => self.refuse_guarded(message),
             }
         }
+        if let Some(id) = actions.delete_playlist {
+            match self.guarded_playlist(id) {
+                Ok(_) => {
+                    if let Some(library) = self.library.as_mut() {
+                        library.confirm_delete_playlist = Some(id);
+                    }
+                }
+                Err(message) => self.refuse_guarded(message),
+            }
+        }
+    }
+
+    /// Looks a playlist up for a mutation and runs the guard. `Ok``
+    /// carries the playlist so the caller can prefill dialogs from it.
+    fn guarded_playlist(&self, id: PlaylistId) -> Result<&Playlist, String> {
+        let library = self.library.as_ref().ok_or_else(|| {
+            "Сначала подключите устройство".to_owned()
+        })?;
+        let playlist = library
+            .snapshot
+            .playlist(id)
+            .ok_or_else(|| format!("Плейлист не найден (id {id})"))?;
+        guard_playlist_mutation(playlist)?;
+        Ok(playlist)
+    }
+
+    /// Shows a guard refusal as the standard error notice.
+    fn refuse_guarded(&mut self, message: String) {
+        self.error = Some(UiError {
+            message,
+            hint: Some(
+                "Изменять можно только пользовательские плейлисты.".to_owned(),
+            ),
+            stderr: None,
+        });
     }
 
     // ---- file drag-and-drop from the file manager ----
@@ -1903,6 +1999,87 @@ impl PodlibApp {
                 LibraryCommand::CreatePlaylist { name },
                 PendingKind::CreatePlaylist,
                 "Создаю плейлист…",
+            );
+        }
+    }
+
+    /// Round 8: «Переименовать плейлист», opened from the sidebar
+    /// context menu. Same shape as the create modal, but the field is
+    /// prefilled and Enter saves (the primary action) whenever the name
+    /// is non-empty and actually changed — an unchanged/blank name keeps
+    /// the dialog open instead of a pointless round trip.
+    fn maybe_rename_playlist_modal(&mut self, ctx: &egui::Context) {
+        let Some(library) = self.library.as_ref() else {
+            return;
+        };
+        let Some(dialog) = library.rename_dialog.as_ref() else {
+            return;
+        };
+        // The ready check needs the current name from the snapshot; both
+        // values are copied out before the modal borrows `self` mutably.
+        let dialog_id = dialog.id;
+        let current_name = library
+            .snapshot
+            .playlist(dialog_id)
+            .map(|playlist| playlist.name.clone());
+        let mut confirmed = false;
+        let mut typed = String::new();
+        let response = egui::Modal::new(egui::Id::unique("rename_playlist")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.heading("Переименовать плейлист");
+            ui.add_space(4.0);
+            let Some(library) = self.library.as_mut() else {
+                return;
+            };
+            let Some(dialog) = library.rename_dialog.as_mut() else {
+                return;
+            };
+            ui.horizontal(|ui| {
+                ui.label("Название:");
+                let name = ui.add(
+                    egui::TextEdit::singleline(&mut dialog.name)
+                        .desired_width(240.0),
+                );
+                text_menu::attach_text_menu(&name);
+            });
+            typed = dialog.name.clone();
+            ui.separator();
+            // Enter confirms the primary action («Сохранить») only when
+            // the name is real and different — the same rule the button
+            // uses (D2 convention, as the confirm modals).
+            let ready = !typed.trim().is_empty()
+                && current_name.as_deref() != Some(typed.trim());
+            if ready && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                confirmed = true;
+                ui.close();
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Отмена").clicked() {
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(ready, egui::Button::new("Сохранить"))
+                    .clicked()
+                {
+                    confirmed = true;
+                    ui.close();
+                }
+            });
+        });
+        if confirmed || response.should_close() {
+            if let Some(library) = self.library.as_mut() {
+                library.rename_dialog = None;
+            }
+        }
+        if confirmed {
+            let name = typed.trim().to_owned();
+            self.library_request(
+                LibraryCommand::RenamePlaylist {
+                    id: dialog_id,
+                    name,
+                },
+                PendingKind::RenamePlaylist,
+                "Переименовываю плейлист…",
             );
         }
     }
@@ -3992,10 +4169,11 @@ fn sidebar_row(ui: &mut egui::Ui, selected: bool, name: &str, count: &str) -> eg
 }
 
 /// One sidebar row wiring: painted full-width row (see [`sidebar_row`]),
-/// click switches the central context, ПКМ offers delete (user
-/// playlists only; the master is refused honestly), drops add tracks.
-/// Built-in device views accept no drops and no ПКМ: the firmware owns
-/// them. «Все треки» only on the master; the others show a count.
+/// click switches the central context, ПКМ offers rename and delete
+/// (user playlists only; the master is refused honestly), drops add
+/// tracks. Built-in device views accept no drops and no ПКМ: the
+/// firmware owns them. «Все треки» only on the master; the others show
+/// a count.
 fn playlist_row(
     ui: &mut egui::Ui,
     snapshot: &LibrarySnapshot,
@@ -4037,19 +4215,30 @@ fn playlist_row(
                 *view = row_view;
             }
             if menus_allowed && !is_view {
-                let mut refused_master = false;
+                // Round 8: the approved UX menu — «Переименовать…» and
+                // «Удалить плейлист…»; the master takes both choices and
+                // is refused honestly (no dead menu items).
+                let mut refused_master = None;
                 row.context_menu(|ui| {
-                    if icon_button(ui, &ICON_DELETE, true) {
+                    if ui.button("Переименовать…").clicked() {
                         if playlist.is_master {
-                            refused_master = true;
+                            refused_master = Some(playlist.name.clone());
+                        } else {
+                            actions.rename_playlist = Some(playlist.id);
+                        }
+                        ui.close();
+                    }
+                    if ui.button("Удалить плейлист…").clicked() {
+                        if playlist.is_master {
+                            refused_master = Some(playlist.name.clone());
                         } else {
                             actions.delete_playlist = Some(playlist.id);
                         }
                         ui.close();
                     }
                 });
-                if refused_master {
-                    actions.master_delete = Some(playlist.name.clone());
+                if let Some(name) = refused_master {
+                    actions.master_rename = Some(name);
                 }
             }
         },
@@ -4544,6 +4733,7 @@ impl eframe::App for PodlibApp {
         self.maybe_delete_track_modal(&ctx);
         self.maybe_delete_playlist_modal(&ctx);
         self.maybe_create_playlist_modal(&ctx);
+        self.maybe_rename_playlist_modal(&ctx);
         self.maybe_set_artist_modal(&ctx);
         self.maybe_edit_track_modal(&ctx);
         self.maybe_add_to_playlist_modal(&ctx);
@@ -4589,6 +4779,17 @@ mod tests {
             size_bytes: 1024,
             has_artwork: false,
             media_kind: 1,
+        }
+    }
+
+    fn sample_playlist(id: u64, name: &str) -> Playlist {
+        Playlist {
+            id: PlaylistId::from_bits(id),
+            name: name.to_owned(),
+            track_ids: Vec::new(),
+            is_master: false,
+            is_smart: false,
+            distinguished_kind: 0,
         }
     }
 
@@ -6223,6 +6424,7 @@ mod tests {
             app.maybe_close_confirm_modal(&ctx);
             app.maybe_delete_track_modal(&ctx);
             app.maybe_delete_playlist_modal(&ctx);
+            app.maybe_rename_playlist_modal(&ctx);
         });
         output.textures_delta.clear();
     }
@@ -6289,6 +6491,198 @@ mod tests {
         assert!(
             matches!(library.pending, Some((PendingKind::DeletePlaylist, _))),
             "Enter confirms the primary action «Удалить»"
+        );
+    }
+
+    // ---- round 8: playlist rename (sidebar context menu) ----
+
+    #[test]
+    fn sidebar_rename_action_opens_prefilled_dialog() {
+        let (mut app, _dir) = app_with_open_library();
+        app.library.as_mut().unwrap().snapshot.playlists = vec![sample_playlist(100, "Mix")];
+        app.apply_playlist_actions(PlaylistPanelActions {
+            rename_playlist: Some(PlaylistId::from_bits(100)),
+            ..PlaylistPanelActions::default()
+        });
+        let dialog = app.library.as_ref().unwrap().rename_dialog.as_ref().unwrap();
+        assert_eq!(dialog.id, PlaylistId::from_bits(100));
+        assert_eq!(dialog.name, "Mix", "the field is prefilled with the name");
+    }
+
+    #[test]
+    fn sidebar_master_rename_action_is_refused_honestly() {
+        let (mut app, _dir) = app_with_open_library();
+        app.apply_playlist_actions(PlaylistPanelActions {
+            master_rename: Some("Медиатека".to_owned()),
+            ..PlaylistPanelActions::default()
+        });
+        let app_error = app.error.as_ref().unwrap();
+        assert!(app_error.message.contains("мастер"), "got: {}", app_error.message);
+        assert!(app.library.as_ref().unwrap().rename_dialog.is_none());
+    }
+
+    #[test]
+    fn sidebar_guard_blocks_delete_and_rename_of_system_playlists() {
+        let (mut app, _dir) = app_with_open_library();
+        let mut view = sample_playlist(200, "Аудиокниги");
+        view.distinguished_kind = 8;
+        app.library.as_mut().unwrap().snapshot.playlists = vec![view];
+        app.apply_playlist_actions(PlaylistPanelActions {
+            delete_playlist: Some(PlaylistId::from_bits(200)),
+            rename_playlist: Some(PlaylistId::from_bits(200)),
+            ..PlaylistPanelActions::default()
+        });
+        let library = app.library.as_ref().unwrap();
+        assert!(
+            library.confirm_delete_playlist.is_none(),
+            "a system playlist must not reach the delete confirm"
+        );
+        assert!(
+            library.rename_dialog.is_none(),
+            "a system playlist must not reach the rename dialog"
+        );
+        assert!(app.error.is_some(), "the refusal is explained");
+    }
+
+    fn rename_modal_frame(app: &mut PodlibApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            ui.style_mut().animation_time = 0.0;
+            let ctx = ui.ctx().clone();
+            app.maybe_rename_playlist_modal(&ctx);
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn rename_modal_enter_saves_prefilled_field() {
+        let (mut app, _dir) = app_with_open_library();
+        app.library.as_mut().unwrap().snapshot.playlists = vec![sample_playlist(100, "Mix")];
+        app.library.as_mut().unwrap().rename_dialog = Some(RenamePlaylistDialog {
+            id: PlaylistId::from_bits(100),
+            name: "Mix".to_owned(),
+        });
+        let ctx = egui::Context::default();
+        rename_modal_frame(&mut app, &ctx, Vec::new()); // open
+        // Typing happens in the field state; simulate it programmatically.
+        app.library.as_mut().unwrap().rename_dialog.as_mut().unwrap().name = "Renamed".to_owned();
+        rename_modal_frame(&mut app, &ctx, vec![enter_pressed()]);
+        let library = app.library.as_ref().unwrap();
+        assert!(library.rename_dialog.is_none(), "Enter saves and closes");
+        assert!(
+            matches!(library.pending, Some((PendingKind::RenamePlaylist, _))),
+            "Enter dispatches the rename"
+        );
+    }
+
+    #[test]
+    fn rename_modal_esc_cancels_without_dispatch() {
+        let (mut app, _dir) = app_with_open_library();
+        app.library.as_mut().unwrap().rename_dialog = Some(RenamePlaylistDialog {
+            id: PlaylistId::from_bits(100),
+            name: "Mix".to_owned(),
+        });
+        let ctx = egui::Context::default();
+        rename_modal_frame(&mut app, &ctx, Vec::new()); // open
+        rename_modal_frame(&mut app, &ctx, vec![escape_pressed()]);
+        let library = app.library.as_ref().unwrap();
+        assert!(library.rename_dialog.is_none(), "Esc closes");
+        assert!(library.pending.is_none(), "Esc dispatches nothing");
+    }
+
+    #[test]
+    fn rename_modal_refuses_empty_and_unchanged_names() {
+        let (mut app, _dir) = app_with_open_library();
+        app.library.as_mut().unwrap().snapshot.playlists = vec![sample_playlist(100, "Mix")];
+        app.library.as_mut().unwrap().rename_dialog = Some(RenamePlaylistDialog {
+            id: PlaylistId::from_bits(100),
+            name: "Mix".to_owned(),
+        });
+        let ctx = egui::Context::default();
+        rename_modal_frame(&mut app, &ctx, Vec::new()); // open
+        // Unchanged name: Enter must keep the dialog open, no dispatch.
+        rename_modal_frame(&mut app, &ctx, vec![enter_pressed()]);
+        assert!(app.library.as_ref().unwrap().rename_dialog.is_some());
+        assert!(app.library.as_ref().unwrap().pending.is_none());
+        // Whitespace-only: same honest refusal.
+        app.library
+            .as_mut()
+            .unwrap()
+            .rename_dialog
+            .as_mut()
+            .unwrap()
+            .name = "   ".to_owned();
+        rename_modal_frame(&mut app, &ctx, vec![enter_pressed()]);
+        let library = app.library.as_ref().unwrap();
+        assert!(library.rename_dialog.is_some(), "still open");
+        assert!(library.pending.is_none(), "nothing dispatched");
+    }
+
+    #[test]
+    fn deleting_the_open_playlist_returns_to_master() {
+        let (mut app, _dir) = app_with_open_library();
+        let track_id = app.library.as_ref().unwrap().snapshot.tracks[0].id;
+        {
+            let library = app.library.as_mut().unwrap();
+            library.snapshot.playlists = vec![sample_playlist(100, "Mix")];
+            library.view = LibraryView::Playlist(PlaylistId::from_bits(100));
+            library.selected_tracks = vec![track_id];
+            library.selected_track = Some(track_id);
+            library.selection_anchor = Some((0, track_id));
+        }
+        let (tx, rx) = channel();
+        app.library
+            .as_mut()
+            .unwrap()
+            .pending = Some((PendingKind::DeletePlaylist, rx));
+        tx.send(LibraryOutcome::Applied {
+            snapshot: LibrarySnapshot {
+                tracks: app.library.as_ref().unwrap().snapshot.tracks.clone(),
+                playlists: Vec::new(),
+            },
+            summary: "Плейлист удалён".to_owned(),
+        })
+        .unwrap();
+        app.drain_library();
+        let library = app.library.as_ref().unwrap();
+        assert_eq!(library.view, LibraryView::Master, "no dead view");
+        assert!(library.selected_tracks.is_empty());
+        assert!(library.selected_track.is_none());
+        assert!(library.selection_anchor.is_none());
+    }
+
+    #[test]
+    fn deleting_another_playlist_keeps_the_open_view() {
+        let (mut app, _dir) = app_with_open_library();
+        app.library.as_mut().unwrap().snapshot.playlists =
+            vec![sample_playlist(100, "Mix"), sample_playlist(101, "Trip")];
+        app.library.as_mut().unwrap().view =
+            LibraryView::Playlist(PlaylistId::from_bits(100));
+        let (tx, rx) = channel();
+        app.library
+            .as_mut()
+            .unwrap()
+            .pending = Some((PendingKind::DeletePlaylist, rx));
+        tx.send(LibraryOutcome::Applied {
+            snapshot: LibrarySnapshot {
+                tracks: app.library.as_ref().unwrap().snapshot.tracks.clone(),
+                playlists: vec![sample_playlist(100, "Mix")],
+            },
+            summary: "Плейлист удалён".to_owned(),
+        })
+        .unwrap();
+        app.drain_library();
+        assert_eq!(
+            app.library.as_ref().unwrap().view,
+            LibraryView::Playlist(PlaylistId::from_bits(100)),
+            "the open playlist survived — the view must stay"
         );
     }
 

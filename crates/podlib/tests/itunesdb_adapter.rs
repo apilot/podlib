@@ -392,6 +392,21 @@ fn playlist_crud_roundtrip() {
         reopened.delete_playlist(master_id),
         Err(podlib::backend::BackendError::MasterPlaylistImmutable { .. })
     ));
+    // Rename persists and keeps the id and the members; the master is
+    // refused.
+    reopened.rename_playlist(created, "Trip Renamed").unwrap();
+    let trip = reopened
+        .playlists()
+        .unwrap()
+        .into_iter()
+        .find(|p| p.id == created)
+        .unwrap();
+    assert_eq!(trip.name, "Trip Renamed");
+    assert_eq!(trip.track_ids, vec![t2]);
+    assert!(matches!(
+        reopened.rename_playlist(master_id, "Nope"),
+        Err(podlib::backend::BackendError::MasterPlaylistImmutable { .. })
+    ));
     assert!(reopened.delete_playlist(created).unwrap());
     assert!(!reopened.delete_playlist(created).unwrap());
     assert!(reopened

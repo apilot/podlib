@@ -293,6 +293,45 @@ fn playlist_crud_roundtrip_on_fixture() {
     assert_eq!(reparsed.serialize().unwrap(), written);
 }
 
+/// Rename on the fixture: the title mhod is replaced in every dataset
+/// copy, members and neighbours stay intact, and the cycle
+/// parse → mutate → serialize → re-parse preserves the new name.
+#[test]
+fn rename_playlist_roundtrip_on_fixture() {
+    let (_dir, bytes) = fixture_bytes();
+    let mut db = ItunesDb::parse(&bytes).unwrap();
+
+    db.rename_playlist(PlaylistId::from_bits(100), "Favourites Renamed")
+        .unwrap();
+
+    let written = db.serialize().expect("mutated fixture must tile");
+    let reparsed = ItunesDb::parse(&written).unwrap();
+
+    let playlists = reparsed.playlists();
+    let names: Vec<&str> = playlists.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, vec!["iPod Library", "Favourites Renamed"]);
+    // The rename must not touch the membership.
+    let favourites = playlists
+        .iter()
+        .find(|p| p.id == PlaylistId::from_bits(100))
+        .unwrap();
+    assert_eq!(favourites.track_ids, vec![TrackId::from_bits(1)]);
+    // The legacy dataset copy (the fixture keeps only the master in the
+    // type-100 view) carries the renamed title mhod.
+    let list2 = dataset_items(&reparsed, 2);
+    let ListItem::Playlist(favourites2) = &list2.items[1] else {
+        panic!("Favourites playlist expected");
+    };
+    let title = favourites2
+        .mhods
+        .iter()
+        .find(|mhod| mhod.mhod_type == 1)
+        .expect("title mhod present");
+    assert_eq!(title.text.as_deref(), Some("Favourites Renamed"));
+    // Reserialization stays byte-stable.
+    assert_eq!(reparsed.serialize().unwrap(), written);
+}
+
 /// Membership mutations on the fixture: append and removal land in both
 /// dataset copies with the order preserved.
 #[test]

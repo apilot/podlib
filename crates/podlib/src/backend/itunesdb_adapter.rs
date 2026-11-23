@@ -341,6 +341,16 @@ impl LibraryBackend for ItunesdbBackend {
         Ok(true)
     }
 
+    fn rename_playlist(&mut self, id: PlaylistId, name: &str) -> Result<(), BackendError> {
+        // Absent → not-found up front; master/smart/podcast refusals come
+        // from the core editor (`ensure_playlist_editable`).
+        if !self.playlist_id_set().contains(&id.to_bits()) {
+            return Err(BackendError::PlaylistNotFound(id));
+        }
+        self.db.rename_playlist(id, name).map_err(BackendError::from)?;
+        self.persist()
+    }
+
     fn add_to_playlist(
         &mut self,
         playlist: PlaylistId,
