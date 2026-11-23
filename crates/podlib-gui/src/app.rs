@@ -4036,7 +4036,9 @@ fn track_table(
                 body.row(ROW_HEIGHT, |mut row| {
                     // Selection highlight straight from TableBuilder:
                     // every row of the multi-selection plus the cursor.
-                    row.set_selected(selected_tracks.contains(&track.id) || cursor == Some(track.id));
+                    let selected =
+                        selected_tracks.contains(&track.id) || cursor == Some(track.id);
+                    row.set_selected(selected);
                     // Round 6 П2: the checkbox column — an explicit
                     // toggle, kept out of the drag/click machinery.
                     row.col(|ui| {
@@ -4059,7 +4061,12 @@ fn track_table(
                             &clicked,
                             &double_clicked,
                             |ui| {
-                                ui.label(egui::RichText::new(&track.title).strong());
+                                let color = cell_text_color(ui.visuals(), selected);
+                                ui.label(
+                                    egui::RichText::new(&track.title)
+                                        .strong()
+                                        .color(color),
+                                );
                             },
                         );
                     });
@@ -4071,7 +4078,11 @@ fn track_table(
                             &clicked,
                             &double_clicked,
                             |ui| {
-                                tooltip_label(ui, &track.artist);
+                                tooltip_label(
+                                    ui,
+                                    &track.artist,
+                                    cell_text_color(ui.visuals(), selected),
+                                );
                             },
                         );
                     });
@@ -4083,7 +4094,11 @@ fn track_table(
                             &clicked,
                             &double_clicked,
                             |ui| {
-                                tooltip_label(ui, &track.album);
+                                tooltip_label(
+                                    ui,
+                                    &track.album,
+                                    cell_text_color(ui.visuals(), selected),
+                                );
                             },
                         );
                     });
@@ -4099,7 +4114,13 @@ fn track_table(
                                 // the column edge.
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| ui.label(format_duration(track.duration_ms)),
+                                    |ui| {
+                                        let color = cell_text_color(ui.visuals(), selected);
+                                        ui.label(
+                                            egui::RichText::new(format_duration(track.duration_ms))
+                                                .color(color),
+                                        );
+                                    },
                                 );
                             },
                         );
@@ -4187,11 +4208,26 @@ fn draggable_cell(
     }
 }
 
-/// Artist/album cell: clipped by the column, hovering shows the full text.
-fn tooltip_label(ui: &mut egui::Ui, value: &Option<String>) {
-    let response = ui.label(optional_text(value));
+/// Artist/album cell: clipped by the column, hovering shows the full
+/// text. The color is the caller's: selected rows sit on the dense
+/// accent fill and need the selection-stroke text (see
+/// [`cell_text_color`]).
+fn tooltip_label(ui: &mut egui::Ui, value: &Option<String>, color: egui::Color32) {
+    let response = ui.label(egui::RichText::new(optional_text(value)).color(color));
     if let Some(full) = value.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
         response.on_hover_text(full);
+    }
+}
+
+/// Text color for track-table cells. WHY selection stroke when
+/// selected: the row paints the dense accent fill (selection.bg_fill),
+/// so the text switches to the accent fg — the same convention as the
+/// sidebar rows; unselected cells keep the stock text color.
+fn cell_text_color(visuals: &egui::Visuals, selected: bool) -> egui::Color32 {
+    if selected {
+        visuals.selection.stroke.color
+    } else {
+        visuals.text_color()
     }
 }
 
@@ -4951,6 +4987,22 @@ mod tests {
             track_cell_id(track, 0),
             track_cell_id(TrackId::from_bits(0xABCE), 0)
         );
+    }
+
+    #[test]
+    fn table_cell_text_color_follows_selection_stroke_when_selected() {
+        // WHY literals: test asserts only — synthetic accent pair
+        // (light fill + dark accent fg) like the live Catppuccin theme.
+        let mut visuals = egui::Visuals::dark();
+        visuals.selection.bg_fill = egui::Color32::from_rgb(0xB4, 0xBE, 0xFE);
+        visuals.selection.stroke.color = egui::Color32::from_rgb(0x1E, 0x1E, 0x2E);
+        // Selected cells sit on the dense accent fill: the accent fg
+        // keeps contrast; non-selected cells keep the stock text color.
+        assert_eq!(
+            cell_text_color(&visuals, true),
+            egui::Color32::from_rgb(0x1E, 0x1E, 0x2E)
+        );
+        assert_eq!(cell_text_color(&visuals, false), visuals.text_color());
     }
 
     #[test]
