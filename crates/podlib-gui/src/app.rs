@@ -4005,6 +4005,35 @@ fn header_select_all(ui: &mut egui::Ui, state: SelectAllState) -> Option<bool> {
     response.changed().then_some(checked)
 }
 
+/// The caption of one sortable header cell, centered in the cell on
+/// BOTH axes. WHY not `vertical_centered`: it centers horizontally
+/// only — the caption rode the top edge of the band (owner report);
+/// a horizontal layout with both aligns centered pins it to the
+/// middle of the ROW_HEIGHT band, like the data-row text.
+/// One sortable header caption: a strong label centered in the cell
+/// on both axes. WHY painter text, not a Label: egui lays main-axis
+/// widgets through an unbounded cursor (`initial_cursor` sets
+/// `max.x = INFINITY` in egui's layout.rs), so `main_align` never
+/// re-positions a plain widget — only `cross_align` works, which
+/// centered vertically but left the caption glued to the left edge.
+/// Allocating the whole cell also makes the click target column-wide,
+/// matching the header-chrome band painted on the same rect.
+fn sortable_header_caption(ui: &mut egui::Ui, label: &str, suffix: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        format!("{label}{suffix}"),
+        font,
+        // WHY strong_text_color: RichText::strong() is a COLOR tier in
+        // egui 0.37 (WidgetText::strong → visuals.strong_text_color()),
+        // not a font style — this keeps the exact previous look.
+        ui.style().visuals.strong_text_color(),
+    );
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// One sortable header cell (round 7): the strong label, suffixed
 /// ▲/▼ while its column is the active sort. A click reports the
 /// column — the caller owns the state machine ([`next_track_sort`]).
@@ -4024,22 +4053,7 @@ fn sortable_header(
         }
         _ => "",
     };
-    // WHY centered: header labels read as column captions — centered
-    // on the tinted band they line up uniformly across ALL columns,
-    // including the right-aligned «Длит.» one. Body size (not small):
-    // captions must stay readable at header height. Cell CONTENT
-    // alignment is unaffected — this wraps only the caption.
-    let clicked = ui
-        .vertical_centered(|ui| {
-            let response = ui
-                .add(
-                    egui::Label::new(egui::RichText::new(format!("{label}{suffix}")).strong())
-                        .sense(egui::Sense::click()),
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
-            response.clicked()
-        })
-        .inner;
+    let clicked = sortable_header_caption(ui, label, suffix).clicked();
     clicked.then_some(column)
 }
 
@@ -4383,9 +4397,12 @@ fn sidebar_section_header(ui: &mut egui::Ui, title: &str) -> egui::Rect {
         visuals.widgets.inactive.bg_stroke,
     );
     let font = egui::TextStyle::Body.resolve(ui.style());
+    // WHY LEFT_CENTER at the band's vertical center: the same centered
+    // caption convention as the table header ([`sortable_header_caption`]) —
+    // egui cross-align alone cannot center inside a hand-painted band.
     painter.text(
-        rect.left_top() + egui::vec2(SIDEBAR_ROW_INSET, 0.0),
-        egui::Align2::LEFT_TOP,
+        egui::pos2(rect.left() + SIDEBAR_ROW_INSET, rect.center().y),
+        egui::Align2::LEFT_CENTER,
         title,
         font,
         visuals.text_color(),
@@ -7817,6 +7834,28 @@ mod tests {
     /// sidebar − panel margins − vscroll bar. All five columns must be
     /// visible with a ≥100px title (round 6 П2: the checkbox column
     /// shares the same width — the title's worst case is 104px).
+    #[test]
+    fn sortable_header_caption_sits_centered_in_the_band() {
+        // Owner: captions rode the top edge of the tinted band; they
+        // must ride its middle on BOTH axes (|Δ| < 1px).
+        egui::__run_test_ui(|ui| {
+            ui.allocate_ui(egui::vec2(160.0, ROW_HEIGHT), |ui| {
+                let response = sortable_header_caption(ui, "Название", "");
+                let cell = ui.max_rect();
+                assert!(
+                    (response.rect.center().y - cell.center().y).abs() < 1.0,
+                    "caption must be vertically centered, got {:?} in {cell:?}",
+                    response.rect.center()
+                );
+                assert!(
+                    (response.rect.center().x - cell.center().x).abs() < 1.0,
+                    "caption must stay horizontally centered, got {:?} in {cell:?}",
+                    response.rect.center()
+                );
+            });
+        });
+    }
+
     #[test]
     fn checkbox_sits_centered_in_its_column() {
         // Headless render of one checkbox cell: the box must sit at the
