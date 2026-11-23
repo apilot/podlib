@@ -50,6 +50,13 @@ const SIDEBAR_ROW_HEIGHT: f32 = 26.0;
 /// Left/right text inset inside a sidebar row. Identical for every
 /// section (master / «Устройство» / «Плейлисты»): one geometry.
 const SIDEBAR_ROW_INSET: f32 = 8.0;
+/// Modal chrome shared by the edit/playlist dialogs: popup inner
+/// margin and the vertical gap between logical groups (heading,
+/// hint, fields, actions). One pair of values keeps every modal
+/// looking the same; the surrounding popup frame stays the theme's
+/// own (`Frame::popup`), only the breathing room is ours.
+const MODAL_MARGIN: f32 = 16.0;
+const MODAL_GAP: f32 = 12.0;
 /// Gap kept between a (clipped) row name and the right-aligned count.
 const SIDEBAR_NAME_COUNT_GAP: f32 = 8.0;
 
@@ -2200,26 +2207,31 @@ impl PodlibApp {
             return;
         }
         let mut save = false;
-        let response = egui::Modal::new(egui::Id::unique("edit_track")).show(ctx, |ui| {
-            ui.set_width(500.0);
-            ui.heading("Изменить трек");
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(
-                    "Жанр не редактируется: библиотека не отдаёт его при чтении, \
-                     и правка перезаписала бы его пустым значением.",
-                )
-                .weak(),
-            );
-            ui.add_space(4.0);
-            let Some(library) = self.library.as_mut() else {
-                return;
-            };
-            let Some(dialog) = library.edit_dialog.as_mut() else {
-                return;
-            };
-            save = edit_track_dialog_fields(ui, dialog);
-        });
+        // WHY Frame::popup: keep the theme's own popup styling (fill,
+        // stroke, corner radius), only widen the inner margin so the
+        // dialog breathes; the playlist modals share MODAL_MARGIN.
+        let response = egui::Modal::new(egui::Id::unique("edit_track"))
+            .frame(egui::Frame::popup(&ctx.global_style()).inner_margin(MODAL_MARGIN))
+            .show(ctx, |ui| {
+                ui.set_width(500.0);
+                ui.heading("Изменить трек");
+                ui.add_space(MODAL_GAP);
+                ui.label(
+                    egui::RichText::new(
+                        "Жанр не редактируется: библиотека не отдаёт его при чтении, \
+                         и правка перезаписала бы его пустым значением.",
+                    )
+                    .weak(),
+                );
+                ui.add_space(MODAL_GAP);
+                let Some(library) = self.library.as_mut() else {
+                    return;
+                };
+                let Some(dialog) = library.edit_dialog.as_mut() else {
+                    return;
+                };
+                save = edit_track_dialog_fields(ui, dialog);
+            });
         if !(save || response.should_close()) {
             return; // still open, nothing to apply
         }
@@ -4388,64 +4400,53 @@ fn playlist_row(
 
 /// Field editors of the edit-track dialog; returns true on «Сохранить».
 /// Cancel closes via `ui.close()` (surfaces as `should_close`).
+/// One edit-dialog grid row: label + framed single-line field + the
+/// right-click text menu. A real grid replaces the padded-label hack
+/// («Название:      ») — columns align without magic whitespace.
+fn dialog_field(ui: &mut egui::Ui, label: &str, text: &mut String, width: f32) {
+    ui.label(label);
+    let field = ui.add(
+        egui::TextEdit::singleline(text).desired_width(width),
+    );
+    text_menu::attach_text_menu(&field);
+}
+
 fn edit_track_dialog_fields(ui: &mut egui::Ui, dialog: &mut EditDialogState) -> bool {
     let mut save = false;
     // Local copy: egui closures each need their own `&mut` field handle.
     let mut fields = dialog.fields.clone();
-    ui.horizontal(|ui| {
-        ui.label("Название:      ");
-        let title = ui.add(
-            egui::TextEdit::singleline(&mut fields.title).desired_width(320.0),
-        );
-        text_menu::attach_text_menu(&title);
-    });
-    ui.horizontal(|ui| {
-        ui.label("Исполнитель:  ");
-        let artist = ui.add(
-            egui::TextEdit::singleline(&mut fields.artist).desired_width(320.0),
-        );
-        text_menu::attach_text_menu(&artist);
-    });
-    ui.horizontal(|ui| {
-        ui.label("Альбом:       ");
-        let album = ui.add(
-            egui::TextEdit::singleline(&mut fields.album).desired_width(320.0),
-        );
-        text_menu::attach_text_menu(&album);
-    });
-    ui.horizontal(|ui| {
-        ui.label("Альбом-артист:");
-        let album_artist = ui.add(
-            egui::TextEdit::singleline(&mut fields.album_artist)
-                .desired_width(320.0),
-        );
-        text_menu::attach_text_menu(&album_artist);
-    });
-    ui.horizontal(|ui| {
-        ui.label("Трек №:       ");
-        let track_number = ui.add(
-            egui::TextEdit::singleline(&mut fields.track_number)
-                .desired_width(60.0),
-        );
-        text_menu::attach_text_menu(&track_number);
-        ui.label("Диск №:");
-        let disc_number = ui.add(
-            egui::TextEdit::singleline(&mut fields.disc_number)
-                .desired_width(60.0),
-        );
-        text_menu::attach_text_menu(&disc_number);
-    });
+    egui::Grid::new("edit_track_fields")
+        .num_columns(4)
+        .spacing([8.0, 6.0])
+        .show(ui, |ui| {
+            dialog_field(ui, "Название:", &mut fields.title, 320.0);
+            ui.end_row();
+            dialog_field(ui, "Исполнитель:", &mut fields.artist, 320.0);
+            ui.end_row();
+            dialog_field(ui, "Альбом:", &mut fields.album, 320.0);
+            ui.end_row();
+            dialog_field(ui, "Альбом-артист:", &mut fields.album_artist, 320.0);
+            ui.end_row();
+            dialog_field(ui, "Трек №:", &mut fields.track_number, 60.0);
+            dialog_field(ui, "Диск №:", &mut fields.disc_number, 60.0);
+            ui.end_row();
+        });
     dialog.fields = fields;
     if let Some(error) = &dialog.error {
         ui.colored_label(ui.visuals().error_fg_color, error);
     }
+    ui.add_space(MODAL_GAP);
     ui.separator();
-    ui.horizontal(|ui| {
-        if ui.button("Отмена").clicked() {
-            ui.close();
-        }
+    ui.add_space(MODAL_GAP);
+    // WHY right_to_left: the primary action hugs the bottom-right
+    // corner — the standard modal convention; first added = rightmost,
+    // so the visual order is «Отмена / Сохранить».
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         if ui.button("Сохранить").clicked() {
             save = true;
+            ui.close();
+        }
+        if ui.button("Отмена").clicked() {
             ui.close();
         }
     });
