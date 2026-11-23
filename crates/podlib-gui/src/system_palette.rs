@@ -273,7 +273,10 @@ fn raw_defines(css: &str) -> Vec<(String, String)> {
 }
 
 /// Pass 2: resolve raw values into colors; `@name` references may
-/// point at any entry (also across merged files).
+/// point at any entry (also across merged files). WHY silent early
+/// keep: a re-defined name whose later value fails to parse stays on
+/// the earlier color — loyal to themes; GTK in that case simply
+/// doesn't set the variable.
 fn resolve_defines(raw: &[(String, String)]) -> Vec<(String, Color32)> {
     let vars: HashMap<&str, &str> = raw.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     raw.iter()
@@ -341,30 +344,41 @@ fn nibble(b: u8) -> u8 {
 }
 
 /// `rgb(...)` / `rgba(...)`: numbers split on `,` `/` spaces; optional
-/// `%` per component; 3 → opaque, the 4th is alpha (CSS 0..1 float,
-/// raw bytes also accepted — ≤1.0 is treated as a float).
+/// `%` per component (scaled ×255/100 at parse); 3 → opaque, the 4th
+/// is alpha: CSS 0..1 float or raw byte (≤1.0 heuristic). WHY percent
+/// tracking: a scaled percent alpha (e.g. 0.3% → 0.765) must not
+/// re-enter the float heuristic and get scaled a second time.
 fn parse_functional(s: &str) -> Option<Color32> {
     let (name, inner) = s.split_once('(')?;
     let inner = inner.strip_suffix(')')?;
     if !matches!(name.trim().to_ascii_lowercase().as_str(), "rgb" | "rgba") {
         return None;
     }
-    let mut nums = Vec::new();
+    let mut nums: Vec<(f32, bool)> = Vec::new();
     for part in inner.split([',', ' ', '/']) {
         let part = part.trim();
         if part.is_empty() {
             continue;
         }
         if let Some(pct) = part.strip_suffix('%') {
-            nums.push(pct.trim().parse::<f32>().ok()? * 255.0 / 100.0);
+            nums.push((pct.trim().parse::<f32>().ok()? * 255.0 / 100.0, true));
         } else {
-            nums.push(part.parse::<f32>().ok()?);
+            nums.push((part.parse::<f32>().ok()?, false));
         }
     }
     match nums.as_slice() {
-        [r, g, b] => Some(Color32::from_rgb(channel(*r), channel(*g), channel(*b))),
-        [r, g, b, a] => {
-            let a = if *a <= 1.0 { a * 255.0 } else { *a };
+        [(r, _), (g, _), (b, _)] => Some(Color32::from_rgb(channel(*r), channel(*g), channel(*b))),
+        [(r, _), (g, _), (b, _), (a, is_pct)] => {
+            // WHY ≤1.0 heuristic: CSS alpha is a 0..1 float (themes
+            // write rgba(...,0.5) = half opacity); raw bytes also
+            // accepted. Percent components are already scaled.
+            let a = if *is_pct {
+                *a
+            } else if *a <= 1.0 {
+                a * 255.0
+            } else {
+                *a
+            };
             Some(Color32::from_rgba_unmultiplied(
                 channel(*r),
                 channel(*g),
@@ -387,7 +401,7 @@ fn parse_named(s: &str) -> Option<Color32> {
     match s.trim().to_ascii_lowercase().as_str() {
         "white" => Some(Color32::WHITE),
         "black" => Some(Color32::BLACK),
-        "gray" | "grey" => Some(Color32::GRAY),
+        "gray" | "grey" => Some(Color32::from_rgb(0x80, 0x80, 0x80)),
         "silver" => Some(Color32::from_rgb(0xC0, 0xC0, 0xC0)),
         "red" => Some(Color32::from_rgb(255, 0, 0)),
         "green" => Some(Color32::from_rgb(0, 128, 0)),
@@ -615,6 +629,31 @@ mod tests {
     }
 
     #[test]
+    fn parse_color_percent_alpha() {
+        // 50% opacity → half alpha (50 × 2.55 = 127.5 → 128).
+        assert_eq!(
+            parse_color("rgba(255, 255, 255, 50%)", &HashMap::new(), 0),
+            Some(Color32::from_rgba_unmultiplied(255, 255, 255, 128))
+        );
+        // WHY this case: a tiny percent alpha scales below the ≤1.0
+        // float heuristic — it must not be re-scaled a second time
+        // (0.3% of 255 ≈ 1, not 77% opacity).
+        assert_eq!(
+            parse_color("rgba(255, 255, 255, 0.3%)", &HashMap::new(), 0),
+            Some(Color32::from_rgba_unmultiplied(255, 255, 255, 1))
+        );
+        // Float and byte alpha forms keep their semantics.
+        assert_eq!(
+            parse_color("rgba(0, 0, 0, 0.5)", &HashMap::new(), 0),
+            Some(Color32::from_rgba_unmultiplied(0, 0, 0, 128))
+        );
+        assert_eq!(
+            parse_color("rgba(0, 0, 0, 100%)", &HashMap::new(), 0),
+            Some(Color32::from_rgba_unmultiplied(0, 0, 0, 255))
+        );
+    }
+
+    #[test]
     fn parse_color_css_names_and_none() {
         assert_eq!(
             parse_color("white", &HashMap::new(), 0),
@@ -628,7 +667,10 @@ mod tests {
             parse_color("silver", &HashMap::new(), 0),
             Some(Color32::from_rgb(0xC0, 0xC0, 0xC0))
         );
-        assert_eq!(parse_color("gray", &HashMap::new(), 0), Some(Color32::GRAY));
+        assert_eq!(
+            parse_color("gray", &HashMap::new(), 0),
+            Some(Color32::from_rgb(0x80, 0x80, 0x80))
+        );
         assert_eq!(parse_color("none", &HashMap::new(), 0), None);
         assert_eq!(parse_color("", &HashMap::new(), 0), None);
         assert_eq!(parse_color("notacolor", &HashMap::new(), 0), None);
@@ -676,20 +718,13 @@ garbage line
     }
 
     #[test]
-    fn map_visuals_overwrites_slots_from_variables() {
+    fn map_visuals_background_and_text_slots() {
         let vars = map(&[
             ("window_bg_color", 0x18, 0x18, 0x25),
             ("view_bg_color", 0x1E, 0x1E, 0x2E),
             ("insensitive_bg_color", 0x11, 0x11, 0x11),
             ("theme_fg_color", 0xC0, 0xC0, 0xC0),
             ("insensitive_fg_color", 0x60, 0x60, 0x60),
-            ("accent_bg_color", 0xB4, 0xBE, 0xFE),
-            ("accent_fg_color", 0x11, 0x11, 0x18),
-            ("theme_button_background_normal_breeze", 0x31, 0x32, 0x44),
-            ("theme_button_decoration_hover_breeze", 0x45, 0x46, 0x58),
-            ("borders", 0x20, 0x20, 0x20),
-            ("error_color", 0xF3, 0x8B, 0xA8),
-            ("warning_color", 0xFA, 0xB3, 0x87),
         ]);
         let v = map_visuals(&vars, true);
         assert_eq!(v.panel_fill, Color32::from_rgb(0x18, 0x18, 0x25));
@@ -701,6 +736,21 @@ garbage line
             Color32::from_rgb(0xC0, 0xC0, 0xC0)
         );
         assert_eq!(v.weak_text_color, Some(Color32::from_rgb(0x60, 0x60, 0x60)));
+        assert!(v.dark_mode);
+    }
+
+    #[test]
+    fn map_visuals_widgets_accent_and_status_slots() {
+        let vars = map(&[
+            ("accent_bg_color", 0xB4, 0xBE, 0xFE),
+            ("accent_fg_color", 0x11, 0x11, 0x18),
+            ("theme_button_background_normal_breeze", 0x31, 0x32, 0x44),
+            ("theme_button_decoration_hover_breeze", 0x45, 0x46, 0x58),
+            ("borders", 0x20, 0x20, 0x20),
+            ("error_color", 0xF3, 0x8B, 0xA8),
+            ("warning_color", 0xFA, 0xB3, 0x87),
+        ]);
+        let v = map_visuals(&vars, true);
         assert_eq!(v.selection.bg_fill, LAVENDER);
         assert_eq!(
             v.selection.stroke.color,
@@ -725,7 +775,6 @@ garbage line
         );
         assert_eq!(v.error_fg_color, Color32::from_rgb(0xF3, 0x8B, 0xA8));
         assert_eq!(v.warn_fg_color, Color32::from_rgb(0xFA, 0xB3, 0x87));
-        assert!(v.dark_mode);
     }
 
     #[test]

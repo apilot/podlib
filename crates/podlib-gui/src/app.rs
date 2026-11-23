@@ -413,6 +413,11 @@ pub struct PodlibApp {
     /// window actually closes (round 5.3: close = safe unmount when
     /// the app created the mount).
     pending_close_after_eject: bool,
+    /// Device status-dot color resolved once at startup (review M1):
+    /// `accent_success()` re-reads and re-parses the whole theme CSS —
+    /// doing that per frame would repeat ~600KB of parsing (plus a
+    /// gsettings spawn while GTK_THEME is unset) on every redraw.
+    palette_accent: Option<egui::Color32>,
 }
 
 impl PodlibApp {
@@ -423,6 +428,11 @@ impl PodlibApp {
         // WHY after set_theme: the palette rides on whichever dark/light
         // slot System resolves to; unresolved -> stock visuals (no-op).
         system_palette::apply(&ctx);
+        // WHY once here, not in the draw path: the dot paints every
+        // redraw, while accent_success() resolves the full theme
+        // (CSS read + parse, plus a gsettings spawn while GTK_THEME
+        // is unset) — cache the answer at startup.
+        let palette_accent = system_palette::accent_success();
         let mut app = Self {
             ctx,
             devices: Vec::new(),
@@ -443,6 +453,7 @@ impl PodlibApp {
             pending_remove_from_playlist: None,
             mounted_by_us: false,
             pending_close_after_eject: false,
+            palette_accent,
             tag_review: None,
         };
         app.refresh_devices();
@@ -1050,8 +1061,10 @@ impl PodlibApp {
                             ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
                         // WHY palette success over a green literal: the
                         // dot follows the active theme; unresolved ->
-                        // selection fill (never a stock color).
-                        let dot = system_palette::accent_success()
+                        // selection fill (never a stock color). Cached at
+                        // startup — see PodlibApp::palette_accent.
+                        let dot = self
+                            .palette_accent
                             .unwrap_or_else(|| ui.visuals().selection.bg_fill);
                         ui.painter().circle_filled(rect.center(), 4.0, dot);
                         ui.label(
