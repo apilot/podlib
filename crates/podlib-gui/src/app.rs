@@ -2000,6 +2000,7 @@ impl PodlibApp {
                 ui.label("Название:");
                 let name = ui.add(
                     egui::TextEdit::singleline(&mut library.new_playlist_name)
+                        .hint_text("Название плейлиста…")
                         .desired_width(240.0),
                 );
                 text_menu::attach_text_menu(&name);
@@ -2066,6 +2067,7 @@ impl PodlibApp {
                 ui.label("Название:");
                 let name = ui.add(
                     egui::TextEdit::singleline(&mut dialog.name)
+                        .hint_text("Новое название…")
                         .desired_width(240.0),
                 );
                 text_menu::attach_text_menu(&name);
@@ -4431,13 +4433,16 @@ fn playlist_row(
 
 /// Field editors of the edit-track dialog; returns true on «Сохранить».
 /// Cancel closes via `ui.close()` (surfaces as `should_close`).
-/// One edit-dialog grid row: label + framed single-line field + the
-/// right-click text menu. A real grid replaces the padded-label hack
-/// («Название:      ») — columns align without magic whitespace.
-fn dialog_field(ui: &mut egui::Ui, label: &str, text: &mut String, width: f32) {
+/// One edit-dialog grid row: label + framed single-line field (with
+/// the placeholder hint) + the right-click text menu. A real grid
+/// replaces the padded-label hack («Название:      ») — columns align
+/// without magic whitespace.
+fn dialog_field(ui: &mut egui::Ui, label: &str, text: &mut String, hint: &str, width: f32) {
     ui.label(label);
     let field = ui.add(
-        egui::TextEdit::singleline(text).desired_width(width),
+        egui::TextEdit::singleline(text)
+            .hint_text(hint)
+            .desired_width(width),
     );
     text_menu::attach_text_menu(&field);
 }
@@ -4450,16 +4455,22 @@ fn edit_track_dialog_fields(ui: &mut egui::Ui, dialog: &mut EditDialogState) -> 
         .num_columns(4)
         .spacing([8.0, 6.0])
         .show(ui, |ui| {
-            dialog_field(ui, "Название:", &mut fields.title, 320.0);
+            dialog_field(ui, "Название:", &mut fields.title, "Название трека…", 320.0);
             ui.end_row();
-            dialog_field(ui, "Исполнитель:", &mut fields.artist, 320.0);
+            dialog_field(ui, "Исполнитель:", &mut fields.artist, "Исполнитель…", 320.0);
             ui.end_row();
-            dialog_field(ui, "Альбом:", &mut fields.album, 320.0);
+            dialog_field(ui, "Альбом:", &mut fields.album, "Альбом…", 320.0);
             ui.end_row();
-            dialog_field(ui, "Альбом-артист:", &mut fields.album_artist, 320.0);
+            dialog_field(
+                ui,
+                "Альбом-артист:",
+                &mut fields.album_artist,
+                "Альбом-артист…",
+                320.0,
+            );
             ui.end_row();
-            dialog_field(ui, "Трек №:", &mut fields.track_number, 60.0);
-            dialog_field(ui, "Диск №:", &mut fields.disc_number, 60.0);
+            dialog_field(ui, "Трек №:", &mut fields.track_number, "Трек №…", 60.0);
+            dialog_field(ui, "Диск №:", &mut fields.disc_number, "Диск №…", 60.0);
             ui.end_row();
         });
     dialog.fields = fields;

@@ -544,7 +544,11 @@ fn map_widgets(v: &mut egui::Visuals, vars: &HashMap<String, Color32>) {
         v.widgets.active.weak_bg_fill = hover;
     }
     if let Some(border) = first(BORDERS_CHAIN) {
-        v.widgets.inactive.bg_stroke.color = border;
+        // WHY the whole stroke (width 1): the stock inactive.bg_stroke
+        // is Stroke::NONE — a color-only write keeps width 0 and paints
+        // nothing, so idle TextEdits would stay borderless. GTK's
+        // borders are conventionally a 1px hairline.
+        v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border);
     }
 }
 
@@ -769,9 +773,12 @@ garbage line
             v.widgets.active.bg_fill,
             Color32::from_rgb(0x45, 0x46, 0x58)
         );
+        // WHY the whole stroke: the stock inactive.bg_stroke is
+        // Stroke::NONE (width 0) — a color-only mapping would paint
+        // nothing; GTK borders are a 1px hairline by convention.
         assert_eq!(
-            v.widgets.inactive.bg_stroke.color,
-            Color32::from_rgb(0x20, 0x20, 0x20)
+            v.widgets.inactive.bg_stroke,
+            egui::Stroke::new(1.0, Color32::from_rgb(0x20, 0x20, 0x20))
         );
         assert_eq!(v.error_fg_color, Color32::from_rgb(0xF3, 0x8B, 0xA8));
         assert_eq!(v.warn_fg_color, Color32::from_rgb(0xFA, 0xB3, 0x87));
