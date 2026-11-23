@@ -22,6 +22,7 @@ use crate::library::{
     path_extension, plural, AUDIOBOOK_BIT, EditDialogFields, DraggedTracks, LibraryCommand,
     LibraryOutcome, LibrarySnapshot, LibraryWorker,
 };
+use crate::system_palette;
 use crate::text_menu;
 
 /// Row height of the track table rows, keeps the column grid aligned.
@@ -419,6 +420,9 @@ impl PodlibApp {
         // WHY the theme follows the system: owner requirement (round 4
         // UX) — the app must not impose dark/light on the desktop.
         ctx.set_theme(egui::ThemePreference::System);
+        // WHY after set_theme: the palette rides on whichever dark/light
+        // slot System resolves to; unresolved -> stock visuals (no-op).
+        system_palette::apply(&ctx);
         let mut app = Self {
             ctx,
             devices: Vec::new(),
@@ -1044,8 +1048,12 @@ impl PodlibApp {
                         // widget; a 4px filled circle reads as a status dot.
                         let (rect, _) =
                             ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                        ui.painter()
-                            .circle_filled(rect.center(), 4.0, egui::Color32::LIGHT_GREEN);
+                        // WHY palette success over a green literal: the
+                        // dot follows the active theme; unresolved ->
+                        // selection fill (never a stock color).
+                        let dot = system_palette::accent_success()
+                            .unwrap_or_else(|| ui.visuals().selection.bg_fill);
+                        ui.painter().circle_filled(rect.center(), 4.0, dot);
                         ui.label(
                             egui::RichText::new(format!(
                                 "{} · {}",
@@ -1081,7 +1089,7 @@ impl PodlibApp {
                 ui.label(egui::RichText::new("Готово").weak());
             }
             if let Some(error) = &self.error {
-                ui.colored_label(egui::Color32::LIGHT_RED, &error.message)
+                ui.colored_label(ui.visuals().error_fg_color, &error.message)
                     .on_hover_text(error_tooltip(error));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2337,7 +2345,7 @@ impl PodlibApp {
                 text_menu::attach_text_menu(&book_title);
             });
             if review.validation_attempted && review.book_title.trim().is_empty() {
-                ui.colored_label(egui::Color32::LIGHT_RED, texts.empty_title);
+                ui.colored_label(ui.visuals().error_fg_color, texts.empty_title);
             }
             ui.horizontal(|ui| {
                 ui.label(texts.author_field);
@@ -4308,7 +4316,7 @@ fn edit_track_dialog_fields(ui: &mut egui::Ui, dialog: &mut EditDialogState) -> 
     });
     dialog.fields = fields;
     if let Some(error) = &dialog.error {
-        ui.colored_label(egui::Color32::LIGHT_RED, error);
+        ui.colored_label(ui.visuals().error_fg_color, error);
     }
     ui.separator();
     ui.horizontal(|ui| {
@@ -4409,7 +4417,7 @@ fn draw_drop_overlay(ui: &egui::Ui, names: &[String]) {
         egui::Align2::CENTER_CENTER,
         text,
         font,
-        egui::Color32::WHITE,
+        ui.visuals().strong_text_color(),
     );
 }
 
@@ -4699,7 +4707,7 @@ impl eframe::App for PodlibApp {
             } else if self.library.is_none() {
                 ui.centered_and_justified(|ui| {
                     ui.colored_label(
-                        egui::Color32::LIGHT_RED,
+                        ui.visuals().error_fg_color,
                         "Библиотека недоступна: воркер закрылся. Отключите и подключите \
                          устройство заново.",
                     );

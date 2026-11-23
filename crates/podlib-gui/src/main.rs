@@ -7,6 +7,7 @@
 mod app;
 mod device;
 mod library;
+mod system_palette;
 mod text_menu;
 
 use eframe::egui;
