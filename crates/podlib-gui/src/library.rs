@@ -394,7 +394,25 @@ fn add_tracks_command(
         if needs_transcode(&path_extension(&draft.source_path)) {
             if let Some(dir) = transcode_dir.as_ref().map(|dir| dir.path()) {
                 match transcode_draft(draft, dir, index) {
-                    Ok(transcoded) => prepared = Some(transcoded),
+                    Ok(mut transcoded) => {
+                        // Round 6.1 B1 on the transcode path: the
+                        // transcoded file is fresh ffmpeg output, so
+                        // its duration is still the DnD zero — probe
+                        // the real one here. Same gate as passthrough
+                        // (a caller-supplied duration is trusted) and
+                        // the same honest skip on a failed probe.
+                        if transcoded.duration_ms == 0 {
+                            match probe_duration_ms(&transcoded.source_path) {
+                                Ok(duration_ms) => transcoded.duration_ms = duration_ms,
+                                Err(reason) => {
+                                    add_failures
+                                        .push(format!("«{}»: {reason}", draft.title));
+                                    continue;
+                                }
+                            }
+                        }
+                        prepared = Some(transcoded);
+                    }
                     Err(reason) => {
                         // The batch continues: the failed file is
                         // reported honestly in the summary tail.
@@ -1806,6 +1824,46 @@ mod tests {
             other => panic!("expected an honest Applied tail, got {other:?}"),
         }
         assert!(backend.added.is_empty(), "the failed draft must be skipped");
+    }
+
+    /// End-to-end transcode: a real FLAC fixture must reach the backend
+    /// with a probed duration — the transcoded draft inherits the DnD
+    /// zero, and a silent `total_time_ms = 0` makes the firmware refuse
+    /// to play the track (live F40/DBWI.m4a failure). Same contract as
+    /// the passthrough probe (B1).
+    #[test]
+    fn add_tracks_probes_transcoded_duration() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("song.flac");
+        let generated = std::process::Command::new("ffmpeg")
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=0.5",
+                "-c:a",
+                "flac",
+                &source.display().to_string(),
+            ])
+            .output()
+            .expect("run ffmpeg");
+        assert!(
+            generated.status.success(),
+            "fixture ffmpeg failed: {}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let mut backend = RecordingBackend::default();
+        let outcome =
+            add_tracks_command(&mut backend, vec![TrackDraft::new(source, "Трек").unwrap()]);
+        assert!(
+            matches!(outcome, LibraryOutcome::Applied { .. }),
+            "the transcoded draft must add cleanly"
+        );
+        assert_eq!(backend.added.len(), 1);
+        assert!(
+            backend.added[0].duration_ms > 0,
+            "B1: transcoded duration must be probed, not zero"
+        );
     }
 
     #[test]
