@@ -61,6 +61,12 @@ const MODAL_GAP: f32 = 12.0;
 /// the numeric pair row so the two layouts line up pixel-for-pixel.
 const FIELD_COLUMN_SPACING: f32 = 8.0;
 const FIELD_ROW_SPACING: f32 = 6.0;
+/// Modal scrim: alpha of the theme-tinted backdrop (a touch denser
+/// than egui's stock black 100) and the open-animation time. The
+/// whole modal chrome fades in over it; no fade-out — egui modals
+/// close in one frame and there is no close hook to animate from.
+const MODAL_SCRIM_ALPHA: u8 = 130;
+const MODAL_ANIMATION_TIME: f32 = 0.2;
 /// Gap kept between a (clipped) row name and the right-aligned count.
 const SIDEBAR_NAME_COUNT_GAP: f32 = 8.0;
 
@@ -1787,7 +1793,7 @@ impl PodlibApp {
         }
         let mut confirmed = false;
         let (title, body) = close_confirm_texts(self.busy || self.library_busy());
-        let response = egui::Modal::new(egui::Id::unique("confirm_close")).show(ctx, |ui| {
+        let response = podlib_modal(ctx, egui::Id::unique("confirm_close")).show(ctx, |ui| {
             ui.set_width(440.0);
             ui.heading(title);
             ui.add_space(4.0);
@@ -1867,7 +1873,8 @@ impl PodlibApp {
             )
         };
         let mut confirmed = false;
-        let response = egui::Modal::new(egui::Id::unique("confirm_delete_track")).show(ctx, |ui| {
+        let response =
+            podlib_modal(ctx, egui::Id::unique("confirm_delete_track")).show(ctx, |ui| {
             ui.set_width(440.0);
             ui.heading(title_line);
             ui.add_space(4.0);
@@ -1950,7 +1957,7 @@ impl PodlibApp {
             .unwrap_or_default();
         let mut confirmed = false;
         let response =
-            egui::Modal::new(egui::Id::unique("confirm_delete_playlist")).show(ctx, |ui| {
+            podlib_modal(ctx, egui::Id::unique("confirm_delete_playlist")).show(ctx, |ui| {
                 ui.set_width(400.0);
                 ui.heading(format!("Удалить плейлист «{name}»?"));
                 ui.add_space(4.0);
@@ -1995,9 +2002,7 @@ impl PodlibApp {
         let mut name = String::new();
         // WHY Frame::popup: the theme's own popup chrome, only wider
         // inner margins — one look with the edit modal (MODAL_MARGIN).
-        let response = egui::Modal::new(egui::Id::unique("create_playlist"))
-            .frame(egui::Frame::popup(&ctx.global_style()).inner_margin(MODAL_MARGIN))
-            .show(ctx, |ui| {
+        let response = podlib_modal(ctx, egui::Id::unique("create_playlist")).show(ctx, |ui| {
                 ui.set_width(380.0);
                 ui.heading("Новый плейлист");
                 ui.add_space(MODAL_GAP);
@@ -2075,9 +2080,7 @@ impl PodlibApp {
         let mut typed = String::new();
         // WHY Frame::popup: the theme's own popup chrome, only wider
         // inner margins — one look with the edit modal (MODAL_MARGIN).
-        let response = egui::Modal::new(egui::Id::unique("rename_playlist"))
-            .frame(egui::Frame::popup(&ctx.global_style()).inner_margin(MODAL_MARGIN))
-            .show(ctx, |ui| {
+        let response = podlib_modal(ctx, egui::Id::unique("rename_playlist")).show(ctx, |ui| {
                 ui.set_width(380.0);
                 ui.heading("Переименовать плейлист");
                 ui.add_space(MODAL_GAP);
@@ -2155,7 +2158,7 @@ impl PodlibApp {
         let count = dialog.track_ids.len();
         let mut confirmed = false;
         let mut artist = String::new();
-        let response = egui::Modal::new(egui::Id::unique("set_artist")).show(ctx, |ui| {
+        let response = podlib_modal(ctx, egui::Id::unique("set_artist")).show(ctx, |ui| {
             ui.set_width(440.0);
             let Some(library) = self.library.as_mut() else {
                 return;
@@ -2237,9 +2240,7 @@ impl PodlibApp {
         // WHY Frame::popup: keep the theme's own popup styling (fill,
         // stroke, corner radius), only widen the inner margin so the
         // dialog breathes; the playlist modals share MODAL_MARGIN.
-        let response = egui::Modal::new(egui::Id::unique("edit_track"))
-            .frame(egui::Frame::popup(&ctx.global_style()).inner_margin(MODAL_MARGIN))
-            .show(ctx, |ui| {
+        let response = podlib_modal(ctx, egui::Id::unique("edit_track")).show(ctx, |ui| {
                 ui.set_width(500.0);
                 ui.heading("Изменить трек");
                 ui.add_space(MODAL_GAP);
@@ -2372,7 +2373,7 @@ impl PodlibApp {
         }
         let mut cancelled = false;
         let mut committed = false;
-        let response = egui::Modal::new(egui::Id::unique("tag_review_modal")).show(ctx, |ui| {
+        let response = podlib_modal(ctx, egui::Id::unique("tag_review_modal")).show(ctx, |ui| {
             let Some(review) = self.tag_review.as_mut() else {
                 return;
             };
@@ -2545,7 +2546,7 @@ impl PodlibApp {
             .map(|library| library.snapshot.playlists.clone())
             .unwrap_or_default();
         let mut chosen: Option<PlaylistId> = None;
-        let response = egui::Modal::new(egui::Id::unique("add_to_playlist")).show(ctx, |ui| {
+        let response = podlib_modal(ctx, egui::Id::unique("add_to_playlist")).show(ctx, |ui| {
             ui.set_width(360.0);
             ui.heading("Добавить в плейлист");
             ui.add_space(4.0);
@@ -4741,6 +4742,52 @@ fn password_field_id(id_salt: &str) -> egui::Id {
 /// click cancel, and the submit button stays disabled while the field
 /// is empty. The password never leaves the app: the caller consumes
 /// and clears it when the worker starts.
+/// Scrim alpha at the modal's open progress `t` (0 = closed, 1 =
+/// fully open): scales linearly, clamped — the animation can overshoot.
+fn scrim_alpha(t: f32) -> u8 {
+    (f32::from(MODAL_SCRIM_ALPHA) * t.clamp(0.0, 1.0)).round() as u8
+}
+
+/// Snaps the animation progress to its target once it is visually
+/// indistinguishable (< 1% away): leaves no eternal 0.999 opacity
+/// residue that keeps the frame "almost done" forever.
+fn settle(t: f32) -> f32 {
+    if (1.0 - t).abs() < 0.01 {
+        1.0
+    } else {
+        t.clamp(0.0, 1.0)
+    }
+}
+
+/// The app's modal constructor: every dialog goes through it so the
+/// chrome is identical — theme-tinted scrim (a light desaturating
+/// veil instead of egui's stock black), the themed popup frame with
+/// [`MODAL_MARGIN`], and a short fade-in driven by
+/// `Context::animate_value_with_time` (first appearance animates
+/// 0 → 1; after [`settle`] the per-frame call is a visual no-op).
+/// WHY no backdrop blur: egui 0.37 has none (only shadow `blur` and
+/// font hinting) — the tint is the honest substitute.
+fn podlib_modal(ctx: &egui::Context, id: egui::Id) -> egui::Modal {
+    let progress =
+        settle(ctx.animate_value_with_time(id.with("open"), 1.0, MODAL_ANIMATION_TIME));
+    let style = ctx.global_style();
+    let tint = style.visuals.window_fill();
+    let mut frame = egui::Frame::popup(&style).inner_margin(MODAL_MARGIN);
+    // WHY multiply the surface colors, not wrap the frame: Frame has
+    // no gamma_multiply in egui 0.37; the fill and the stroke carry
+    // the fade-in (the content is laid out at full strength).
+    frame.fill = frame.fill.gamma_multiply(progress);
+    frame.stroke.color = frame.stroke.color.gamma_multiply(progress);
+    egui::Modal::new(id)
+        .backdrop_color(egui::Color32::from_rgba_unmultiplied(
+            tint.r(),
+            tint.g(),
+            tint.b(),
+            scrim_alpha(progress),
+        ))
+        .frame(frame)
+}
+
 fn password_modal(
     ctx: &egui::Context,
     id_salt: &str,
@@ -4751,7 +4798,7 @@ fn password_modal(
 ) -> PasswordModal {
     let field_id = password_field_id(id_salt);
     let mut outcome = PasswordModal::Open;
-    let response = egui::Modal::new(egui::Id::unique(id_salt)).show(ctx, |ui| {
+    let response = podlib_modal(ctx, egui::Id::unique(id_salt)).show(ctx, |ui| {
         ui.set_width(440.0);
         ui.heading(heading);
         ui.add_space(4.0);
@@ -5167,6 +5214,27 @@ mod tests {
             track_cell_id(track, 0),
             track_cell_id(TrackId::from_bits(0xABCE), 0)
         );
+    }
+
+    #[test]
+    fn scrim_alpha_scales_with_the_open_factor() {
+        // The scrim rides the open animation: 0 at the first frame of
+        // the fade-in, full density when settled, clamped beyond.
+        assert_eq!(scrim_alpha(0.0), 0);
+        assert_eq!(scrim_alpha(1.0), MODAL_SCRIM_ALPHA);
+        assert_eq!(scrim_alpha(1.5), MODAL_SCRIM_ALPHA, "clamped from above");
+        assert_eq!(scrim_alpha(-0.5), 0, "clamped from below");
+    }
+
+    #[test]
+    fn settle_snaps_near_one_to_exactly_one() {
+        // animate_value_with_time can linger a hair below the target:
+        // without the snap the modal frame would keep a faint ghost
+        // darkening forever.
+        assert_eq!(settle(0.995), 1.0);
+        assert_eq!(settle(1.5), 1.0);
+        assert_eq!(settle(-0.5), 0.0);
+        assert_eq!(settle(0.5), 0.5);
     }
 
     #[test]
