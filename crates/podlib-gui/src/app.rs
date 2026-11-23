@@ -2411,7 +2411,18 @@ impl PodlibApp {
                                 );
                             }
                             ui.horizontal(|ui| {
-                                ui.label(format!("{:>2}.", row.track_number));
+                                let number = format!("{:>2}.", row.track_number);
+                                // WHY selection stroke when selected: this
+                                // label paints directly on the selection
+                                // fill; the TextEdits own their dark
+                                // backgrounds and keep their styling.
+                                let number = if selected {
+                                    egui::RichText::new(number)
+                                        .color(ui.visuals().selection.stroke.color)
+                                } else {
+                                    egui::RichText::new(number)
+                                };
+                                ui.label(number);
                                 let title = ui.add(
                                     egui::TextEdit::singleline(&mut row.title)
                                         .desired_width(300.0)
@@ -3840,19 +3851,30 @@ fn book_file_row(
     }
     let inner = rect.shrink2(egui::vec2(4.0, 0.0));
     let middle = rect.center().y;
+    // WHY selection stroke when selected: egui paints selected text
+    // with selection.stroke.color (the theme's accent fg) — on a
+    // dense light accent fill (selection.bg_fill) the normal light
+    // text_color washes out. One color for both tiers, no invented
+    // weak variant.
+    let (text_color, weak_color) = if selected {
+        let stroke = visuals.selection.stroke.color;
+        (stroke, stroke)
+    } else {
+        (visuals.text_color(), visuals.weak_text_color())
+    };
     painter.text(
         egui::pos2(inner.left(), middle),
         egui::Align2::LEFT_CENTER,
         format!("{}. {}", file_idx + 1, track.title),
         egui::FontId::proportional(14.0),
-        visuals.text_color(),
+        text_color,
     );
     painter.text(
         egui::pos2(inner.right(), middle),
         egui::Align2::RIGHT_CENTER,
         format_duration(track.duration_ms),
         egui::FontId::proportional(12.0),
-        visuals.weak_text_color(),
+        weak_color,
     );
     let response = response.on_hover_cursor(egui::CursorIcon::Grab);
     if response.drag_started() {
@@ -4153,10 +4175,20 @@ fn sidebar_row(ui: &mut egui::Ui, selected: bool, name: &str, count: &str) -> eg
     }
     let inner = rect.shrink2(egui::vec2(SIDEBAR_ROW_INSET, 0.0));
     let middle = rect.center().y;
+    // WHY selection stroke when selected: the accent fg (egui's own
+    // selected-text convention) stays readable on the dense accent
+    // fill; the stock light text_color washes out on it. Same color
+    // for name and count — no invented weak variant.
+    let (name_color, count_color) = if selected {
+        let stroke = visuals.selection.stroke.color;
+        (stroke, stroke)
+    } else {
+        (visuals.text_color(), visuals.weak_text_color())
+    };
     let count_galley = painter.layout_no_wrap(
         count.to_owned(),
         egui::FontId::proportional(12.0),
-        visuals.weak_text_color(),
+        count_color,
     );
     painter.text(
         egui::pos2(inner.right(), middle),
@@ -4170,7 +4202,7 @@ fn sidebar_row(ui: &mut egui::Ui, selected: bool, name: &str, count: &str) -> eg
     let name_galley = painter.layout_no_wrap(
         name.to_owned(),
         egui::FontId::proportional(14.0),
-        visuals.text_color(),
+        name_color,
     );
     let name_width = (inner.width() - count_galley.size().x - SIDEBAR_NAME_COUNT_GAP).max(0.0);
     let name_clipped = name_galley.size().x > name_width;
@@ -4181,7 +4213,7 @@ fn sidebar_row(ui: &mut egui::Ui, selected: bool, name: &str, count: &str) -> eg
     painter.with_clip_rect(name_clip).galley(
         egui::pos2(inner.left(), middle - 0.5 * name_galley.size().y),
         name_galley,
-        visuals.text_color(),
+        name_color,
     );
     if name_clipped {
         return response.on_hover_text(name);
