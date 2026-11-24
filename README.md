@@ -2,6 +2,10 @@
 
 **podlib** is a free software library and command-line tool for managing music libraries on USB-connected iPods — a modern Rust take on the classic libgpod + gtkpod workflow.
 
+<p align="center">
+  <img src="assets/demo.gif" alt="podlib demo: drag &amp; drop import with transcoding, audiobook grouping, playlists" width="720">
+</p>
+
 Also available in Russian: [README.ru.md](README.ru.md).
 
 ## Features
