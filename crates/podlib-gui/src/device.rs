@@ -6,6 +6,7 @@
 //! strings, never executed); only the `run_*` helpers execute processes,
 //! keeping the exact command lines unit-testable.
 
+use crate::i18n::{Key, tr, trf};
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -511,7 +512,13 @@ pub fn shutdown_step_label(spec: &CommandSpec) -> &'static str {
 /// Uniform UI-facing failure of one sudo shutdown step: the step name
 /// plus the tool's own stderr (or the spawn error text).
 pub fn shutdown_step_error(spec: &CommandSpec, stderr: &str) -> String {
-    format!("шаг {} (sudo): {}", shutdown_step_label(spec), stderr.trim())
+    trf(
+        Key::ShutdownStepError,
+        &[
+            ("step", shutdown_step_label(spec)),
+            ("stderr", stderr.trim()),
+        ],
+    )
 }
 
 /// Wraps `spec` in `sudo -S -p ''`: the password is read from stdin and
@@ -542,7 +549,7 @@ pub fn run_sudo_command(password: &str, spec: &CommandSpec) -> std::io::Result<O
         // `build_sudo_command` always pipes stdin; `None` here would mean
         // an internal bug, so fail with an error instead of panicking.
         let stdin = child.stdin.as_mut().ok_or_else(|| {
-            std::io::Error::other("stdin не открыт: build_sudo_command не настроил pipe")
+            std::io::Error::other(tr(Key::ErrStdinPipe))
         })?;
         // The write is best-effort (`let _ =`): in a loop of
         // back-to-back sudo steps the already-validated password is
@@ -592,43 +599,53 @@ pub fn classify_mount_failure(stderr: &str) -> MountFailure {
 }
 
 /// Classified mount errors with UI-facing hints.
-#[derive(Debug, thiserror::Error)]
+///
+/// WHY no `thiserror`: the messages are localised, and the Display impl
+/// delegates to the i18n dictionary (`tr`), the same single source the
+/// rest of the GUI uses.
+#[derive(Debug)]
 pub enum MountError {
-    #[error("sudo отклонил пароль")]
     WrongPassword,
-    #[error("журнал HFS+ грязный — force-монтирование невозможно")]
     DirtyJournal,
-    #[error("том уже смонтирован")]
     AlreadyMounted,
     /// Round 6.3: `udisksctl unmount` failed on a foreign ro automount.
     /// Review N1: Display carries only the advice sentence — the raw
-    /// stderr travels solely in `ConnectError::Mount.stderr`.
-    #[error(
-        "том смонтирован системой только для чтения — \
-         закройте приложения, использующие iPod, и повторите подключение"
-    )]
-    ForeignReadOnly(String),
-    #[error("mount завершился с ошибкой")]
+    /// stderr travels solely in `ConnectError::Mount.stderr`; the field
+    /// is read by tests (the «drive is in use» special case) and kept
+    /// for diagnostics, hence the explicit allow.
+    ForeignReadOnly(#[allow(dead_code)] String),
     Failed,
-    #[error("не удалось выполнить sudo: {0}")]
-    Io(#[from] std::io::Error),
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for MountError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MountError::WrongPassword => f.write_str(tr(Key::MountErrWrongPassword)),
+            MountError::DirtyJournal => f.write_str(tr(Key::MountErrDirtyJournal)),
+            MountError::AlreadyMounted => f.write_str(tr(Key::MountErrAlreadyMounted)),
+            MountError::ForeignReadOnly(_) => f.write_str(tr(Key::MountErrForeignRo)),
+            MountError::Failed => f.write_str(tr(Key::MountErrFailed)),
+            MountError::Io(error) => {
+                write!(f, "{}", trf(Key::MountErrSudoIo, &[("error", &error.to_string())]))
+            }
+        }
+    }
+}
+
+impl From<std::io::Error> for MountError {
+    fn from(value: std::io::Error) -> Self {
+        MountError::Io(value)
+    }
 }
 
 impl MountError {
     /// Extra advice beyond the error message itself, if any.
     pub fn hint(&self) -> Option<&'static str> {
         match self {
-            MountError::WrongPassword => {
-                Some("Проверьте пароль sudo (раскладка, CapsLock).")
-            }
-            MountError::DirtyJournal => Some(
-                "Журнал HFS+ грязный (обычно после прерванного синка). \
-                 Выполните: fsck.hfsplus -f <блочное устройство> — \
-                 см. docs/device-ipod-nano-7g.md.",
-            ),
-            MountError::AlreadyMounted => {
-                Some("Том уже смонтирован; при необходимости отмонтируйте и повторите.")
-            }
+            MountError::WrongPassword => Some(tr(Key::HintCheckSudoPassword)),
+            MountError::DirtyJournal => Some(tr(Key::HintDirtyJournal)),
+            MountError::AlreadyMounted => Some(tr(Key::HintAlreadyMounted)),
             MountError::Failed | MountError::Io(_) | MountError::ForeignReadOnly(_) => None,
         }
     }

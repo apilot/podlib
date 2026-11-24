@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::JoinHandle;
 
+use crate::i18n::{Key, added_tracks, lang, n_tracks, tr, trf};
 use podlib::{
     assign_album_track_numbers, BackendError, BatchEditOutcome, LibraryBackend, Playlist,
     PlaylistDraft, PlaylistId, Track, TrackChanges, TrackDraft, TrackId,
@@ -102,7 +103,8 @@ impl LibraryWorker {
         let (opened_tx, opened_rx) = channel();
         // No `.expect()` here (round-3 rule: none outside tests): a
         // failed thread spawn surfaces as an honest Failed outcome and
-        // a dead worker whose `request()` reports "не активен".
+        // a dead worker whose `request()` reports the worker-inactive
+        // message (i18n key `ErrWorkerInactive`).
         // Clone the open sender: the closure owns one copy, the error
         // arm below still has the original to report the failure.
         let spawned = std::thread::Builder::new()
@@ -121,8 +123,8 @@ impl LibraryWorker {
             ),
             Err(error) => {
                 let _ = opened_tx.send(LibraryOutcome::Failed {
-                    message: format!("Не удалось запустить поток библиотеки: {error}"),
-                    hint: Some("Подключите устройство заново.".to_owned()),
+                    message: trf(Key::ErrSpawnThread, &[("error", &error.to_string())]),
+                    hint: Some(tr(Key::HintReconnect).to_owned()),
                 });
                 (Self {
                     requests: None,
@@ -168,12 +170,12 @@ impl LibraryWorker {
         let requests = self
             .requests
             .as_ref()
-            .ok_or_else(|| "воркер библиотеки не активен".to_owned())?;
+            .ok_or_else(|| tr(Key::ErrWorkerInactive).to_owned())?;
         let (reply_tx, reply_rx) = channel();
         requests
             .send((command, reply_tx))
             .map(|_| reply_rx)
-            .map_err(|_| "воркер библиотеки не активен".to_owned())
+            .map_err(|_| tr(Key::ErrWorkerInactive).to_owned())
     }
 
     /// Blocking close and join. Used by the eject thread: the backend
@@ -211,11 +213,8 @@ fn worker_loop(
         Ok(backend) => backend,
         Err(error) => {
             let _ = opened.send(LibraryOutcome::Failed {
-                message: format!("Том смонтирован, но библиотека не открылась: {error}"),
-                hint: Some(
-                    "Проверьте, что на устройстве есть библиотека iTunes, и подключите заново."
-                        .to_owned(),
-                ),
+                message: trf(Key::ErrOpenFailed, &[("error", &error.to_string())]),
+                hint: Some(tr(Key::HintCheckItunes).to_owned()),
             });
             return; // the request channel closes: the UI sees a dead worker
         }
@@ -266,15 +265,11 @@ fn serve_loop(
                 // Stop serving honestly (see the WHY above): no further
                 // command may reach a backend of unknown state.
                 let _ = reply.send(LibraryOutcome::Failed {
-                    message: format!(
-                        "Внутренняя ошибка библиотеки: {}",
-                        panic_message(payload)
+                    message: trf(
+                        Key::ErrLibPanic,
+                        &[("message", &panic_message(payload))],
                     ),
-                    hint: Some(
-                        "Состояние библиотеки после сбоя неизвестно; отключите и подключите \
-                         устройство заново."
-                            .to_owned(),
-                    ),
+                    hint: Some(tr(Key::HintLibStateUnknown).to_owned()),
                 });
                 drop(backend);
                 return;
@@ -321,7 +316,7 @@ fn dispatch(backend: &mut dyn LibraryBackend, command: LibraryCommand) -> Librar
         },
         LibraryCommand::AddTracks(drafts) => add_tracks_command(backend, drafts),
         LibraryCommand::RemoveTrack { id, purge_media } => match backend.remove_track(id, purge_media) {
-            Ok(_) => finish(backend, "Трек удалён".to_owned()),
+            Ok(_) => finish(backend, tr(Key::TrackDeleted).to_owned()),
             Err(error) => failure_outcome(error),
         },
         LibraryCommand::EditTrack { id, changes } => edit_track_command(backend, id, changes),
@@ -331,19 +326,19 @@ fn dispatch(backend: &mut dyn LibraryBackend, command: LibraryCommand) -> Librar
         } => set_artist_command(backend, track_ids, artist),
         LibraryCommand::CreatePlaylist { name } => match PlaylistDraft::new(&name, Vec::new()) {
             Ok(draft) => match backend.create_playlist(&draft) {
-                Ok(_) => finish(backend, format!("Создан плейлист «{name}»")),
+                Ok(_) => finish(backend, trf(Key::PlaylistCreated, &[("name", &name)])),
                 Err(error) => failure_outcome(error),
             },
             Err(error) => failure_outcome(error.into()),
         },
         LibraryCommand::DeletePlaylist { id } => match backend.delete_playlist(id) {
-            Ok(_) => finish(backend, "Плейлист удалён".to_owned()),
+            Ok(_) => finish(backend, tr(Key::PlaylistDeleted).to_owned()),
             Err(error) => failure_outcome(error),
         },
         LibraryCommand::RenamePlaylist { id, name } => match backend.rename_playlist(id, &name) {
             // The id never rotates (rename is in place), so the notice
             // needs no id-change tail.
-            Ok(_) => finish(backend, format!("Плейлист переименован в «{name}»")),
+            Ok(_) => finish(backend, trf(Key::PlaylistRenamed, &[("name", &name)])),
             Err(error) => failure_outcome(error),
         },
         LibraryCommand::AddToPlaylist {
@@ -354,10 +349,9 @@ fn dispatch(backend: &mut dyn LibraryBackend, command: LibraryCommand) -> Librar
             // requested rows, not of stored ones.
             Ok(_) => finish(
                 backend,
-                format!(
-                    "Добавлено в плейлист: {} {}",
-                    track_ids.len(),
-                    plural(track_ids.len(), "трек", "трека", "треков")
+                trf(
+                    Key::AddedToPlaylist,
+                    &[("tracks", &n_tracks(lang(), track_ids.len()))],
                 ),
             ),
             Err(error) => failure_outcome(error),
@@ -366,7 +360,7 @@ fn dispatch(backend: &mut dyn LibraryBackend, command: LibraryCommand) -> Librar
             playlist,
             track_ids,
         } => match backend.remove_from_playlist(playlist, &track_ids) {
-            Ok(_) => finish(backend, "Убрано из плейлиста".to_owned()),
+            Ok(_) => finish(backend, tr(Key::RemovedFromPlaylist).to_owned()),
             Err(error) => failure_outcome(error),
         },
         LibraryCommand::Close => LibraryOutcome::Closed, // handled in the loop
@@ -413,8 +407,10 @@ fn add_tracks_command(
                             match probe_duration_ms(&transcoded.source_path) {
                                 Ok(duration_ms) => transcoded.duration_ms = duration_ms,
                                 Err(reason) => {
-                                    add_failures
-                                        .push(format!("«{}»: {reason}", draft.title));
+                                    add_failures.push(trf(
+                                        Key::AddFailureItem,
+                                        &[("title", &draft.title), ("reason", &reason)],
+                                    ));
                                     continue;
                                 }
                             }
@@ -424,14 +420,17 @@ fn add_tracks_command(
                     Err(reason) => {
                         // The batch continues: the failed file is
                         // reported honestly in the summary tail.
-                        add_failures.push(format!("«{}»: {reason}", draft.title));
+                        add_failures.push(trf(
+                            Key::AddFailureItem,
+                            &[("title", &draft.title), ("reason", &reason)],
+                        ));
                         continue;
                     }
                 }
             } else {
                 // Unreachable while the batch tempdir owns the path, but
                 // the draft is skipped honestly instead of panicking.
-                add_failures.push(format!("«{}»: нет временной папки транскода", draft.title));
+                add_failures.push(trf(Key::TranscodeNoTempDir, &[("title", &draft.title)]));
                 continue;
             }
         } else if draft.duration_ms == 0 {
@@ -447,7 +446,10 @@ fn add_tracks_command(
                     prepared = Some(probed);
                 }
                 Err(reason) => {
-                    add_failures.push(format!("«{}»: {reason}", draft.title));
+                    add_failures.push(trf(
+                        Key::AddFailureItem,
+                        &[("title", &draft.title), ("reason", &reason)],
+                    ));
                     continue;
                 }
             }
@@ -468,14 +470,19 @@ fn add_tracks_command(
     let failures_tail = add_failures_summary(&add_failures);
     match stopped {
         None if added == total && add_failures.is_empty() => {
-            finish(backend, added_tracks_summary(added))
+            finish(backend, added_tracks(lang(), added))
         }
         // Honest partial success without a backend error: some
         // drafts failed their transcode or their duration probe
         // and were skipped.
         None => {
-            let mut summary =
-                format!("{} из {total}", added_tracks_summary(added));
+            let mut summary = trf(
+                Key::SummaryPartial,
+                &[
+                    ("added", &added_tracks(lang(), added)),
+                    ("total", &total.to_string()),
+                ],
+            );
             summary.push_str(&failures_tail);
             finish(backend, summary)
         }
@@ -485,9 +492,13 @@ fn add_tracks_command(
         // Partial success: show honestly how far it got.
         Some(error) => match list_snapshot(backend) {
             Ok(snapshot) => {
-                let mut summary = format!(
-                    "{} из {total}; остановлено: {error}",
-                    added_tracks_summary(added)
+                let mut summary = trf(
+                    Key::AddStopped,
+                    &[
+                        ("added", &added_tracks(lang(), added)),
+                        ("total", &total.to_string()),
+                        ("error", &error.to_string()),
+                    ],
                 );
                 summary.push_str(&failures_tail);
                 LibraryOutcome::Applied { snapshot, summary }
@@ -508,9 +519,12 @@ fn edit_track_command(
             // Contract: the resulting id is authoritative; edits are
             // remove-and-re-add, so it usually changes — surface it.
             let summary = if track.id == id {
-                format!("Обновлено: «{}»", track.title)
+                trf(Key::UpdatedTrack, &[("title", &track.title)])
             } else {
-                format!("Обновлено: «{}» (новый id: {})", track.title, track.id)
+                trf(
+                    Key::UpdatedTrackNewId,
+                    &[("title", &track.title), ("id", &track.id.to_string())],
+                )
             };
             finish(backend, summary)
         }
@@ -552,8 +566,9 @@ fn set_artist_command(
             BatchEditOutcome::Updated(_) => updated += 1,
             BatchEditOutcome::Unchanged => unchanged += 1,
             BatchEditOutcome::Failed(reason) => {
-                let title =
-                    titles.get(id).map_or_else(|| id.to_string(), |title| format!("«{title}»"));
+                let title = titles
+                    .get(id)
+                    .map_or_else(|| id.to_string(), |title| trf(Key::QuotedTitle, &[("title", title)]));
                 failures.push(format!("{title}: {reason}"));
             }
         }
@@ -563,37 +578,48 @@ fn set_artist_command(
             (failures[0].clone(), None)
         } else {
             (
-                format!(
-                    "Задать исполнителя не удалось ни одному треку ({} из {total}): {}",
-                    failures.len(),
-                    failures.join("; ")
+                trf(
+                    Key::ArtistNoneSucceeded,
+                    &[
+                        ("count", &failures.len().to_string()),
+                        ("total", &total.to_string()),
+                        ("list", &failures.join("; ")),
+                    ],
                 ),
-                Some("Список мог устареть — нажмите «Обновить».".to_owned()),
+                Some(tr(Key::HintStaleList).to_owned()),
             )
         };
         return LibraryOutcome::Failed { message, hint };
     }
-    let unchanged_tail =
-        if unchanged > 0 { format!("; уже с исполнителем: {unchanged}") } else { String::new() };
+    let unchanged_tail = if unchanged > 0 {
+        trf(Key::ArtistUnchangedTail, &[("count", &unchanged.to_string())])
+    } else {
+        String::new()
+    };
     let summary = if updated == 0 {
         // Everything already carried the artist: an honest «уже задан»
         // instead of a fabricated success count (failures are handled
         // above, so `unchanged` covers the whole batch).
-        format!(
-            "Исполнитель уже задан: {} {}",
-            unchanged,
-            plural(unchanged, "трек", "трека", "треков")
+        trf(
+            Key::ArtistAlreadySet,
+            &[("tracks", &n_tracks(lang(), unchanged))],
         )
     } else if updated == total {
-        format!(
-            "Исполнитель задан: {} {}{unchanged_tail}",
-            total,
-            plural(total, "трек", "трека", "треков")
+        trf(
+            Key::ArtistSetAll,
+            &[("tracks", &n_tracks(lang(), total)), ("tail", &unchanged_tail)],
         )
     } else {
-        let mut summary = format!("Исполнитель задан: {updated} из {total}{unchanged_tail}");
+        let mut summary = trf(
+            Key::ArtistSetPartial,
+            &[
+                ("updated", &updated.to_string()),
+                ("total", &total.to_string()),
+                ("tail", &unchanged_tail),
+            ],
+        );
         if !failures.is_empty() {
-            summary.push_str("; задать не удалось: ");
+            summary.push_str(tr(Key::ArtistFailuresTail));
             summary.push_str(&failures.join("; "));
         }
         summary
@@ -613,23 +639,16 @@ fn finish(backend: &mut dyn LibraryBackend, summary: String) -> LibraryOutcome {
 fn failure_from(error: BackendError) -> (String, Option<String>) {
     match &error {
         BackendError::MasterPlaylistImmutable { id } => (
-            format!("Плейлист {id} — встроенный, его нельзя изменять"),
-            Some(
-                "Мастер-плейлист библиотеки доступен только для чтения; добавляйте треки \
-                 в пользовательские плейлисты."
-                    .to_owned(),
-            ),
+            trf(Key::ErrMasterImmutable, &[("id", &id.to_string())]),
+            Some(tr(Key::HintMasterReadonly).to_owned()),
         ),
         BackendError::TrackNotFound(_) | BackendError::PlaylistNotFound(_) => (
             error.to_string(),
-            Some("Список мог устареть — нажмите «Обновить».".to_owned()),
+            Some(tr(Key::HintStaleList).to_owned()),
         ),
         BackendError::Io(_) => (
-            format!("Ошибка ввода-вывода: {error}"),
-            Some(
-                "Проверьте, что устройство смонтировано и на нём есть свободное место."
-                    .to_owned(),
-            ),
+            trf(Key::ErrIo, &[("error", &error.to_string())]),
+            Some(tr(Key::HintIoMountSpace).to_owned()),
         ),
         _ => (error.to_string(), None),
     }
@@ -638,32 +657,6 @@ fn failure_from(error: BackendError) -> (String, Option<String>) {
 fn failure_outcome(error: BackendError) -> LibraryOutcome {
     let (message, hint) = failure_from(error);
     LibraryOutcome::Failed { message, hint }
-}
-
-/// Russian plural form for `n` items: «1 трек», «2 трека», «5 треков».
-/// Rules: `n % 10 == 1 && n % 100 != 11` → one; `n % 10` in 2..=4 and
-/// `n % 100` not in 12..=14 → few; otherwise (including 0) → many.
-pub(crate) fn plural<'a>(n: usize, one: &'a str, few: &'a str, many: &'a str) -> &'a str {
-    let units = n % 10;
-    let teens = n % 100;
-    if units == 1 && teens != 11 {
-        one
-    } else if (2..=4).contains(&units) && !(12..=14).contains(&teens) {
-        few
-    } else {
-        many
-    }
-}
-
-/// «Добавлен 1 трек» / «Добавлено 2 трека» / «Добавлено 5 треков»: the
-/// passive participle agrees with the count exactly like the noun does.
-fn added_tracks_summary(added: usize) -> String {
-    format!(
-        "{} {} {}",
-        plural(added, "Добавлен", "Добавлено", "Добавлено"),
-        added,
-        plural(added, "трек", "трека", "треков")
-    )
 }
 
 /// Extracts a human-readable message from a panic payload. Takes the box
@@ -675,7 +668,7 @@ pub(crate) fn panic_message(payload: Box<dyn Any + Send>) -> String {
     } else if let Some(text) = payload.downcast_ref::<String>() {
         text.clone()
     } else {
-        "причина не сообщена".to_owned()
+        tr(Key::PanicNoReason).to_owned()
     }
 }
 
@@ -783,7 +776,7 @@ fn add_failures_summary(failures: &[String]) -> String {
     if failures.is_empty() {
         String::new()
     } else {
-        format!("; добавление не удалось: {}", failures.join("; "))
+        trf(Key::AddFailuresTail, &[("list", &failures.join("; "))])
     }
 }
 
@@ -899,17 +892,17 @@ fn transcode_draft(
     let output = std::process::Command::new("ffmpeg")
         .args(ffmpeg_transcode_args(&draft.source_path, &target, codec))
         .output()
-        .map_err(|_| "ffmpeg не найден".to_owned())?;
+        .map_err(|_| tr(Key::FfmpegNotFound).to_owned())?;
     if !output.status.success() {
         let reason = String::from_utf8_lossy(&output.stderr)
             .lines()
             .next()
-            .unwrap_or("без вывода ffmpeg")
+            .unwrap_or(tr(Key::FfmpegNoOutput))
             .to_owned();
         return Err(format!("ffmpeg: {reason}"));
     }
     if !target.is_file() {
-        return Err("ffmpeg не создал целевой файл".to_owned());
+        return Err(tr(Key::FfmpegNoTarget).to_owned());
     }
     let mut prepared = draft.clone();
     prepared.source_path = target;
@@ -941,12 +934,12 @@ fn probe_duration_ms_with(program: &str, path: &std::path::Path) -> Result<u32, 
     let output = std::process::Command::new(program)
         .args(ffprobe_duration_args(path))
         .output()
-        .map_err(|_| format!("{program} не найден"))?;
+        .map_err(|_| trf(Key::ToolNotFound, &[("program", program)]))?;
     if !output.status.success() {
         let reason = String::from_utf8_lossy(&output.stderr)
             .lines()
             .next()
-            .unwrap_or("без вывода ffprobe")
+            .unwrap_or(tr(Key::FfprobeNoOutput))
             .to_owned();
         return Err(format!("ffprobe: {reason}"));
     }
@@ -954,9 +947,9 @@ fn probe_duration_ms_with(program: &str, path: &std::path::Path) -> Result<u32, 
     let seconds: f64 = stdout
         .trim()
         .parse()
-        .map_err(|_| format!("ffprobe: нечисловой вывод «{}»", stdout.trim()))?;
+        .map_err(|_| trf(Key::FfprobeNonNumeric, &[("output", stdout.trim())]))?;
     if !seconds.is_finite() || seconds <= 0.0 {
-        return Err(format!("ffprobe: бессмысленная длительность {seconds}"));
+        return Err(trf(Key::FfprobeBadDuration, &[("seconds", &seconds.to_string())]));
     }
     Ok((seconds * 1000.0).round() as u32)
 }
@@ -986,15 +979,9 @@ pub struct DraggedTracks(pub Vec<TrackId>);
 /// delete are refused alongside membership changes.
 pub fn guard_playlist_mutation(playlist: &Playlist) -> Result<(), String> {
     if playlist.is_master {
-        Err(format!(
-            "«{}» — встроенный мастер-плейлист: в него нельзя ничего добавить или убрать",
-            playlist.name
-        ))
+        Err(trf(Key::GuardMasterMembers, &[("name", &playlist.name)]))
     } else if playlist.distinguished_kind != 0 {
-        Err(format!(
-            "«{}» — системный плейлист устройства: его нельзя изменять",
-            playlist.name
-        ))
+        Err(trf(Key::GuardSystemPlaylist, &[("name", &playlist.name)]))
     } else {
         Ok(())
     }
@@ -1035,7 +1022,7 @@ pub fn changes_from_track(
 ) -> Result<TrackChanges, String> {
     let title = fields.title.trim();
     if title.is_empty() {
-        return Err("Название не может быть пустым".to_owned());
+        return Err(tr(Key::ErrEmptyTitle).to_owned());
     }
     let mut changes = TrackChanges::default();
     if title != current.title {
@@ -1062,7 +1049,7 @@ fn number_change(text: &str, current: u32) -> Result<Option<u32>, String> {
     }
     let parsed: u32 = text
         .parse()
-        .map_err(|_| format!("«{text}» — не целое число"))?;
+        .map_err(|_| trf(Key::ErrNotAnInteger, &[("text", text)]))?;
     if parsed == current {
         Ok(None)
     } else {
@@ -1150,40 +1137,9 @@ mod tests {
     }
 
     // ---- Russian plural forms (P1) ----
-
-    #[test]
-    fn plural_picks_one_few_many_on_boundaries() {
-        let cases = [
-            (0, "треков"),   // ноль → родительный множественного
-            (1, "трек"),     // один
-            (2, "трека"),    // два-четыре
-            (5, "треков"),   // пять и больше
-            (11, "треков"),  // 11-14 — всегда «ов»
-            (12, "треков"),
-            (21, "трек"),    // ...1, кроме 11
-            (22, "трека"),   // ...2, кроме 12-14
-            (25, "треков"),
-            (100, "треков"),
-            (101, "трек"),   // круглое число + 1
-            (111, "треков"), // 11 в конце — исключение из правила выше
-        ];
-        for (n, expected) in cases {
-            assert_eq!(
-                plural(n, "трек", "трека", "треков"),
-                expected,
-                "n = {n}"
-            );
-        }
-    }
-
-    #[test]
-    fn added_tracks_summary_agrees_with_the_count() {
-        assert_eq!(added_tracks_summary(1), "Добавлен 1 трек");
-        assert_eq!(added_tracks_summary(2), "Добавлено 2 трека");
-        assert_eq!(added_tracks_summary(5), "Добавлено 5 треков");
-        assert_eq!(added_tracks_summary(11), "Добавлено 11 треков");
-        assert_eq!(added_tracks_summary(21), "Добавлен 21 трек");
-    }
+    // Moved to i18n.rs (round 9): plural/added_tracks_summary became
+    // `i18n::n_tracks` / `i18n::added_tracks`, tested there on the same
+    // boundaries (0/1/2/5/11/12/21/22/25/100/101/111).
 
     // ---- drafts_from_paths ----
 

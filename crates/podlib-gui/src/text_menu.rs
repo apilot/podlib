@@ -4,6 +4,7 @@
 //! one to any text-field response: «Выделить всё», «Копировать»,
 //! «Вырезать», «Вставить».
 
+use crate::i18n::{Key, tr};
 use eframe::egui;
 
 /// Which items the menu carries.
@@ -26,18 +27,19 @@ enum MenuAction {
     Paste,
 }
 
-/// The menu items of `kind`, in display order.
-fn items(kind: MenuKind) -> &'static [(MenuAction, &'static str)] {
+/// The menu items of `kind`, in display order (translated at call time —
+/// the language is pinned at startup).
+fn items(kind: MenuKind) -> Vec<(MenuAction, &'static str)> {
     match kind {
-        MenuKind::Full => &[
-            (MenuAction::SelectAll, "Выделить всё"),
-            (MenuAction::Copy, "Копировать"),
-            (MenuAction::Cut, "Вырезать"),
-            (MenuAction::Paste, "Вставить"),
+        MenuKind::Full => vec![
+            (MenuAction::SelectAll, tr(Key::CtxSelectAll)),
+            (MenuAction::Copy, tr(Key::CtxCopy)),
+            (MenuAction::Cut, tr(Key::CtxCut)),
+            (MenuAction::Paste, tr(Key::CtxPaste)),
         ],
-        MenuKind::Secret => &[
-            (MenuAction::SelectAll, "Выделить всё"),
-            (MenuAction::Paste, "Вставить"),
+        MenuKind::Secret => vec![
+            (MenuAction::SelectAll, tr(Key::CtxSelectAll)),
+            (MenuAction::Paste, tr(Key::CtxPaste)),
         ],
     }
 }
@@ -79,11 +81,10 @@ fn show_menu(response: &egui::Response, kind: MenuKind) {
 
 fn menu_body(ui: &mut egui::Ui, ctx: &egui::Context, field_id: egui::Id, kind: MenuKind) {
     for (action, label) in items(kind) {
-        let button =
-            egui::Button::new(*label).shortcut_text(ctx.format_shortcut(&shortcut(*action)));
+        let button = egui::Button::new(label).shortcut_text(ctx.format_shortcut(&shortcut(action)));
         if ui.add(button).clicked() {
             ui.close();
-            run_action(ctx, field_id, *action);
+            run_action(ctx, field_id, action);
         }
     }
 }
@@ -156,11 +157,11 @@ mod tests {
     fn full_menu_offers_select_all_copy_cut_paste_in_order() {
         assert_eq!(
             items(MenuKind::Full),
-            &[
-                (MenuAction::SelectAll, "Выделить всё"),
-                (MenuAction::Copy, "Копировать"),
-                (MenuAction::Cut, "Вырезать"),
-                (MenuAction::Paste, "Вставить"),
+            vec![
+                (MenuAction::SelectAll, tr(Key::CtxSelectAll)),
+                (MenuAction::Copy, tr(Key::CtxCopy)),
+                (MenuAction::Cut, tr(Key::CtxCut)),
+                (MenuAction::Paste, tr(Key::CtxPaste)),
             ],
             "the full menu carries all four items, in order"
         );
@@ -170,11 +171,11 @@ mod tests {
     fn secret_menu_omits_copy_and_cut() {
         assert_eq!(
             items(MenuKind::Secret),
-            &[
-                (MenuAction::SelectAll, "Выделить всё"),
-                (MenuAction::Paste, "Вставить"),
+            vec![
+                (MenuAction::SelectAll, tr(Key::CtxSelectAll)),
+                (MenuAction::Paste, tr(Key::CtxPaste)),
             ],
-            "a password field gets no Копировать/Вырезать — egui blocks \
+            "a password field gets no copy/cut item — egui blocks \
              copying out of password fields anyway"
         );
     }
