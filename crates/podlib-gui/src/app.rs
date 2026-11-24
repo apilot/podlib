@@ -3606,7 +3606,10 @@ const ICON_ADD_TO_PLAYLIST: ActionIcon = ActionIcon {
     tooltip: "Добавить в плейлист…",
 };
 const ICON_REMOVE_FROM_PLAYLIST: ActionIcon = ActionIcon {
-    glyph: "🚫",
+    // ✖, not 🚫 (owner, 24.11): the ban sign reads ambiguously next to
+    // 🗑 (delete track); the cross says "remove from THIS list" and
+    // stays distinct from the trash that removes from the device.
+    glyph: "✖",
     tooltip: "Убрать из плейлиста",
 };
 const ICON_DELETE: ActionIcon = ActionIcon {
@@ -7996,7 +7999,7 @@ mod tests {
     /// search box at the 616px worst case. The pictogram row must stay
     /// clear of the search box: its leftmost extent sits right of the
     /// search box's right edge plus the item spacing. Both toolbar
-    /// variants checked (playlist «🚫» and library «🗑» as the first
+    /// variants checked (playlist «✖» and library «🗑» as the first
     /// right-to-left button).
     #[test]
     fn icon_row_clears_the_search_box_at_the_narrow_panel() {
