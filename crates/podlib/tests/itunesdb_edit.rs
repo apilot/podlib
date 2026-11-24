@@ -57,6 +57,7 @@ fn fixture_bytes() -> (TempDir, Vec<u8>) {
         &[FixturePlaylist {
             name: "Favourites".to_owned(),
             member_indices: vec![0],
+            distinguished_kind: None,
         }],
     )
     .unwrap();
@@ -269,9 +270,13 @@ fn playlist_crud_roundtrip_on_fixture() {
 
     let playlists = reparsed.playlists();
     let names: Vec<&str> = playlists.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(names, vec!["iPod Library", "Road Trip"]);
-    let road = &playlists[1];
-    assert_eq!(road.id, PlaylistId::from_bits(300));
+    assert_eq!(names, vec!["iPod Library", "Music", "Audiobooks", "Road Trip"]);
+    // WHY by name: built-in views (Music/Audiobooks) now precede user
+    // playlists, and the deterministic id allocation shifts with them.
+    let road = playlists
+        .iter()
+        .find(|p| p.name == "Road Trip")
+        .expect("created playlist persists");
     assert_eq!(
         road.track_ids,
         vec![TrackId::from_bits(1), TrackId::from_bits(3)]
@@ -309,7 +314,7 @@ fn rename_playlist_roundtrip_on_fixture() {
 
     let playlists = reparsed.playlists();
     let names: Vec<&str> = playlists.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(names, vec!["iPod Library", "Favourites Renamed"]);
+    assert_eq!(names, vec!["iPod Library", "Favourites Renamed", "Music", "Audiobooks"]);
     // The rename must not touch the membership.
     let favourites = playlists
         .iter()
@@ -396,7 +401,7 @@ fn mutation_chain_roundtrip_on_fixture() {
     );
     let playlists = reparsed.playlists();
     let names: Vec<&str> = playlists.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(names, vec!["iPod Library", "Favourites"]);
+    assert_eq!(names, vec!["iPod Library", "Favourites", "Music", "Audiobooks"]);
     for kind in [2, 3] {
         let list = dataset_items(&reparsed, kind);
         assert!(list.items.iter().all(|item| matches!(

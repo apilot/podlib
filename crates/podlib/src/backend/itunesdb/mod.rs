@@ -109,6 +109,7 @@ pub struct Mhyp {
     /// True when the kind byte at 0x14 is set — the classic encoding of
     /// the built-in master playlist.
     pub is_master: bool,
+    pub distinguished_kind: i64,
     /// True when smart-playlist mhods (types 50/51) are present.
     pub is_smart: bool,
     pub playlist_id: u64,

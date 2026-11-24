@@ -388,6 +388,7 @@ fn parse_mhyp(bytes: &[u8], span: &ChildSpan) -> Result<Mhyp, ParseError> {
         // master template, podcasts.rs L69) treats only the exact value 1
         // as "master" — other nonzero values mean other hidden kinds.
         is_master: bytes[at + 0x14] == 1,
+        distinguished_kind: i64::from(bytes[at + 0x14]),
         is_smart,
         playlist_id: read_u64(bytes, at + 0x1C)?,
         // Podcast flag lives at 0x2A only on headers long enough to hold it.

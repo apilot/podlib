@@ -67,6 +67,7 @@ fn fixture_db() -> (TempDir, Vec<u8>) {
         &[FixturePlaylist {
             name: "Favourites".to_owned(),
             member_indices: vec![0],
+            distinguished_kind: None,
         }],
     )
     .unwrap();
@@ -131,8 +132,8 @@ fn fixture_playlists_map_to_domain() {
     let db = ItunesDb::parse(&bytes).unwrap();
     let playlists = db.playlists();
     // Dual datasets (mhsd 2 + 3) duplicate the playlists; the reader
-    // takes the legacy view exactly once.
-    assert_eq!(playlists.len(), 2);
+    // takes the legacy view exactly once. Plus the built-in views.
+    assert_eq!(playlists.len(), 4);
 
     let master = &playlists[0];
     assert_eq!(master.name, "iPod Library");
@@ -149,6 +150,15 @@ fn fixture_playlists_map_to_domain() {
     assert!(!favourites.is_master);
     assert_eq!(favourites.id, PlaylistId::from_bits(100));
     assert_eq!(favourites.track_ids, vec![TrackId::from_bits(1)]);
+
+    let music = &playlists[2];
+    assert_eq!(music.name, "Music");
+    assert_eq!(music.distinguished_kind, 4);
+    assert!(music.track_ids.is_empty());
+    let audiobooks = &playlists[3];
+    assert_eq!(audiobooks.name, "Audiobooks");
+    assert_eq!(audiobooks.distinguished_kind, 5);
+    assert!(audiobooks.track_ids.is_empty());
 }
 
 #[test]

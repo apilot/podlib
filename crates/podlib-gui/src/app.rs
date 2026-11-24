@@ -5591,7 +5591,7 @@ mod tests {
         assert!(app.status.contains("Подключено"));
         // P1: Russian plural forms — «1 трек», not «1 треков».
         assert!(
-            app.status.contains("1 трек, 1 плейлист"),
+            app.status.contains("1 трек, 3 плейлиста"),
             "got: {}",
             app.status
         );

@@ -57,6 +57,7 @@ fn fixture_db() -> (TempDir, Vec<u8>) {
         &[FixturePlaylist {
             name: "Favourites".to_owned(),
             member_indices: vec![0],
+            distinguished_kind: None,
         }],
     )
     .unwrap();
@@ -107,8 +108,8 @@ fn dual_playlist_datasets_survive_serialization() {
     assert!(indices.contains(&3), "type-100 dataset missing: {indices:?}");
 
     // Both datasets duplicate the playlists; the domain reads dataset 2
-    // only, so the count stays 2 (master + Favourites).
-    assert_eq!(reparsed.playlists().len(), 2);
+    // only. Plus the built-in views (Music/Audiobooks) the fixture emits.
+    assert_eq!(reparsed.playlists().len(), 4);
     let playlists = reparsed.playlists();
     let favourites = playlists
         .iter()

@@ -1328,6 +1328,8 @@ fn build_mhyp(
         .map(|(position, &track_id)| build_mhip(track_id, u32::try_from(position).unwrap_or(u32::MAX)))
         .collect();
     Ok(Mhyp {
+        // Classic edits stay regular: kind 0 (the 0x14 byte).
+        distinguished_kind: 0,
         offset: UNASSIGNED,
         raw,
         is_master: false,

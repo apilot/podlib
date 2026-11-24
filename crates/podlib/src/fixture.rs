@@ -30,6 +30,9 @@ pub struct FixtureTrack {
 pub struct FixturePlaylist {
     pub name: String,
     pub member_indices: Vec<usize>,
+    /// Device-view kind carried in the MHYP kind/hidden byte: None =
+    /// regular, Some(1) = master, Some(4/5) = Music/Audiobooks views.
+    pub distinguished_kind: Option<i64>,
 }
 
 const MHBD_HEADER: usize = 244;
@@ -64,7 +67,6 @@ fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
 fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
-
 
 /// Zeroed chunk with magic, header_length and total_length prefilled.
 fn chunk(magic: &[u8; 4], header: usize) -> Vec<u8> {
@@ -140,9 +142,9 @@ fn preferences_mhod() -> Vec<u8> {
 }
 
 /// Playlist chunk; `is_master` sets the hidden/kind byte at 0x14.
-fn mhyp(playlist_id: u64, is_master: bool, name: &str, members: &[usize]) -> Vec<u8> {
+fn mhyp(playlist_id: u64, kind: u8, name: &str, members: &[usize]) -> Vec<u8> {
     let mut chunk = chunk(b"mhyp", MHYP_HEADER);
-    chunk[0x14] = u8::from(is_master);
+    chunk[0x14] = kind;
     put_u64(&mut chunk, 0x1c, playlist_id);
 
     let mut children = vec![preferences_mhod(), string_mhod(1, name)];
@@ -164,12 +166,17 @@ fn mhyp(playlist_id: u64, is_master: bool, name: &str, members: &[usize]) -> Vec
 fn playlist_dataset(kind: u32, playlists: &[FixturePlaylist], track_count: usize) -> Vec<u8> {
     let mut lists = vec![mhyp(
         MASTER_PLAYLIST_ID,
-        true,
+        1,
         "iPod Library",
         &(0..track_count).collect::<Vec<_>>(),
     )];
     for (index, playlist) in playlists.iter().enumerate() {
-        lists.push(mhyp(100 + index as u64, false, &playlist.name, &playlist.member_indices));
+        lists.push(mhyp(
+            100 + index as u64,
+            playlist.distinguished_kind.unwrap_or(0) as u8,
+            &playlist.name,
+            &playlist.member_indices,
+        ));
     }
 
     let mut list = chunk(b"mhlp", LIST_HEADER);
@@ -255,7 +262,20 @@ pub fn build_nano2g_fixture(
         let path = root.join("iPod_Control/Music/F00").join(&track.file_name);
         fs::write(path, vec![0x7Fu8; track.size_bytes as usize])?;
     }
-    let itunesdb = assemble_itunesdb(tracks, playlists);
+    // Built-in firmware views (Nano 7G sidebar «Музыка»/«Аудиокниги»):
+    // the app filters by media_kind, so membership stays empty.
+    let mut all = playlists.to_vec();
+    all.push(FixturePlaylist {
+        name: "Music".to_owned(),
+        member_indices: Vec::new(),
+        distinguished_kind: Some(4),
+    });
+    all.push(FixturePlaylist {
+        name: "Audiobooks".to_owned(),
+        member_indices: Vec::new(),
+        distinguished_kind: Some(5),
+    });
+    let itunesdb = assemble_itunesdb(tracks, &all);
     fs::write(root.join("iPod_Control/iTunes/iTunesDB"), itunesdb)?;
     Ok(())
 }
@@ -279,12 +299,38 @@ mod tests {
     }
 
     #[test]
+    fn nano2g_fixture_carries_distinguished_device_playlists() {
+        use crate::backend::itunesdb::ItunesDb;
+        let root = tempfile::TempDir::new().unwrap();
+        let tracks = vec![sample_track("A"), sample_track("B")];
+        let playlists = vec![FixturePlaylist {
+            name: "Mix".to_owned(),
+            member_indices: vec![0],
+            distinguished_kind: None,
+        }];
+        build_nano2g_fixture(root.path(), &tracks, &playlists).unwrap();
+        let bytes = std::fs::read(root.path().join("iPod_Control/iTunes/iTunesDB")).unwrap();
+        let db = ItunesDb::parse(&bytes).unwrap();
+        let playlists = db.playlists();
+        let kinds: Vec<i64> = playlists.iter().map(|p| p.distinguished_kind).collect();
+        assert!(kinds.contains(&1), "master keeps kind 1: {kinds:?}");
+        assert!(kinds.contains(&0), "user playlist keeps kind 0: {kinds:?}");
+        assert!(
+            kinds.contains(&4) && kinds.contains(&5),
+            "built-in views present: {kinds:?}"
+        );
+        let names: Vec<&str> = playlists.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"Music") && names.contains(&"Audiobooks"));
+    }
+
+    #[test]
     fn itunesdb_lengths_are_consistent() {
         let bytes = assemble_itunesdb(
             &[sample_track("A"), sample_track("B")],
             &[FixturePlaylist {
                 name: "Mix".to_owned(),
                 member_indices: vec![0],
+                distinguished_kind: None,
             }],
         );
         let total = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
@@ -316,6 +362,7 @@ mod tests {
             &[FixturePlaylist {
                 name: "Mix".to_owned(),
                 member_indices: vec![0],
+                distinguished_kind: None,
             }],
         )
         .unwrap();

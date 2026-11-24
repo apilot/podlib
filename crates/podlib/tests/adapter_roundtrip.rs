@@ -49,6 +49,7 @@ fn fixture_with_playlist() -> TempDir {
         &[podlib::FixturePlaylist {
             name: FAVOURITES.to_owned(),
             member_indices: vec![0],
+            distinguished_kind: None,
         }],
     )
     .unwrap();

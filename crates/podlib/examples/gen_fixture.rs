@@ -31,6 +31,7 @@ fn main() {
     let playlists = vec![FixturePlaylist {
         name: "Favourites".to_owned(),
         member_indices: vec![0],
+        distinguished_kind: None,
     }];
     build_nano2g_fixture(&root, &tracks, &playlists).expect("fixture generation failed");
     println!("fixture written to {}", root.display());

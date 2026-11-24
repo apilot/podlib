@@ -37,6 +37,7 @@ fn sample_fixture(root: &Path) {
         &[FixturePlaylist {
             name: "Mix".to_owned(),
             member_indices: vec![0],
+            distinguished_kind: None,
         }],
     )
     .unwrap();
@@ -99,8 +100,11 @@ fn open_lists_fixture_tracks_and_playlists() {
     assert_eq!(tracks[0].size_bytes, 1000);
 
     let playlists = backend.playlists().unwrap();
-    assert_eq!(playlists.len(), 2); // master + Mix
+    // master + Mix + the two built-in firmware views the fixture emits.
+    assert_eq!(playlists.len(), 4);
     assert!(playlists.iter().any(|p| p.is_master));
+    assert!(playlists.iter().any(|p| p.distinguished_kind == 4));
+    assert!(playlists.iter().any(|p| p.distinguished_kind == 5));
     let mix = playlists.iter().find(|p| p.name == "Mix").unwrap();
     assert_eq!(mix.track_ids, vec![TrackId::from_bits(1)]);
 }
@@ -345,8 +349,8 @@ fn playlist_crud_roundtrip() {
     let created = backend
         .create_playlist(&PlaylistDraft::new("Trip", vec![t1, t2]).unwrap())
         .unwrap();
-    // Deterministic id: max existing (100) + 1.
-    assert_eq!(created.to_bits(), 101);
+    // Deterministic id: max existing (102, built-ins) + 1.
+    assert_eq!(created.to_bits(), 103);
 
     let mut reopened = ItunesdbBackend::open(dir.path()).unwrap();
     let trip = reopened

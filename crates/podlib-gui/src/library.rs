@@ -2067,11 +2067,11 @@ mod tests {
                 name: "Mix".to_owned(),
             },
         ));
-        assert_eq!(snapshot.playlists.len(), 2, "master + the new one");
+        assert_eq!(snapshot.playlists.len(), 4, "master + new + built-ins");
         let playlist = snapshot
             .playlists
             .iter()
-            .find(|playlist| !playlist.is_master)
+            .find(|playlist| !playlist.is_master && playlist.distinguished_kind == 0)
             .expect("user playlist must appear");
         let playlist_id = playlist.id;
 
@@ -2100,7 +2100,7 @@ mod tests {
                 id: playlist_id,
             },
         ));
-        assert_eq!(snapshot.playlists.len(), 1, "only master remains");
+        assert_eq!(snapshot.playlists.len(), 3, "master + the two built-ins remain");
         worker.close_and_join();
     }
 
@@ -2119,7 +2119,7 @@ mod tests {
         let playlist_id = snapshot
             .playlists
             .iter()
-            .find(|playlist| !playlist.is_master)
+            .find(|playlist| !playlist.is_master && playlist.distinguished_kind == 0)
             .expect("user playlist must appear")
             .id;
         applied_snapshot(run(

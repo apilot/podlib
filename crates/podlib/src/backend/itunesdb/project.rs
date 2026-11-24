@@ -114,7 +114,7 @@ fn domain_playlist(mhyp: &Mhyp) -> Playlist {
         is_master: mhyp.is_master,
         is_smart: mhyp.is_smart,
         // Classic iTunesDB has no device views: kind stays 0.
-        distinguished_kind: 0,
+        distinguished_kind: mhyp.distinguished_kind,
     }
 }
 
