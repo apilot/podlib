@@ -3798,9 +3798,20 @@ fn groups_view(ui: &mut egui::Ui, params: GroupsViewParams<'_>) -> TrackRowActio
         expanded,
     } = params;
     let mut actions = TrackRowActions::default();
-    if !expanded.is_empty() && ui.button("Свернуть все").clicked() {
-        expanded.clear();
-    }
+    ui.horizontal(|ui| {
+        if !expanded.is_empty() && ui.button("Свернуть все").clicked() {
+            expanded.clear();
+        }
+        // WHY here: the books view renders no table header, so the
+        // view-level «выбрать все» rides the toolbar row — same
+        // tri-state, same select_all path as the tracks table.
+        let state = select_all_state(selected_tracks, visible_ids);
+        let mut checked = state == SelectAllState::All;
+        let indeterminate = state == SelectAllState::Some;
+        if centered_checkbox(ui, &mut checked, indeterminate).changed() {
+            actions.select_all = Some(checked);
+        }
+    });
     // Durations and titles for the infoblock/file rows; the groups
     // carry ids only (single source of truth, see TrackGroup).
     let by_id: HashMap<TrackId, &Track> =
@@ -3825,29 +3836,48 @@ fn groups_view(ui: &mut egui::Ui, params: GroupsViewParams<'_>) -> TrackRowActio
                     egui::Sense::click(),
                 );
                 let painter = ui.painter();
-                let visuals = ui.visuals();
                 if is_expanded {
                     painter.rect_filled(
                         rect,
                         ROW_HIGHLIGHT_RADIUS,
-                        visuals.widgets.inactive.bg_fill,
+                        ui.visuals().widgets.inactive.bg_fill,
                     );
                 }
                 if response.hovered() {
                     painter.rect_filled(
                         rect,
                         ROW_HIGHLIGHT_RADIUS,
-                        visuals.widgets.hovered.bg_fill,
+                        ui.visuals().widgets.hovered.bg_fill,
                     );
                 }
                 let inner = rect.shrink2(egui::vec2(8.0, 0.0));
                 let middle = rect.center().y;
+                // Book-level tri-state: the row checkbox selects or
+                // clears the WHOLE track set of the book (batch ops);
+                // the rest of the row keeps toggling the expansion.
+                let book_state = select_all_state(selected_tracks, &group.track_ids);
+                let mut book_checked = book_state == SelectAllState::All;
+                let book_box = egui::Rect::from_min_max(
+                    egui::pos2(inner.left(), rect.top()),
+                    egui::pos2(inner.left() + CHECK_COLUMN, rect.bottom()),
+                );
+                let book_response = ui.put(
+                    book_box,
+                    egui::Checkbox::without_text(&mut book_checked)
+                        .indeterminate(book_state == SelectAllState::Some),
+                );
+                if book_response.changed() {
+                    actions.checkbox_group = Some((group.track_ids.clone(), book_checked));
+                }
+                // Re-bind after the &mut-ui widget calls above (the old
+                // painter borrow would otherwise span across them).
+                let painter = ui.painter();
                 painter.text(
-                    egui::pos2(inner.left(), middle),
+                    egui::pos2(inner.left() + CHECK_COLUMN, middle),
                     egui::Align2::LEFT_CENTER,
                     format!("{arrow} {}", group.name),
                     egui::FontId::proportional(14.0),
-                    visuals.strong_text_color(),
+                    ui.visuals().strong_text_color(),
                 );
                 painter.text(
                     egui::pos2(inner.right(), middle),
@@ -3858,7 +3888,7 @@ fn groups_view(ui: &mut egui::Ui, params: GroupsViewParams<'_>) -> TrackRowActio
                         format_total_duration(total_ms)
                     ),
                     egui::FontId::proportional(12.0),
-                    visuals.weak_text_color(),
+                    ui.visuals().weak_text_color(),
                 );
                 if response.clicked() {
                     // Insert-else-remove = toggle.
@@ -3950,6 +3980,20 @@ fn book_file_row(
     }
     let inner = rect.shrink2(egui::vec2(4.0, 0.0));
     let middle = rect.center().y;
+    // Per-track checkbox (batch selection inside a book); the rest of
+    // the row keeps its drag/click mechanics untouched.
+    let box_rect = egui::Rect::from_min_max(
+        egui::pos2(inner.left(), rect.top()),
+        egui::pos2(inner.left() + CHECK_COLUMN, rect.bottom()),
+    );
+    let mut box_checked = selected_tracks.contains(&track_id);
+    let box_response = ui.put(box_rect, egui::Checkbox::without_text(&mut box_checked));
+    if box_response.changed() {
+        actions.checkbox_toggle = Some(track_id);
+    }
+    // Re-bind after the &mut-ui child call above (the old painter
+    // borrow would otherwise span across it).
+    let painter = ui.painter();
     // WHY selection stroke when selected: egui paints selected text
     // with selection.stroke.color (the theme's accent fg) — on a
     // dense light accent fill (selection.bg_fill) the normal light
@@ -3957,13 +4001,13 @@ fn book_file_row(
     // weak variant. The duration is a secondary label: it follows
     // [`row_secondary_color`] (hovered rows wash the weak tier out).
     let text_color = if selected {
-        visuals.selection.stroke.color
+        ui.visuals().selection.stroke.color
     } else {
-        visuals.text_color()
+        ui.visuals().text_color()
     };
-    let weak_color = row_secondary_color(visuals, selected, response.hovered());
+    let weak_color = row_secondary_color(ui.visuals(), selected, response.hovered());
     painter.text(
-        egui::pos2(inner.left(), middle),
+        egui::pos2(inner.left() + CHECK_COLUMN, middle),
         egui::Align2::LEFT_CENTER,
         format!("{}. {}", file_idx + 1, track.title),
         egui::FontId::proportional(14.0),
