@@ -4714,7 +4714,11 @@ fn numeric_fields_row(ui: &mut egui::Ui, track: &mut String, disc: &mut String) 
     // WHY measured, not magic: the split depends on the real label
     // widths and the layout's own spacing.
     let gaps = 2.0 * ui.spacing().item_spacing.x;
-    let half = even_split(ui.available_width(), label_width(ui, "Диск №:"), gaps);
+    let half = even_split(
+        ui.available_width(),
+        label_width(ui, tr(Key::EditLabelDiscNo)),
+        gaps,
+    );
     let track_number = ui.add(field_with(track, tr(Key::HintTrackNo), half));
     text_menu::attach_text_menu(&track_number);
     ui.label(tr(Key::EditLabelDiscNo));
@@ -4959,7 +4963,7 @@ fn password_modal(
             let password_field = ui.add(
                 egui::TextEdit::singleline(password)
                     .password(true)
-                    .hint_text("Пароль sudo…")
+                    .hint_text(tr(Key::HintSudoPassword))
                     .desired_width(ui.available_width())
                     .id(field_id),
             );

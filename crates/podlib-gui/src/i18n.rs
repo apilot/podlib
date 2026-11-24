@@ -240,6 +240,7 @@ pub enum Key {
     MountErrFailed,
     MountErrSudoIo,
     HintCheckSudoPassword,
+    HintSudoPassword,
     HintDirtyJournal,
     HintAlreadyMounted,
     // ---- text-edit context menu ----
@@ -456,6 +457,7 @@ const ALL_KEYS: &[Key] = &[
     Key::MountErrFailed,
     Key::MountErrSudoIo,
     Key::HintCheckSudoPassword,
+    Key::HintSudoPassword,
     Key::HintDirtyJournal,
     Key::HintAlreadyMounted,
     Key::CtxSelectAll,
@@ -1088,6 +1090,8 @@ pub(crate) fn text(lang: Lang, key: Key) -> &'static str {
             "Check the sudo password (keyboard layout, Caps Lock)."
         }
         (Lang::Ru, Key::HintCheckSudoPassword) => "Проверьте пароль sudo (раскладка, CapsLock).",
+        (Lang::En, Key::HintSudoPassword) => "Sudo password…",
+        (Lang::Ru, Key::HintSudoPassword) => "Пароль sudo…",
         (Lang::En, Key::HintDirtyJournal) => {
             "The HFS+ journal is dirty (usually after an interrupted sync). \
              Run: fsck.hfsplus -f <block device> — see docs/device-ipod-nano-7g.md."
