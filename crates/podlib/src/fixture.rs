@@ -117,6 +117,7 @@ fn mhit(position: usize, track: &FixtureTrack) -> Vec<u8> {
     put_u32(&mut chunk, 0x28, track.duration_ms);
     put_u32(&mut chunk, 0x2c, track.track_number);
     put_u32(&mut chunk, 0x5c, track.disc_number);
+    put_u32(&mut chunk, 0x60, 1); // music
     put_u64(&mut chunk, 0x70, 1_000_000 + position as u64);
     for child in children {
         chunk.extend_from_slice(&child);
@@ -320,6 +321,12 @@ mod tests {
             "built-in views present: {kinds:?}"
         );
         let names: Vec<&str> = playlists.iter().map(|p| p.name.as_str()).collect();
+        let tracks = db.tracks();
+        assert!(
+            tracks.iter().all(|track| track.media_kind == 1),
+            "fixture tracks are music: {:?}",
+            tracks.iter().map(|t| t.media_kind).collect::<Vec<_>>()
+        );
         assert!(names.contains(&"Music") && names.contains(&"Audiobooks"));
     }
 

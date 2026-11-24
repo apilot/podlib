@@ -110,6 +110,48 @@ fn open_lists_fixture_tracks_and_playlists() {
 }
 
 #[test]
+fn add_track_carries_audiobook_media_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    sample_fixture(dir.path());
+    let source = dir.path().join("chapter.m4b");
+    fs::write(&source, b"x").unwrap();
+    let mut backend = ItunesdbBackend::open(dir.path()).unwrap();
+    let draft = TrackDraft::new(source.clone(), "Глава")
+        .unwrap()
+        .with_media_kind_bits(8);
+    backend.add_track(&draft).unwrap();
+    let reopened = ItunesdbBackend::open(dir.path()).unwrap();
+    let track = reopened
+        .tracks()
+        .unwrap()
+        .into_iter()
+        .find(|track| track.title == "Глава")
+        .expect("added audiobook persisted");
+    assert_eq!(track.media_kind, 8);
+}
+
+#[test]
+fn add_track_carries_music_media_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    sample_fixture(dir.path());
+    let source = dir.path().join("song.mp3");
+    fs::write(&source, b"x").unwrap();
+    let mut backend = ItunesdbBackend::open(dir.path()).unwrap();
+    let draft = TrackDraft::new(source.clone(), "Песня")
+        .unwrap()
+        .with_media_kind_bits(1);
+    backend.add_track(&draft).unwrap();
+    let reopened = ItunesdbBackend::open(dir.path()).unwrap();
+    let track = reopened
+        .tracks()
+        .unwrap()
+        .into_iter()
+        .find(|track| track.title == "Песня")
+        .expect("added song persisted");
+    assert_eq!(track.media_kind, 1);
+}
+
+#[test]
 fn add_track_copies_media_and_persists() {
     let dir = tempfile::tempdir().unwrap();
     sample_fixture(dir.path());

@@ -353,6 +353,7 @@ fn parse_mhit(bytes: &[u8], span: &ChildSpan) -> Result<Mhit, ParseError> {
         duration_ms: read_u32(bytes, at + 0x28)?,
         track_number: read_u32(bytes, at + 0x2C)?,
         disc_number: read_u32(bytes, at + 0x5C)?,
+        media_kind: read_u32(bytes, at + 0x60)?,
         persistent_id: read_u64(bytes, at + 0x70)?,
         mhods,
         unknown_children,
@@ -389,6 +390,7 @@ fn parse_mhyp(bytes: &[u8], span: &ChildSpan) -> Result<Mhyp, ParseError> {
         // as "master" — other nonzero values mean other hidden kinds.
         is_master: bytes[at + 0x14] == 1,
         distinguished_kind: i64::from(bytes[at + 0x14]),
+        media_kind: 0,
         is_smart,
         playlist_id: read_u64(bytes, at + 0x1C)?,
         // Podcast flag lives at 0x2A only on headers long enough to hold it.

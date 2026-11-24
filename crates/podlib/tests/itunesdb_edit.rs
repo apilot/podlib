@@ -109,6 +109,7 @@ fn dataset_span(db: &ItunesDb, index: u32) -> Vec<u8> {
 
 fn delta_addition(title: &str) -> TrackAddition {
     TrackAddition {
+        media_kind_bits: 1,
         title: title.to_owned(),
         artist: Some("Four".to_owned()),
         album: None,

@@ -110,6 +110,7 @@ pub struct Mhyp {
     /// the built-in master playlist.
     pub is_master: bool,
     pub distinguished_kind: i64,
+    pub media_kind: i64,
     /// True when smart-playlist mhods (types 50/51) are present.
     pub is_smart: bool,
     pub playlist_id: u64,
@@ -134,6 +135,7 @@ pub struct Mhit {
     pub duration_ms: u32,
     pub track_number: u32,
     pub disc_number: u32,
+    pub media_kind: u32,
     pub mhods: Vec<Mhod>,
     pub unknown_children: Vec<RawChunk>,
 }

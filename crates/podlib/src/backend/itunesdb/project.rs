@@ -81,7 +81,7 @@ fn domain_track(mhit: &Mhit) -> Track {
         size_bytes: u64::from(mhit.size_bytes),
         has_artwork: false,
         // Classic iTunesDB does not expose media kind here (0 = unknown).
-        media_kind: 0,
+        media_kind: mhit.media_kind,
     }
 }
 

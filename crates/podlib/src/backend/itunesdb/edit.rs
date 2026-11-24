@@ -105,6 +105,9 @@ pub struct TrackAddition {
     pub duration_ms: u32,
     pub track_number: u32,
     pub disc_number: u32,
+    /// iPod media type (1 = music, 8 = audiobook) — lands in the mhit
+    /// kind field at +0x60 so the device views can filter by it.
+    pub media_kind_bits: u32,
 }
 
 /// Error raised when a mutation cannot be applied to the tree.
@@ -1182,6 +1185,7 @@ fn build_mhit(
     patch_u32(&mut raw, 0x28, addition.duration_ms)?;
     patch_u32(&mut raw, 0x2C, addition.track_number)?;
     patch_u32(&mut raw, 0x5C, addition.disc_number)?;
+    patch_u32(&mut raw, 0x60, addition.media_kind_bits)?;
     patch_u64(&mut raw, 0x70, persistent_id)?;
     if header_len >= 0x124 {
         patch_u32(&mut raw, 0x120, album_id)?;
@@ -1204,6 +1208,7 @@ fn build_mhit(
         size_bytes: addition.size_bytes,
         duration_ms: addition.duration_ms,
         track_number: addition.track_number,
+        media_kind: addition.media_kind_bits,
         disc_number: addition.disc_number,
         mhods,
         unknown_children: Vec::new(),
@@ -1330,6 +1335,7 @@ fn build_mhyp(
     Ok(Mhyp {
         // Classic edits stay regular: kind 0 (the 0x14 byte).
         distinguished_kind: 0,
+        media_kind: 0,
         offset: UNASSIGNED,
         raw,
         is_master: false,
@@ -1591,6 +1597,7 @@ mod tests {
 
     fn addition(title: &str) -> TrackAddition {
         TrackAddition {
+            media_kind_bits: 1,
             title: title.to_owned(),
             artist: Some("Artist".to_owned()),
             album: None,

@@ -258,6 +258,7 @@ impl LibraryBackend for ItunesdbBackend {
             duration_ms: draft.duration_ms,
             track_number: draft.track_number,
             disc_number: draft.disc_number,
+            media_kind_bits: draft.media_kind_bits,
         };
         let id = self.db.add_track(&addition).map_err(BackendError::from)?;
         self.persist()?;
@@ -310,6 +311,7 @@ impl LibraryBackend for ItunesdbBackend {
             duration_ms: merged.duration_ms,
             track_number: merged.track_number,
             disc_number: merged.disc_number,
+            media_kind_bits: current.media_kind,
         };
         self.db.remove_track(id).map_err(BackendError::from)?;
         // The re-added id may differ (or be reused when the edited
