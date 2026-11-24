@@ -4840,6 +4840,15 @@ fn context_menu_allowed(app: &PodlibApp) -> bool {
 }
 
 /// Full-window overlay while files hover over the viewport.
+/// Paths shown by the drop overlay: deduplicated, first-seen order.
+fn unique_in_order(paths: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::with_capacity(paths.len());
+    paths
+        .into_iter()
+        .filter(|path| seen.insert(path.clone()))
+        .collect()
+}
+
 fn draw_drop_overlay(ui: &egui::Ui, names: &[String]) {
     let ctx = ui.ctx();
     let painter =
@@ -5239,6 +5248,11 @@ impl eframe::App for PodlibApp {
                     })
                     .collect()
             });
+        // WHY dedup: the X11 DnD race (winit re-sends XdndPosition when
+        // a SelectionNotify is lost) makes egui push duplicate
+        // HoveredFile entries; the drop payload stays correct, so the
+        // overlay just needs unique paths back, in first-seen order.
+        let hovered = unique_in_order(hovered);
         if !hovered.is_empty() {
             draw_drop_overlay(ui, &hovered);
         }
@@ -6557,6 +6571,27 @@ mod tests {
         );
         assert!(review.strip_prefix, "found prefix → checkbox pre-enabled");
         assert_eq!(review.book_title, "drop", "common parent dir name prefills");
+    }
+
+    #[test]
+    fn drop_overlay_names_dedup_keeps_first_seen_order() {
+        // WHY: the X11 DnD race duplicates HoveredFile entries; the
+        // overlay must count unique paths in first-seen order.
+        assert_eq!(
+            unique_in_order(vec![
+                "a.mp3".to_owned(),
+                "a.mp3".to_owned(),
+                "b.mp3".to_owned(),
+                "a.mp3".to_owned(),
+                "c.mp3".to_owned(),
+            ]),
+            vec![
+                "a.mp3".to_owned(),
+                "b.mp3".to_owned(),
+                "c.mp3".to_owned()
+            ]
+        );
+        assert!(unique_in_order(Vec::new()).is_empty());
     }
 
     #[derive(Debug)]
