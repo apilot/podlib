@@ -4970,7 +4970,16 @@ fn password_modal(
                     .id(field_id),
             );
             text_menu::attach_secret_text_menu(&password_field);
-            if ctx.memory(|memory| memory.focused().is_none()) {
+            // WHY reclaim every frame: this field is the only
+            // focusable widget inside the modal (buttons and labels
+            // take no focus, the scrim blocks the outside), so any
+            // foreign focus is stale — a pre-modal click or a dead
+            // retry id (Id::unique opens a fresh id every attempt) —
+            // and silently ate typed sudo passwords (owner: eject
+            // rejected the CORRECT password, log showed 7 chars then
+            // 4). Skipping when the focus already sits here keeps the
+            // frame O(1).
+            if ctx.memory(|memory| memory.focused()) != Some(field_id) {
                 ctx.memory_mut(|memory| memory.request_focus(field_id));
             }
             // Enter submits a non-empty password; an empty one keeps
@@ -6808,6 +6817,45 @@ mod tests {
         password_modal_frame(&mut app, &ctx, vec![escape_pressed()]);
         assert!(!app.confirm_eject, "Esc closes the modal");
         assert!(!app.start_eject, "Esc does not start the eject");
+    }
+
+    #[test]
+    fn password_modal_reclaims_focus_after_it_moves_away() {
+        let mut app = test_app();
+        app.confirm_eject = true;
+        let ctx = egui::Context::default();
+        password_modal_frame(&mut app, &ctx, Vec::new());
+        // Something else takes the focus mid-session (a click outside
+        // the modal field); the modal must take it back — otherwise
+        // the masked field shows nothing while the user keeps typing.
+        let other = egui::Id::unique("toolbar_search");
+        ctx.memory_mut(|memory| memory.request_focus(other));
+        password_modal_frame(&mut app, &ctx, Vec::new());
+        assert_eq!(
+            ctx.memory(|memory| memory.focused()),
+            Some(password_field_id("confirm_eject"))
+        );
+    }
+
+    #[test]
+    fn password_modal_recaptures_typing_after_a_focus_detour() {
+        let mut app = test_app();
+        app.confirm_eject = true;
+        let ctx = egui::Context::default();
+        password_modal_frame(&mut app, &ctx, Vec::new());
+        password_modal_frame(&mut app, &ctx, vec![egui::Event::Text("abc".into())]);
+        assert_eq!(app.password, "abc");
+        // WHY: the live bug — a focus detour (e.g. the click that
+        // opened the dialog) made the modal lose the field forever, so
+        // every later keystroke vanished and sudo got a truncated
+        // password (owner log: 7 chars, then 4).
+        let other = egui::Id::unique("toolbar_search");
+        ctx.memory_mut(|memory| memory.request_focus(other));
+        // Detour frame (no keys): the modal must reclaim the focus
+        // here, so the very next keystroke lands in the field.
+        password_modal_frame(&mut app, &ctx, Vec::new());
+        password_modal_frame(&mut app, &ctx, vec![egui::Event::Text("def".into())]);
+        assert_eq!(app.password, "abcdef", "a focus detour must not eat keystrokes");
     }
 
     // ---- batch F: EVERY eject collects the password through the modal ----
