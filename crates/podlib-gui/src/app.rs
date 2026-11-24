@@ -267,6 +267,9 @@ struct TrackRowActions {
     /// Round 6 П2: a row checkbox was clicked → explicit toggle of
     /// that id in the shared selection.
     checkbox_toggle: Option<TrackId>,
+    /// Books: a book-row checkbox → (the book's track ids, target
+    /// state) — a whole-group add/remove, resolved like «выбрать все».
+    checkbox_group: Option<(Vec<TrackId>, bool)>,
     /// Round 7: a sortable header was clicked → which column.
     sort_toggle: Option<TrackSortColumn>,
 }
@@ -283,6 +286,7 @@ impl TrackRowActions {
             .or(self.remove_from_playlist.take());
         self.select_all = other.select_all.or(self.select_all.take());
         self.checkbox_toggle = other.checkbox_toggle.or(self.checkbox_toggle.take());
+        self.checkbox_group = other.checkbox_group.or(self.checkbox_group.take());
         self.sort_toggle = other.sort_toggle.or(self.sort_toggle.take());
     }
 }
@@ -1419,6 +1423,7 @@ impl PodlibApp {
                 actions.row_click.take(),
                 actions.select_all.take(),
                 actions.checkbox_toggle.take(),
+                actions.checkbox_group.take(),
             );
             library.selected_tracks = update.selected_tracks;
             library.selection_anchor = update.selection_anchor;
@@ -3006,6 +3011,7 @@ fn resolve_selection_actions(
     row_click: Option<(usize, bool, bool)>,
     select_all: Option<bool>,
     checkbox_toggle: Option<TrackId>,
+    checkbox_group: Option<(Vec<TrackId>, bool)>,
 ) -> SelectionUpdate {
     let mut selection = SelectionUpdate {
         selected_tracks: selected_tracks.to_vec(),
@@ -3070,6 +3076,20 @@ fn resolve_selection_actions(
         if selection.selected_tracks.contains(&id) {
             selection.selected_track = Some(id);
         } else if selection.selected_track == Some(id) {
+            selection.selected_track = selection.selected_tracks.last().copied();
+        }
+    }
+    // A book-row checkbox adds or removes the WHOLE track set of that
+    // group; the cursor invariant matches the «выбрать все» uncheck:
+    // it only moves when its own row was swept.
+    if let Some((group, check)) = checkbox_group {
+        selection.selected_tracks =
+            apply_select_all(&selection.selected_tracks, &group, check);
+        let swept = !check
+            && selection
+                .selected_track
+                .is_some_and(|id| group.contains(&id) && !selection.selected_tracks.contains(&id));
+        if swept {
             selection.selected_track = selection.selected_tracks.last().copied();
         }
     }
@@ -5318,6 +5338,78 @@ mod tests {
         // per-site ad-hoc values (the «rounded sidebar, square
         // playlist» report).
         assert_eq!(ROW_HIGHLIGHT_RADIUS, 4.0);
+    }
+
+    #[test]
+    fn group_check_appends_the_books_tracks_and_uncheck_removes_them() {
+        let selected = [TrackId::from_bits(1), TrackId::from_bits(2)];
+        let group = vec![TrackId::from_bits(9), TrackId::from_bits(1)];
+        // Check: the clicked-order selection keeps its rows, the
+        // book's missing tracks append in book order.
+        let update = resolve_selection_actions(
+            &selected,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            Some((group.clone(), true)),
+        );
+        assert_eq!(
+            update.selected_tracks,
+            vec![
+                TrackId::from_bits(1),
+                TrackId::from_bits(2),
+                TrackId::from_bits(9)
+            ]
+        );
+        // Uncheck: the book's tracks leave; the cursor rode one of
+        // them → it moves to the last remaining (the invariant).
+        let update = resolve_selection_actions(
+            &selected,
+            None,
+            Some(TrackId::from_bits(1)),
+            &[],
+            None,
+            None,
+            None,
+            Some((group, false)),
+        );
+        assert_eq!(update.selected_tracks, vec![TrackId::from_bits(2)]);
+        assert_eq!(update.selected_track, Some(TrackId::from_bits(2)));
+    }
+
+    #[test]
+    fn group_uncheck_moves_a_swept_cursor_to_the_last_remaining() {
+        let selected = [TrackId::from_bits(1), TrackId::from_bits(2)];
+        let group = vec![TrackId::from_bits(1), TrackId::from_bits(2)];
+        // The cursor sat on a swept row → nothing remains → None.
+        let update = resolve_selection_actions(
+            &selected,
+            None,
+            Some(TrackId::from_bits(1)),
+            &[],
+            None,
+            None,
+            None,
+            Some((group.clone(), false)),
+        );
+        assert!(update.selected_tracks.is_empty());
+        assert_eq!(update.selected_track, None);
+        // A cursor outside the swept set never moves (bulk edits are
+        // not navigation).
+        let update = resolve_selection_actions(
+            &selected,
+            None,
+            Some(TrackId::from_bits(77)),
+            &[],
+            None,
+            None,
+            None,
+            Some((group, false)),
+        );
+        assert_eq!(update.selected_track, Some(TrackId::from_bits(77)));
     }
 
     #[test]
@@ -7694,6 +7786,7 @@ mod tests {
             Some((1, false, false)),
             None,
             None,
+            None,
         );
         assert_eq!(update.selected_tracks, ids(&[20]));
         assert_eq!(update.selection_anchor, Some((1, TrackId::from_bits(20))));
@@ -7712,6 +7805,7 @@ mod tests {
             Some(TrackId::from_bits(30)),
             &visible,
             Some((2, false, true)),
+            None,
             None,
             None,
         );
@@ -7733,6 +7827,7 @@ mod tests {
             &visible,
             None,
             Some(true),
+            None,
             None,
         );
         assert_eq!(update.selected_tracks, ids(&[9, 1, 2, 3]));
@@ -7756,6 +7851,7 @@ mod tests {
             None,
             Some(false),
             None,
+            None,
         );
         assert_eq!(update.selected_tracks, ids(&[9]), "out-of-view rows survive");
         assert_eq!(
@@ -7777,6 +7873,7 @@ mod tests {
             None,
             None,
             Some(TrackId::from_bits(2)),
+            None,
         );
         assert_eq!(check.selected_tracks, ids(&[1, 2]));
         assert_eq!(check.selected_track, Some(TrackId::from_bits(2)));
@@ -7789,6 +7886,7 @@ mod tests {
             None,
             None,
             Some(TrackId::from_bits(2)),
+            None,
         );
         assert_eq!(uncheck.selected_tracks, ids(&[1]));
         assert_eq!(uncheck.selected_track, Some(TrackId::from_bits(1)), "cursor put");
@@ -7808,6 +7906,7 @@ mod tests {
             None,
             None,
             Some(TrackId::from_bits(2)),
+            None,
         );
         assert_eq!(update.selected_tracks, ids(&[1]));
         assert_eq!(
@@ -7830,6 +7929,7 @@ mod tests {
             None,
             None,
             Some(TrackId::from_bits(5)),
+            None,
         );
         assert_eq!(update.selected_tracks, ids(&[]));
         assert_eq!(update.selected_track, None);
@@ -7848,6 +7948,7 @@ mod tests {
             None,
             None,
             Some(TrackId::from_bits(3)),
+            None,
         );
         assert_eq!(update.selected_tracks, ids(&[1]));
         assert_eq!(update.selected_track, Some(TrackId::from_bits(1)), "cursor put");
@@ -7866,6 +7967,7 @@ mod tests {
             &visible,
             None,
             Some(false),
+            None,
             None,
         );
         assert_eq!(update.selected_tracks, ids(&[]));
