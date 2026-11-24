@@ -1415,16 +1415,16 @@ impl PodlibApp {
             // `cursor` is the value read before rendering and nothing
             // below has touched the field yet, so passing it back is a
             // no-op when no branch moves the cursor.
-            let update = resolve_selection_actions(
-                &library.selected_tracks,
-                library.selection_anchor,
-                cursor,
-                &visible_ids,
-                actions.row_click.take(),
-                actions.select_all.take(),
-                actions.checkbox_toggle.take(),
-                actions.checkbox_group.take(),
-            );
+            let update = resolve_selection_actions(SelectionActionsInput {
+                    selected_tracks: &library.selected_tracks,
+                    selection_anchor: library.selection_anchor,
+                    cursor,
+                    visible_ids: &visible_ids,
+                    row_click: actions.row_click.take(),
+                    select_all: actions.select_all.take(),
+                    checkbox_toggle: actions.checkbox_toggle.take(),
+                    checkbox_group: actions.checkbox_group.take(),
+                });
             library.selected_tracks = update.selected_tracks;
             library.selection_anchor = update.selection_anchor;
             library.selected_track = update.selected_track;
@@ -2993,6 +2993,20 @@ struct SelectionUpdate {
     selected_track: Option<TrackId>,
 }
 
+/// One frame's selection interactions bundled for
+/// [`resolve_selection_actions`] — plain/ctrl/shift row clicks, the
+/// «выбрать все» header toggle, and the row/book checkbox toggles.
+struct SelectionActionsInput<'a> {
+    selected_tracks: &'a [TrackId],
+    selection_anchor: Option<(usize, TrackId)>,
+    cursor: Option<TrackId>,
+    visible_ids: &'a [TrackId],
+    row_click: Option<(usize, bool, bool)>,
+    select_all: Option<bool>,
+    checkbox_toggle: Option<TrackId>,
+    checkbox_group: Option<(Vec<TrackId>, bool)>,
+}
+
 /// Pure selection resolution (review 🟡-3: functions < 50 lines —
 /// extracted from `library_view`): row clicks (plain/ctrl/shift),
 /// «выбрать все» and a row-checkbox toggle, applied in that order to
@@ -3003,16 +3017,17 @@ struct SelectionUpdate {
 /// toggled row; «выбрать все» rewrites the row set and deliberately
 /// leaves the cursor put (review 🟡-1), so Enter/«Изменить…» keep the
 /// row they had before the bulk edit.
-fn resolve_selection_actions(
-    selected_tracks: &[TrackId],
-    selection_anchor: Option<(usize, TrackId)>,
-    cursor: Option<TrackId>,
-    visible_ids: &[TrackId],
-    row_click: Option<(usize, bool, bool)>,
-    select_all: Option<bool>,
-    checkbox_toggle: Option<TrackId>,
-    checkbox_group: Option<(Vec<TrackId>, bool)>,
-) -> SelectionUpdate {
+fn resolve_selection_actions(input: SelectionActionsInput<'_>) -> SelectionUpdate {
+    let SelectionActionsInput {
+        selected_tracks,
+        selection_anchor,
+        cursor,
+        visible_ids,
+        row_click,
+        select_all,
+        checkbox_toggle,
+        checkbox_group,
+    } = input;
     let mut selection = SelectionUpdate {
         selected_tracks: selected_tracks.to_vec(),
         selection_anchor,
@@ -5390,16 +5405,16 @@ mod tests {
         let group = vec![TrackId::from_bits(9), TrackId::from_bits(1)];
         // Check: the clicked-order selection keeps its rows, the
         // book's missing tracks append in book order.
-        let update = resolve_selection_actions(
-            &selected,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            Some((group.clone(), true)),
-        );
+        let update = resolve_selection_actions(SelectionActionsInput {
+                selected_tracks: &selected,
+                selection_anchor: None,
+                cursor: None,
+                visible_ids: &[],
+                row_click: None,
+                select_all: None,
+                checkbox_toggle: None,
+                checkbox_group: Some((group.clone(), true)),
+            });
         assert_eq!(
             update.selected_tracks,
             vec![
@@ -5410,16 +5425,16 @@ mod tests {
         );
         // Uncheck: the book's tracks leave; the cursor rode one of
         // them → it moves to the last remaining (the invariant).
-        let update = resolve_selection_actions(
-            &selected,
-            None,
-            Some(TrackId::from_bits(1)),
-            &[],
-            None,
-            None,
-            None,
-            Some((group, false)),
-        );
+        let update = resolve_selection_actions(SelectionActionsInput {
+                selected_tracks: &selected,
+                selection_anchor: None,
+                cursor: Some(TrackId::from_bits(1)),
+                visible_ids: &[],
+                row_click: None,
+                select_all: None,
+                checkbox_toggle: None,
+                checkbox_group: Some((group, false)),
+            });
         assert_eq!(update.selected_tracks, vec![TrackId::from_bits(2)]);
         assert_eq!(update.selected_track, Some(TrackId::from_bits(2)));
     }
@@ -5429,30 +5444,30 @@ mod tests {
         let selected = [TrackId::from_bits(1), TrackId::from_bits(2)];
         let group = vec![TrackId::from_bits(1), TrackId::from_bits(2)];
         // The cursor sat on a swept row → nothing remains → None.
-        let update = resolve_selection_actions(
-            &selected,
-            None,
-            Some(TrackId::from_bits(1)),
-            &[],
-            None,
-            None,
-            None,
-            Some((group.clone(), false)),
-        );
+        let update = resolve_selection_actions(SelectionActionsInput {
+                selected_tracks: &selected,
+                selection_anchor: None,
+                cursor: Some(TrackId::from_bits(1)),
+                visible_ids: &[],
+                row_click: None,
+                select_all: None,
+                checkbox_toggle: None,
+                checkbox_group: Some((group.clone(), false)),
+            });
         assert!(update.selected_tracks.is_empty());
         assert_eq!(update.selected_track, None);
         // A cursor outside the swept set never moves (bulk edits are
         // not navigation).
-        let update = resolve_selection_actions(
-            &selected,
-            None,
-            Some(TrackId::from_bits(77)),
-            &[],
-            None,
-            None,
-            None,
-            Some((group, false)),
-        );
+        let update = resolve_selection_actions(SelectionActionsInput {
+                selected_tracks: &selected,
+                selection_anchor: None,
+                cursor: Some(TrackId::from_bits(77)),
+                visible_ids: &[],
+                row_click: None,
+                select_all: None,
+                checkbox_toggle: None,
+                checkbox_group: Some((group, false)),
+            });
         assert_eq!(update.selected_track, Some(TrackId::from_bits(77)));
     }
 
@@ -7822,16 +7837,16 @@ mod tests {
     #[test]
     fn resolution_plain_click_from_empty_selection_targets_the_row() {
         let visible = ids(&[10, 20, 30]);
-        let update = resolve_selection_actions(
-            &ids(&[]),
-            None,
-            None,
-            &visible,
-            Some((1, false, false)),
-            None,
-            None,
-            None,
-        );
+        let update = resolve_selection_actions(SelectionActionsInput {
+                selected_tracks: &ids(&[]),
+                selection_anchor: None,
+                cursor: None,
+                visible_ids: &visible,
+                row_click: Some((1, false, false)),
+                select_all: None,
+                checkbox_toggle: None,
+                checkbox_group: None,
+            });
         assert_eq!(update.selected_tracks, ids(&[20]));
         assert_eq!(update.selection_anchor, Some((1, TrackId::from_bits(20))));
         assert_eq!(update.selected_track, Some(TrackId::from_bits(20)));
@@ -7843,16 +7858,16 @@ mod tests {
         // matches the visible list: the shift click must act as a plain
         // click, not select a foreign range.
         let visible = ids(&[10, 20, 30]);
-        let update = resolve_selection_actions(
-            &ids(&[]),
-            Some((1, TrackId::from_bits(99))),
-            Some(TrackId::from_bits(30)),
-            &visible,
-            Some((2, false, true)),
-            None,
-            None,
-            None,
-        );
+        let update = resolve_selection_actions(SelectionActionsInput {
+                selected_tracks: &ids(&[]),
+                selection_anchor: Some((1, TrackId::from_bits(99))),
+                cursor: Some(TrackId::from_bits(30)),
+                visible_ids: &visible,
+                row_click: Some((2, false, true)),
+                select_all: None,
+                checkbox_toggle: None,
+                checkbox_group: None,
+            });
         assert_eq!(update.selected_tracks, ids(&[30]));
         assert_eq!(update.selection_anchor, Some((2, TrackId::from_bits(30))));
         assert_eq!(update.selected_track, Some(TrackId::from_bits(30)));
@@ -7864,16 +7879,16 @@ mod tests {
         // its previous row (review 🟡-1) — Enter must not retarget to
         // the bottom visible row; the anchor is untouched as well.
         let visible = ids(&[1, 2, 3]);
-        let update = resolve_selection_actions(
-            &ids(&[9]),
-            Some((0, TrackId::from_bits(9))),
-            Some(TrackId::from_bits(9)),
-            &visible,
-            None,
-            Some(true),
-            None,
-            None,
-        );
+        let update = resolve_selection_actions(SelectionActionsInput {
+                selected_tracks: &ids(&[9]),
+                selection_anchor: Some((0, TrackId::from_bits(9))),
+                cursor: Some(TrackId::from_bits(9)),
+                visible_ids: &visible,
+                row_click: None,
+                select_all: Some(true),
+                checkbox_toggle: None,
+                checkbox_group: None,
+            });
         assert_eq!(update.selected_tracks, ids(&[9, 1, 2, 3]));
         assert_eq!(update.selection_anchor, Some((0, TrackId::from_bits(9))));
         assert_eq!(update.selected_track, Some(TrackId::from_bits(9)), "cursor put");
@@ -7887,16 +7902,16 @@ mod tests {
         // it re-anchors to the last surviving selection (the hidden
         // id 9 here) instead of ghost-highlighting a cleared row.
         let visible = ids(&[1, 2, 3]);
-        let update = resolve_selection_actions(
-            &ids(&[1, 2, 3, 9]),
-            Some((0, TrackId::from_bits(1))),
-            Some(TrackId::from_bits(3)),
-            &visible,
-            None,
-            Some(false),
-            None,
-            None,
-        );
+        let update = resolve_selection_actions(SelectionActionsInput {
+                selected_tracks: &ids(&[1, 2, 3, 9]),
+                selection_anchor: Some((0, TrackId::from_bits(1))),
+                cursor: Some(TrackId::from_bits(3)),
+                visible_ids: &visible,
+                row_click: None,
+                select_all: Some(false),
+                checkbox_toggle: None,
+                checkbox_group: None,
+            });
         assert_eq!(update.selected_tracks, ids(&[9]), "out-of-view rows survive");
         assert_eq!(
             update.selected_track,
@@ -7909,29 +7924,29 @@ mod tests {
     fn resolution_checkbox_toggle_moves_the_cursor_only_on_check() {
         let visible = ids(&[1, 2]);
         // Checking: the cursor moves to the toggled row.
-        let check = resolve_selection_actions(
-            &ids(&[1]),
-            None,
-            Some(TrackId::from_bits(1)),
-            &visible,
-            None,
-            None,
-            Some(TrackId::from_bits(2)),
-            None,
-        );
+        let check = resolve_selection_actions(SelectionActionsInput {
+                selected_tracks: &ids(&[1]),
+                selection_anchor: None,
+                cursor: Some(TrackId::from_bits(1)),
+                visible_ids: &visible,
+                row_click: None,
+                select_all: None,
+                checkbox_toggle: Some(TrackId::from_bits(2)),
+                checkbox_group: None,
+            });
         assert_eq!(check.selected_tracks, ids(&[1, 2]));
         assert_eq!(check.selected_track, Some(TrackId::from_bits(2)));
         // Unchecking: the cursor stays where it was.
-        let uncheck = resolve_selection_actions(
-            &ids(&[1, 2]),
-            None,
-            Some(TrackId::from_bits(1)),
-            &visible,
-            None,
-            None,
-            Some(TrackId::from_bits(2)),
-            None,
-        );
+        let uncheck = resolve_selection_actions(SelectionActionsInput {
+                selected_tracks: &ids(&[1, 2]),
+                selection_anchor: None,
+                cursor: Some(TrackId::from_bits(1)),
+                visible_ids: &visible,
+                row_click: None,
+                select_all: None,
+                checkbox_toggle: Some(TrackId::from_bits(2)),
+                checkbox_group: None,
+            });
         assert_eq!(uncheck.selected_tracks, ids(&[1]));
         assert_eq!(uncheck.selected_track, Some(TrackId::from_bits(1)), "cursor put");
     }
@@ -7942,16 +7957,16 @@ mod tests {
         // unchecking it must not leave a highlighted-but-unchecked
         // ghost (live report); it re-anchors to the last remaining.
         let visible = ids(&[1, 2, 3]);
-        let update = resolve_selection_actions(
-            &ids(&[1, 2]),
-            None,
-            Some(TrackId::from_bits(2)),
-            &visible,
-            None,
-            None,
-            Some(TrackId::from_bits(2)),
-            None,
-        );
+        let update = resolve_selection_actions(SelectionActionsInput {
+                selected_tracks: &ids(&[1, 2]),
+                selection_anchor: None,
+                cursor: Some(TrackId::from_bits(2)),
+                visible_ids: &visible,
+                row_click: None,
+                select_all: None,
+                checkbox_toggle: Some(TrackId::from_bits(2)),
+                checkbox_group: None,
+            });
         assert_eq!(update.selected_tracks, ids(&[1]));
         assert_eq!(
             update.selected_track,
@@ -7965,16 +7980,16 @@ mod tests {
         // Nothing left to point at: the cursor becomes None instead of
         // hovering over a row the user just deselected.
         let visible = ids(&[5]);
-        let update = resolve_selection_actions(
-            &ids(&[5]),
-            None,
-            Some(TrackId::from_bits(5)),
-            &visible,
-            None,
-            None,
-            Some(TrackId::from_bits(5)),
-            None,
-        );
+        let update = resolve_selection_actions(SelectionActionsInput {
+                selected_tracks: &ids(&[5]),
+                selection_anchor: None,
+                cursor: Some(TrackId::from_bits(5)),
+                visible_ids: &visible,
+                row_click: None,
+                select_all: None,
+                checkbox_toggle: Some(TrackId::from_bits(5)),
+                checkbox_group: None,
+            });
         assert_eq!(update.selected_tracks, ids(&[]));
         assert_eq!(update.selected_track, None);
     }
@@ -7984,16 +7999,16 @@ mod tests {
         // The invariant only bites when the cursor's own row is swept:
         // an uncheck elsewhere leaves it exactly where it was.
         let visible = ids(&[1, 2, 3]);
-        let update = resolve_selection_actions(
-            &ids(&[1, 3]),
-            None,
-            Some(TrackId::from_bits(1)),
-            &visible,
-            None,
-            None,
-            Some(TrackId::from_bits(3)),
-            None,
-        );
+        let update = resolve_selection_actions(SelectionActionsInput {
+                selected_tracks: &ids(&[1, 3]),
+                selection_anchor: None,
+                cursor: Some(TrackId::from_bits(1)),
+                visible_ids: &visible,
+                row_click: None,
+                select_all: None,
+                checkbox_toggle: Some(TrackId::from_bits(3)),
+                checkbox_group: None,
+            });
         assert_eq!(update.selected_tracks, ids(&[1]));
         assert_eq!(update.selected_track, Some(TrackId::from_bits(1)), "cursor put");
     }
@@ -8004,16 +8019,16 @@ mod tests {
         // visible is swept and no out-of-view selection survives, so
         // the cursor has no selected row to point at.
         let visible = ids(&[1, 2]);
-        let update = resolve_selection_actions(
-            &ids(&[1, 2]),
-            Some((0, TrackId::from_bits(1))),
-            Some(TrackId::from_bits(2)),
-            &visible,
-            None,
-            Some(false),
-            None,
-            None,
-        );
+        let update = resolve_selection_actions(SelectionActionsInput {
+                selected_tracks: &ids(&[1, 2]),
+                selection_anchor: Some((0, TrackId::from_bits(1))),
+                cursor: Some(TrackId::from_bits(2)),
+                visible_ids: &visible,
+                row_click: None,
+                select_all: Some(false),
+                checkbox_toggle: None,
+                checkbox_group: None,
+            });
         assert_eq!(update.selected_tracks, ids(&[]));
         assert_eq!(update.selected_track, None);
     }
