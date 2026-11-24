@@ -17,9 +17,10 @@ use egui_extras::{Column, TableBuilder};
 use podlib::{Playlist, PlaylistId, Track, TrackDraft, TrackId};
 
 use crate::device::{self, DeviceCandidate, MountError};
+use crate::i18n::{Key, lang, n_files, n_playlists, n_tracks, tr, trf};
 use crate::library::{
     changes_from_track, drafts_from_paths, guard_playlist_mutation, needs_transcode, panic_message,
-    path_extension, plural, AUDIOBOOK_BIT, EditDialogFields, DraggedTracks, LibraryCommand,
+    path_extension, AUDIOBOOK_BIT, EditDialogFields, DraggedTracks, LibraryCommand,
     LibraryOutcome, LibrarySnapshot, LibraryWorker,
 };
 use crate::system_palette;
@@ -156,16 +157,9 @@ fn deferred_eject_due(pending: bool, busy: bool, library_idle: bool) -> bool {
 /// the eject needs the sudo password for it.
 fn close_confirm_texts(busy: bool) -> (&'static str, &'static str) {
     if busy {
-        (
-            "Идёт операция с библиотекой",
-            "Закрыть всё равно? Возможно повреждение базы на устройстве.",
-        )
+        (tr(Key::CloseBusyTitle), tr(Key::CloseBusyBody))
     } else {
-        (
-            "Закрыть podlib?",
-            "Смонтированное устройство будет безопасно отключено перед \
-             закрытием (понадобится пароль sudo).",
-        )
+        (tr(Key::CloseIdleTitle), tr(Key::CloseIdleBody))
     }
 }
 
@@ -176,16 +170,8 @@ fn close_confirm_texts(busy: bool) -> (&'static str, &'static str) {
 /// may still be mounted».
 fn ejected_failure_hint(failure: device::MountFailure) -> &'static str {
     match failure {
-        device::MountFailure::WrongPassword => {
-            "Пароль sudo отклонён — проверьте раскладку и Caps Lock. \
-             Нажмите „Безопасно отключить“ ещё раз: библиотека уже \
-             закрыта, том не тронут, повторный ввод пароля безопасен."
-        }
-        _ => {
-            "Нажмите „Безопасно отключить“ ещё раз — библиотека уже \
-             закрыта и повторная попытка безопасна; том мог остаться \
-             смонтированным."
-        }
+        device::MountFailure::WrongPassword => tr(Key::EjectHintWrongPassword),
+        _ => tr(Key::EjectHintRetry),
     }
 }
 fn close_decision(
@@ -538,12 +524,12 @@ impl PodlibApp {
                             entry.candidate.label.clone(),
                         )
                     })
-                    .unwrap_or_else(|| (Default::default(), "устройство".to_owned()));
+                    .unwrap_or_else(|| (Default::default(), tr(Key::DeviceWord).to_owned()));
                 self.connected = Some(ConnectedDevice {
                     block_dev,
                     label,
                 });
-                self.status = "Открываю библиотеку…".to_owned();
+                self.status = tr(Key::StatusOpening).to_owned();
                 self.start_library(mount);
             }
             DeviceEvent::Connected(Err(error)) => {
@@ -554,11 +540,8 @@ impl PodlibApp {
                         stderr: Some(stderr),
                     },
                     ConnectError::Internal(message) => UiError {
-                        message: format!("Внутренняя ошибка операции: {message}"),
-                        hint: Some(
-                            "Состояние операции после сбоя неизвестно; нажмите «Обновить»."
-                                .to_owned(),
-                        ),
+                        message: trf(Key::ErrInternalOp, &[("message", &message)]),
+                        hint: Some(tr(Key::HintOpStateUnknownRefresh).to_owned()),
                         stderr: None,
                     },
                 });
@@ -568,7 +551,7 @@ impl PodlibApp {
                 self.connected = None;
                 self.error = None;
                 self.mounted_by_us = false;
-                self.status = "Устройство безопасно отключено".to_owned();
+                self.status = tr(Key::StatusEjected).to_owned();
                 self.refresh_devices();
                 // Round 5.3: a close requested while the device was
                 // mounted completes after the eject lands.
@@ -669,12 +652,12 @@ impl PodlibApp {
                         // Russian plural forms: «1 трек», «2 трека», «5 треков».
                         let tracks = library.snapshot.tracks.len();
                         let playlists = library.snapshot.playlists.len();
-                        self.status = format!(
-                            "Подключено: {} {}, {} {}",
-                            tracks,
-                            plural(tracks, "трек", "трека", "треков"),
-                            playlists,
-                            plural(playlists, "плейлист", "плейлиста", "плейлистов"),
+                        self.status = trf(
+                            Key::ConnectedStatus,
+                            &[
+                                ("tracks", &n_tracks(lang(), tracks)),
+                                ("playlists", &n_playlists(lang(), playlists)),
+                            ],
                         );
                     }
                 }
@@ -695,8 +678,8 @@ impl PodlibApp {
                 }
                 Err(TryRecvError::Disconnected) => {
                     self.error = Some(UiError {
-                        message: "Воркер библиотеки завершился, не открыв её".to_owned(),
-                        hint: Some("Подключите устройство заново.".to_owned()),
+                        message: tr(Key::ErrWorkerDiedNoOpen).to_owned(),
+                        hint: Some(tr(Key::HintReconnect).to_owned()),
                         stderr: None,
                     });
                     self.library = None;
@@ -726,7 +709,7 @@ impl PodlibApp {
                     if let Some(library) = self.library.as_mut() {
                         library.snapshot = snapshot;
                     }
-                    self.status = "Список обновлён".to_owned();
+                    self.status = tr(Key::StatusListRefreshed).to_owned();
                 }
                 Ok(LibraryOutcome::Applied { snapshot, summary }) => {
                     if let Some(library) = self.library.as_mut() {
@@ -782,12 +765,8 @@ impl PodlibApp {
                 }
                 Err(TryRecvError::Disconnected) => {
                     self.error = Some(UiError {
-                        message: "Воркер библиотеки завершился во время операции".to_owned(),
-                        hint: Some(
-                            "Состояние операции неизвестно; отключите и подключите устройство \
-                             заново."
-                                .to_owned(),
-                        ),
+                        message: tr(Key::ErrWorkerDiedMidOp).to_owned(),
+                        hint: Some(tr(Key::HintOpStateUnknownReconnect).to_owned()),
                         stderr: None,
                     });
                     self.library = None;
@@ -823,7 +802,7 @@ impl PodlibApp {
                     purge_media: purge,
                 },
                 PendingKind::RemoveTrack,
-                "Удаляю трек…",
+                tr(Key::StatusDeletingTrack),
             );
         }
     }
@@ -843,7 +822,7 @@ impl PodlibApp {
         // connecting a device instead of a wait that would never end.
         let Some(library) = self.library.as_ref() else {
             self.error = Some(UiError {
-                message: "Сначала подключите устройство".to_owned(),
+                message: tr(Key::ErrConnectFirst).to_owned(),
                 hint: None,
                 stderr: None,
             });
@@ -854,7 +833,7 @@ impl PodlibApp {
             // context-menu choices are not gated on idleness, so a busy
             // worker must refuse visibly instead of ignoring the request.
             self.error = Some(UiError {
-                message: "Дождитесь завершения текущей операции".to_owned(),
+                message: tr(Key::ErrWaitOperation).to_owned(),
                 hint: None,
                 stderr: None,
             });
@@ -887,8 +866,8 @@ impl PodlibApp {
         };
         let Some(block_dev) = entry.block_dev.clone() else {
             self.error = Some(UiError {
-                message: "Не удалось определить блочное устройство по sysfs".to_owned(),
-                hint: Some("Нажмите «Обновить» и выберите устройство заново.".to_owned()),
+                message: tr(Key::ErrBlockDevSysfs).to_owned(),
+                hint: Some(tr(Key::HintPressRefresh).to_owned()),
                 stderr: None,
             });
             return;
@@ -898,7 +877,7 @@ impl PodlibApp {
             // W4: nothing has run yet, so the UI error must not claim a
             // mounted volume — surfaced locally, worker never spawned.
             self.error = Some(UiError {
-                message: "не удалось определить uid/gid процесса".to_owned(),
+                message: tr(Key::ErrUidGid).to_owned(),
                 hint: None,
                 stderr: None,
             });
@@ -918,7 +897,8 @@ impl PodlibApp {
         self.rx = Some(rx);
         self.busy = true;
         self.error = None;
-        self.status = format!("Монтирование {} (rw)…", block_dev.display());
+        self.status =
+            trf(Key::StatusMounting, &[("dev", &block_dev.display().to_string())]);
         std::thread::spawn(move || {
             // catch_unwind: a worker panic must still produce an event,
             // otherwise the UI would silently stay busy forever.
@@ -951,9 +931,21 @@ impl PodlibApp {
         // only — never the content — so an empty/short delivery is
         // distinguishable from a typed-but-rejected password.
         eprintln!(
-            "[eject] пароль sudo: {} симв., ascii={}",
-            password.chars().count(),
-            password.bytes().all(|byte| byte.is_ascii()),
+            "{}",
+            trf(
+                Key::LogSudoPassword,
+                &[
+                    ("count", &password.chars().count().to_string()),
+                    (
+                        "ascii",
+                        if password.bytes().all(|byte| byte.is_ascii()) {
+                            "true"
+                        } else {
+                            "false"
+                        }
+                    ),
+                ],
+            )
         );
         // Take the library out: the backend must be closed (and joined)
         // before the unmount sequence, on the eject thread itself.
@@ -963,8 +955,7 @@ impl PodlibApp {
         self.rx = Some(rx);
         self.busy = true;
         self.error = None;
-        self.status =
-            "Отключение: закрытие библиотеки → sync → unmount → power-off…".to_owned();
+        self.status = tr(Key::StatusEjecting).to_owned();
         std::thread::spawn(move || {
             if let Some(library) = library {
                 // Blocking close: the backend owns files on the mounted
@@ -1005,7 +996,7 @@ impl PodlibApp {
                     drop(password);
                     Ok(())
                 },
-                |message| format!("внутренняя ошибка: {message}"),
+                |message| trf(Key::ErrPanicGeneric, &[("message", &message)]),
             );
             let _ = tx.send(DeviceEvent::Ejected(result));
             ctx.request_repaint();
@@ -1015,20 +1006,17 @@ impl PodlibApp {
     // ---- panels ----
 
     fn device_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Устройство");
+        ui.heading(tr(Key::HeadingDevice));
         ui.add_space(4.0);
         if ui
-            .add_enabled(!self.busy, egui::Button::new("Обновить"))
+            .add_enabled(!self.busy, egui::Button::new(tr(Key::BtnRefresh)))
             .clicked()
         {
             self.refresh_devices();
         }
         ui.separator();
         if self.devices.is_empty() {
-            ui.label(
-                "Устройства не найдены. Подключите устройство по USB и нажмите \
-                 «Обновить» — podlib находит iPod по sysfs даже без automount.",
-            );
+            ui.label(tr(Key::DevicesNotFound));
             return;
         }
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1042,14 +1030,14 @@ impl PodlibApp {
                     .block_dev
                     .as_deref()
                     .map(|dev| dev.display().to_string())
-                    .unwrap_or_else(|| "блочное устройство не определено".to_owned());
+                    .unwrap_or_else(|| tr(Key::BlockDevUnresolved).to_owned());
                 // Unmounted candidates show the planned mount point so
                 // the user knows where «Подключить» will put the volume.
                 let place = match entry.candidate.kind {
                     device::CandidateKind::Mounted => entry.candidate.mount.display().to_string(),
-                    device::CandidateKind::Unmounted => format!(
-                        "не смонтирован → будет в {}",
-                        entry.candidate.mount.display()
+                    device::CandidateKind::Unmounted => trf(
+                        Key::NotMountedWillBe,
+                        &[("path", &entry.candidate.mount.display().to_string())],
                     ),
                 };
                 let text = format!("{}\n{}\n{}", entry.candidate.label, place, dev);
@@ -1059,7 +1047,7 @@ impl PodlibApp {
         ui.separator();
         let ready = !self.busy && self.connected.is_none() && self.selected.is_some();
         if ui
-            .add_enabled(ready, egui::Button::new("Подключить"))
+            .add_enabled(ready, egui::Button::new(tr(Key::BtnConnect)))
             .clicked()
         {
             self.password.clear();
@@ -1077,7 +1065,7 @@ impl PodlibApp {
                     Some(connected) => {
                         let ready = !self.busy && self.library_idle();
                         if ui
-                            .add_enabled(ready, egui::Button::new("Безопасно отключить"))
+                            .add_enabled(ready, egui::Button::new(tr(Key::BtnEject)))
                             .clicked()
                         {
                             self.password.clear();
@@ -1105,7 +1093,7 @@ impl PodlibApp {
                         );
                     }
                     None => {
-                        ui.label(egui::RichText::new("Нет устройства").weak());
+                        ui.label(egui::RichText::new(tr(Key::AppbarNoDevice)).weak());
                     }
                 }
             });
@@ -1127,7 +1115,7 @@ impl PodlibApp {
             } else if self.error.is_none() {
                 // Round 5.3 Ф1: the bar never looks empty/missing —
                 // a neutral text keeps its height and presence.
-                ui.label(egui::RichText::new("Готово").weak());
+                ui.label(egui::RichText::new(tr(Key::StatusReady)).weak());
             }
             if let Some(error) = &self.error {
                 ui.colored_label(ui.visuals().error_fg_color, &error.message)
@@ -1135,8 +1123,7 @@ impl PodlibApp {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
-                    egui::RichText::new("Перетащите аудиофайлы в окно, чтобы добавить")
-                        .weak(),
+                    egui::RichText::new(tr(Key::EmptyDropFiles)).weak(),
                 );
             });
         });
@@ -1184,7 +1171,7 @@ impl PodlibApp {
                     ));
                 }
                 if !views.is_empty() {
-                    sidebar_section_header(ui, "Устройство");
+                    sidebar_section_header(ui, tr(Key::HeadingDevice));
                     for playlist in &views {
                         actions.merge(playlist_row(
                             ui,
@@ -1199,10 +1186,10 @@ impl PodlibApp {
                     // The «+» affordance rides the header row (moved
                     // from the old duplicated heading); it opens the
                     // same create modal as the bottom button.
-                    let add_rect = sidebar_section_header(ui, "Плейлисты");
+                    let add_rect = sidebar_section_header(ui, tr(Key::HeadingPlaylists));
                     if ui
                         .put(add_rect, egui::Button::new("+"))
-                        .on_hover_text("Новый плейлист")
+                        .on_hover_text(tr(Key::TtNewPlaylist))
                         .clicked()
                     {
                         library.create_open = true;
@@ -1226,7 +1213,7 @@ impl PodlibApp {
             library.selected_track = None;
         }
         ui.separator();
-        if ui.button("+ Новый плейлист").clicked() {
+        if ui.button(tr(Key::BtnNewPlaylist)).clicked() {
             library.create_open = true;
             library.new_playlist_name.clear();
         }
@@ -1495,7 +1482,7 @@ impl PodlibApp {
             self.library_request(
                 LibraryCommand::Refresh,
                 PendingKind::Refresh,
-                "Обновляю список…",
+                tr(Key::StatusRefreshing),
             );
         }
         if let Some((playlist, track_ids)) = self.pending_remove_from_playlist.take() {
@@ -1505,7 +1492,7 @@ impl PodlibApp {
                     track_ids,
                 },
                 PendingKind::RemoveFromPlaylist,
-                "Убираю из плейлиста…",
+                tr(Key::StatusRemovingFromPlaylist),
             );
         }
         self.apply_track_actions(actions);
@@ -1547,7 +1534,7 @@ impl PodlibApp {
                     track_ids: vec![member],
                 },
                 PendingKind::RemoveFromPlaylist,
-                "Убираю из плейлиста…",
+                tr(Key::StatusRemovingFromPlaylist),
             );
         }
     }
@@ -1556,11 +1543,8 @@ impl PodlibApp {
     fn apply_playlist_actions(&mut self, actions: PlaylistPanelActions) {
         if let Some(name) = actions.master_drop {
             self.error = Some(UiError {
-                message: format!("«{name}» — мастер-плейлист: добавлять в него нельзя"),
-                hint: Some(
-                    "Создайте пользовательский плейлист («+ Плейлист») и бросьте трек на него."
-                        .to_owned(),
-                ),
+                message: trf(Key::ErrMasterDrop, &[("name", &name)]),
+                hint: Some(tr(Key::HintCreateUserPlaylist).to_owned()),
                 stderr: None,
             });
         }
@@ -1570,10 +1554,8 @@ impl PodlibApp {
             // user-playlist operations, explained up front, no round
             // trip to the device.
             self.error = Some(UiError {
-                message: format!("«{name}» — мастер-плейлист: его нельзя переименовать или удалить"),
-                hint: Some(
-                    "Изменять можно только пользовательские плейлисты.".to_owned(),
-                ),
+                message: trf(Key::ErrMasterRenameDelete, &[("name", &name)]),
+                hint: Some(tr(Key::HintOnlyUserPlaylists).to_owned()),
                 stderr: None,
             });
         }
@@ -1584,7 +1566,7 @@ impl PodlibApp {
                     track_ids,
                 },
                 PendingKind::AddToPlaylist,
-                "Добавляю в плейлист…",
+                tr(Key::StatusAddingToPlaylist),
             );
         }
         if let Some(id) = actions.rename_playlist {
@@ -1615,13 +1597,14 @@ impl PodlibApp {
     /// Looks a playlist up for a mutation and runs the guard. `Ok``
     /// carries the playlist so the caller can prefill dialogs from it.
     fn guarded_playlist(&self, id: PlaylistId) -> Result<&Playlist, String> {
-        let library = self.library.as_ref().ok_or_else(|| {
-            "Сначала подключите устройство".to_owned()
-        })?;
+        let library = self
+            .library
+            .as_ref()
+            .ok_or_else(|| tr(Key::ErrConnectFirst).to_owned())?;
         let playlist = library
             .snapshot
             .playlist(id)
-            .ok_or_else(|| format!("Плейлист не найден (id {id})"))?;
+            .ok_or_else(|| trf(Key::ErrPlaylistNotFound, &[("id", &id.to_string())]))?;
         guard_playlist_mutation(playlist)?;
         Ok(playlist)
     }
@@ -1630,9 +1613,7 @@ impl PodlibApp {
     fn refuse_guarded(&mut self, message: String) {
         self.error = Some(UiError {
             message,
-            hint: Some(
-                "Изменять можно только пользовательские плейлисты.".to_owned(),
-            ),
+            hint: Some(tr(Key::HintOnlyUserPlaylists).to_owned()),
             stderr: None,
         });
     }
@@ -1680,7 +1661,10 @@ impl PodlibApp {
         }
         if drafts.is_empty() {
             if !skipped.is_empty() {
-                self.status = format!("Пропущены не-аудио файлы: {}", skipped.join(", "));
+                self.status = trf(
+                    Key::StatusSkippedNonAudio,
+                    &[("list", &skipped.join(", "))],
+                );
             }
             return;
         }
@@ -1738,12 +1722,9 @@ impl PodlibApp {
             ctx,
             "confirm_mount",
             &mut self.password,
-            "Подключить устройство (запись)",
-            "Система монтирует том HFS+ только для чтения; для записи нужен \
-             повторный mount с force. Пароль sudo нужен, потому что \
-             монтирование — системное действие; он передаётся напрямую \
-             команде sudo и нигде не сохраняется.",
-            "Подключить",
+            tr(Key::MountModalTitle),
+            tr(Key::MountModalBody),
+            tr(Key::BtnConnect),
         );
         if decision == PasswordModal::Confirmed {
             self.start_mount = true; // act after the frame (borrow rules)
@@ -1763,12 +1744,9 @@ impl PodlibApp {
             ctx,
             "confirm_eject",
             &mut self.password,
-            "Безопасно отключить устройство?",
-            "Будут выполнены: закрытие библиотеки, sync, unmount (с др\
-             ейном слоёв) и power-off под sudo. Убедитесь, что операции \
-             записи завершены. Пароль передаётся напрямую команде sudo и \
-             нигде не сохраняется.",
-            "Отключить",
+            tr(Key::EjectModalTitle),
+            tr(Key::EjectModalBody),
+            tr(Key::BtnEjectShort),
         );
         if decision == PasswordModal::Confirmed {
             self.start_eject = true;
@@ -1819,10 +1797,10 @@ impl PodlibApp {
                 ui.close();
             }
             ui.horizontal(|ui| {
-                if ui.button("Отмена").clicked() {
+                if ui.button(tr(Key::BtnCancel)).clicked() {
                     ui.close();
                 }
-                if ui.button("Закрыть").clicked() {
+                if ui.button(tr(Key::BtnClose)).clicked() {
                     confirmed = true;
                     ui.close();
                 }
@@ -1875,13 +1853,12 @@ impl PodlibApp {
                 .and_then(|library| library.snapshot.track(track_ids[0]))
                 .map(|track| track.title.clone())
                 .unwrap_or_default();
-            format!("Удалить трек «{title}»?")
+            trf(Key::DeleteTrackTitle, &[("title", &title)])
         } else {
             let count = track_ids.len();
-            format!(
-                "Удалить {} {}?",
-                count,
-                plural(count, "трек", "трека", "треков")
+            trf(
+                Key::DeleteTracksTitle,
+                &[("tracks", &n_tracks(lang(), count))],
             )
         };
         let mut confirmed = false;
@@ -1890,22 +1867,17 @@ impl PodlibApp {
             ui.set_width(440.0);
             ui.heading(title_line);
             ui.add_space(MODAL_GAP);
-            ui.label("Треки исчезнут из библиотеки и всех плейлистов.");
+            ui.label(tr(Key::DeleteTrackNote));
             if let Some(library) = self.library.as_mut() {
                 // The checkbox lives in the state so it survives frames.
                 let label = if track_ids.len() == 1 {
-                    "Удалить и медиа-файл с устройства"
+                    tr(Key::PurgeOne)
                 } else {
-                    "Удалить и медиа-файлы с устройства"
+                    tr(Key::PurgeMany)
                 };
                 ui.checkbox(&mut library.purge_media, label);
             }
-            ui.label(
-                egui::RichText::new(
-                    "Без галочки аудиофайлы останутся на диске как «осиротевшие».",
-                )
-                .weak(),
-            );
+            ui.label(egui::RichText::new(tr(Key::PurgeNote)).weak());
             ui.separator();
             // Enter confirms the primary action («Удалить») at the
             // input level, regardless of focus — the same pattern as
@@ -1915,10 +1887,10 @@ impl PodlibApp {
                 ui.close();
             }
             ui.horizontal(|ui| {
-                if ui.button("Отмена").clicked() {
+                if ui.button(tr(Key::BtnCancel)).clicked() {
                     ui.close();
                 }
-                if ui.button("Удалить").clicked() {
+                if ui.button(tr(Key::BtnDelete)).clicked() {
                     confirmed = true;
                     ui.close();
                 }
@@ -1948,7 +1920,7 @@ impl PodlibApp {
                     purge_media: purge,
                 },
                 PendingKind::RemoveTrack,
-                "Удаляю трек…",
+                tr(Key::StatusDeletingTrack),
             );
         }
     }
@@ -1971,9 +1943,9 @@ impl PodlibApp {
         let response =
             podlib_modal(ctx, egui::Id::unique("confirm_delete_playlist")).show(ctx, |ui| {
                 ui.set_width(400.0);
-                ui.heading(format!("Удалить плейлист «{name}»?"));
+                ui.heading(trf(Key::DeletePlaylistTitle, &[("name", &name)]));
                 ui.add_space(MODAL_GAP);
-                ui.label("Сами треки останутся в библиотеке.");
+                ui.label(tr(Key::DeletePlaylistNote));
                 ui.separator();
                 // Enter confirms the primary action («Удалить») at the
                 // input level, regardless of focus — the same pattern as
@@ -1983,10 +1955,10 @@ impl PodlibApp {
                     ui.close();
                 }
                 ui.horizontal(|ui| {
-                    if ui.button("Отмена").clicked() {
+                    if ui.button(tr(Key::BtnCancel)).clicked() {
                         ui.close();
                     }
-                    if ui.button("Удалить").clicked() {
+                    if ui.button(tr(Key::BtnDelete)).clicked() {
                         confirmed = true;
                         ui.close();
                     }
@@ -2001,7 +1973,7 @@ impl PodlibApp {
             self.library_request(
                 LibraryCommand::DeletePlaylist { id: playlist_id },
                 PendingKind::DeletePlaylist,
-                "Удаляю плейлист…",
+                tr(Key::StatusDeletingPlaylist),
             );
         }
     }
@@ -2016,16 +1988,16 @@ impl PodlibApp {
         // inner margins — one look with the edit modal (MODAL_MARGIN).
         let response = podlib_modal(ctx, egui::Id::unique("create_playlist")).show(ctx, |ui| {
                 ui.set_width(380.0);
-                ui.heading("Новый плейлист");
+                ui.heading(tr(Key::CreatePlaylistTitle));
                 ui.add_space(MODAL_GAP);
                 let Some(library) = self.library.as_mut() else {
                     return;
                 };
                 ui.horizontal(|ui| {
-                    ui.label("Название:");
+                    ui.label(tr(Key::LabelName));
                     let name = ui.add(
                         egui::TextEdit::singleline(&mut library.new_playlist_name)
-                            .hint_text("Название плейлиста…")
+                            .hint_text(tr(Key::HintPlaylistName))
                             .desired_width(ui.available_width()),
                     );
                     text_menu::attach_text_menu(&name);
@@ -2046,11 +2018,11 @@ impl PodlibApp {
                 // added = rightmost (right_to_left layout).
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let ready = !library.new_playlist_name.trim().is_empty();
-                    if ui.add_enabled(ready, egui::Button::new("Создать")).clicked() {
+                    if ui.add_enabled(ready, egui::Button::new(tr(Key::BtnCreate))).clicked() {
                         confirmed = true;
                         ui.close();
                     }
-                    if ui.button("Отмена").clicked() {
+                    if ui.button(tr(Key::BtnCancel)).clicked() {
                         ui.close();
                     }
                 });
@@ -2064,7 +2036,7 @@ impl PodlibApp {
             self.library_request(
                 LibraryCommand::CreatePlaylist { name },
                 PendingKind::CreatePlaylist,
-                "Создаю плейлист…",
+                tr(Key::StatusCreatingPlaylist),
             );
         }
     }
@@ -2094,7 +2066,7 @@ impl PodlibApp {
         // inner margins — one look with the edit modal (MODAL_MARGIN).
         let response = podlib_modal(ctx, egui::Id::unique("rename_playlist")).show(ctx, |ui| {
                 ui.set_width(380.0);
-                ui.heading("Переименовать плейлист");
+                ui.heading(tr(Key::RenamePlaylistTitle));
                 ui.add_space(MODAL_GAP);
                 let Some(library) = self.library.as_mut() else {
                     return;
@@ -2103,10 +2075,10 @@ impl PodlibApp {
                     return;
                 };
                 ui.horizontal(|ui| {
-                    ui.label("Название:");
+                    ui.label(tr(Key::LabelName));
                     let name = ui.add(
                         egui::TextEdit::singleline(&mut dialog.name)
-                            .hint_text("Новое название…")
+                            .hint_text(tr(Key::HintNewName))
                             .desired_width(ui.available_width()),
                     );
                     text_menu::attach_text_menu(&name);
@@ -2127,10 +2099,10 @@ impl PodlibApp {
                 // Primary action hugs the bottom-right corner; first
                 // added = rightmost (right_to_left layout).
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Отмена").clicked() {
+                    if ui.button(tr(Key::BtnCancel)).clicked() {
                         ui.close();
                     }
-                    if ui.add_enabled(ready, egui::Button::new("Сохранить")).clicked() {
+                    if ui.add_enabled(ready, egui::Button::new(tr(Key::BtnSave))).clicked() {
                         confirmed = true;
                         ui.close();
                     }
@@ -2149,7 +2121,7 @@ impl PodlibApp {
                     name,
                 },
                 PendingKind::RenamePlaylist,
-                "Переименовываю плейлист…",
+                tr(Key::StatusRenamingPlaylist),
             );
         }
     }
@@ -2183,20 +2155,22 @@ impl PodlibApp {
             // confirmation («Удалить трек «X»?»).
             let value_trimmed = dialog.value.trim().to_owned();
             if value_trimmed.is_empty() {
-                ui.heading(format!(
-                    "Присвоить исполнителя выбранным трекам ({count})?"
+                ui.heading(trf(
+                    Key::SetArtistTitlePlain,
+                    &[("count", &count.to_string())],
                 ));
             } else {
-                ui.heading(format!(
-                    "Присвоить исполнителя «{value_trimmed}» выбранным трекам ({count})?"
+                ui.heading(trf(
+                    Key::SetArtistTitleValue,
+                    &[("value", &value_trimmed), ("count", &count.to_string())],
                 ));
             }
             ui.add_space(MODAL_GAP);
             ui.horizontal(|ui| {
-                ui.label("Исполнитель:");
+                ui.label(tr(Key::LabelArtist));
                 let field = ui.add(
                     egui::TextEdit::singleline(&mut dialog.value)
-                        .hint_text("Артист")
+                        .hint_text(tr(Key::ArtistHint))
                         .desired_width(ui.available_width()),
                 );
                 text_menu::attach_text_menu(&field);
@@ -2215,10 +2189,10 @@ impl PodlibApp {
                 ui.close();
             }
             ui.horizontal(|ui| {
-                if ui.button("Отмена").clicked() {
+                if ui.button(tr(Key::BtnCancel)).clicked() {
                     ui.close();
                 }
-                if ui.add_enabled(ready, egui::Button::new("Присвоить")).clicked() {
+                if ui.add_enabled(ready, egui::Button::new(tr(Key::BtnApplyArtist))).clicked() {
                     confirmed = true;
                     ui.close();
                 }
@@ -2236,7 +2210,7 @@ impl PodlibApp {
                     artist,
                 },
                 PendingKind::SetArtist,
-                "Задаю исполнителя…",
+                tr(Key::StatusSettingArtist),
             );
         }
     }
@@ -2254,15 +2228,9 @@ impl PodlibApp {
         // dialog breathes; the playlist modals share MODAL_MARGIN.
         let response = podlib_modal(ctx, egui::Id::unique("edit_track")).show(ctx, |ui| {
                 ui.set_width(500.0);
-                ui.heading("Изменить трек");
+                ui.heading(tr(Key::EditTrackTitle));
                 ui.add_space(MODAL_GAP);
-                ui.label(
-                    egui::RichText::new(
-                        "Жанр не редактируется: библиотека не отдаёт его при чтении, \
-                         и правка перезаписала бы его пустым значением.",
-                    )
-                    .weak(),
-                );
+                ui.label(egui::RichText::new(tr(Key::GenreNote)).weak());
                 ui.add_space(MODAL_GAP);
                 let Some(library) = self.library.as_mut() else {
                     return;
@@ -2299,7 +2267,7 @@ impl PodlibApp {
         match attempt {
             // Unchanged dialog → no request, so the id survives by contract.
             Some(Ok(changes)) if changes.is_empty() => {
-                self.status = "Изменений нет".to_owned();
+                self.status = tr(Key::StatusNoChanges).to_owned();
             }
             Some(Ok(changes)) => {
                 self.library_request(
@@ -2308,7 +2276,7 @@ impl PodlibApp {
                         changes,
                     },
                     PendingKind::EditTrack,
-                    "Сохраняю изменения…",
+                    tr(Key::StatusSavingChanges),
                 );
             }
             // Validation failure: reopen with the inline error.
@@ -2346,7 +2314,7 @@ impl PodlibApp {
             &review.book_title,
             &review.author,
             &review.rows,
-            texts.empty_title,
+            tr(texts.empty_title),
         ) {
             Ok(drafts) => {
                 let transcodes = drafts
@@ -2392,17 +2360,19 @@ impl PodlibApp {
             // Kind-aware texts (round 6 tail nit-8): audiobooks speak
             // «книга/автор», music «альбом/исполнитель».
             let texts = tag_review_texts(review.kind_bits);
-            let title = format!(
-                "Добавление {}: проверьте теги ({} файлов)",
-                texts.subject,
-                review.rows.len()
+            let title = trf(
+                Key::TagReviewHeading,
+                &[
+                    ("subject", tr(texts.subject)),
+                    ("files", &review.rows.len().to_string()),
+                ],
             );
             ui.set_width(560.0);
             ui.heading(title);
             ui.add_space(MODAL_GAP);
-            ui.label("Общее для всех файлов");
+            ui.label(tr(Key::TagReviewCommon));
             ui.horizontal(|ui| {
-                ui.label(texts.title_field);
+                ui.label(tr(texts.title_field));
                 let book_title = ui.add(
                     egui::TextEdit::singleline(&mut review.book_title)
                         .desired_width(320.0),
@@ -2410,10 +2380,10 @@ impl PodlibApp {
                 text_menu::attach_text_menu(&book_title);
             });
             if review.validation_attempted && review.book_title.trim().is_empty() {
-                ui.colored_label(ui.visuals().error_fg_color, texts.empty_title);
+                ui.colored_label(ui.visuals().error_fg_color, tr(texts.empty_title));
             }
             ui.horizontal(|ui| {
-                ui.label(texts.author_field);
+                ui.label(tr(texts.author_field));
                 let author = ui.add(
                     egui::TextEdit::singleline(&mut review.author).desired_width(320.0),
                 );
@@ -2424,7 +2394,7 @@ impl PodlibApp {
                 if ui
                     .checkbox(
                         &mut review.strip_prefix,
-                        format!("Убрать общий префикс из названий: «{prefix}»"),
+                        trf(Key::StripPrefix, &[("prefix", &prefix)]),
                     )
                     .changed()
                 {
@@ -2434,7 +2404,7 @@ impl PodlibApp {
                     retoggle_prefix_titles(&mut review.rows, &prefix, review.strip_prefix);
                 }
             }
-            ui.label("Файлы — проверьте названия (Tab — переход между полями):");
+            ui.label(tr(Key::FilesCheckTitles));
             // Round 5.7 bug 2: NO dnd wrapper here — an empty-payload
             // drag source sat on top of the row and swallowed mouse
             // clicks, so the title TextEdit could only be focused via
@@ -2510,11 +2480,11 @@ impl PodlibApp {
             }
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("Отмена").clicked() {
+                if ui.button(tr(Key::BtnCancel)).clicked() {
                     cancelled = true;
                     ui.close();
                 }
-                if ui.button(texts.add_button).clicked() {
+                if ui.button(tr(texts.add_button)).clicked() {
                     review.validation_attempted = true;
                     if !review.book_title.trim().is_empty() {
                         committed = true;
@@ -2560,13 +2530,13 @@ impl PodlibApp {
         let mut chosen: Option<PlaylistId> = None;
         let response = podlib_modal(ctx, egui::Id::unique("add_to_playlist")).show(ctx, |ui| {
             ui.set_width(360.0);
-            ui.heading("Добавить в плейлист");
+            ui.heading(tr(Key::AddToPlaylistTitle));
             ui.add_space(MODAL_GAP);
             egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                 for playlist in &playlists {
                     let guarded = guard_playlist_mutation(playlist).is_err();
                     let label = if guarded {
-                        format!("{} (нельзя)", playlist.name)
+                        trf(Key::PlaylistNotAllowed, &[("name", &playlist.name)])
                     } else {
                         playlist.name.clone()
                     };
@@ -2599,7 +2569,7 @@ impl PodlibApp {
                     track_ids,
                 },
                 PendingKind::AddToPlaylist,
-                "Добавляю в плейлист…",
+                tr(Key::StatusAddingToPlaylist),
             );
         }
     }
@@ -2638,18 +2608,19 @@ fn picker_close(
 /// disabled by the idle gates and the spinner shows in the status area.
 fn batch_add_status(count: usize, transcode_count: usize, skipped: &[String]) -> String {
     let transcode_note = if transcode_count > 0 {
-        format!(" ({transcode_count} с транскодом)")
+        trf(Key::AddTranscodeNote, &[("count", &transcode_count.to_string())])
     } else {
         String::new()
     };
-    let mut status = format!(
-        "Добавляется {} {}{}, это может занять время…",
-        count,
-        plural(count, "файл", "файла", "файлов"),
-        transcode_note
+    let mut status = trf(
+        Key::AddStatusMain,
+        &[
+            ("files", &n_files(lang(), count)),
+            ("note", &transcode_note),
+        ],
     );
     if !skipped.is_empty() {
-        status.push_str(&format!("; пропущены: {}", skipped.join(", ")));
+        status.push_str(&trf(Key::AddSkippedTail, &[("list", &skipped.join(", "))]));
     }
     status
 }
@@ -2704,13 +2675,12 @@ fn activated(visible: &[TrackId], current: Option<TrackId>) -> Option<TrackId> {
 /// Toolbar counter: «{N} треков», or «{N} из {total}» while filtering.
 fn tracks_counter(shown: usize, total: usize, query: &str) -> String {
     if query.trim().is_empty() {
-        format!(
-            "{} {}",
-            total,
-            plural(total, "трек", "трека", "треков")
-        )
+        n_tracks(lang(), total)
     } else {
-        format!("{} из {}", shown, total)
+        trf(
+            Key::CounterFiltered,
+            &[("shown", &shown.to_string()), ("total", &total.to_string())],
+        )
     }
 }
 
@@ -2747,13 +2717,13 @@ enum SectionMode {
 }
 
 impl SectionMode {
-    /// Switcher label.
+    /// Switcher label (translated at render time).
     fn label(self) -> &'static str {
         match self {
-            Self::List => "Список",
-            Self::Albums => "Альбомы",
-            Self::Artists => "Исполнители",
-            Self::Books => "Книги",
+            Self::List => tr(Key::ModeList),
+            Self::Albums => tr(Key::ModeAlbums),
+            Self::Artists => tr(Key::ModeArtists),
+            Self::Books => tr(Key::ModeBooks),
         }
     }
 }
@@ -3116,16 +3086,16 @@ fn resolve_selection_actions(input: SelectionActionsInput<'_>) -> SelectionUpdat
 /// empty device view or empty playlist — in that priority order.
 fn empty_state_text(library_empty: bool, query: &str, empty_view: bool, empty_playlist: bool) -> String {
     if library_empty {
-        "Перетащите аудиофайлы в окно, чтобы добавить".to_owned()
+        tr(Key::EmptyDropFiles).to_owned()
     } else if !query.trim().is_empty() {
-        format!("Ничего не найдено по „{}“", query.trim())
+        trf(Key::EmptyNoResults, &[("query", query.trim())])
     } else if empty_view {
-        "В этом разделе устройства нет записей".to_owned()
+        tr(Key::EmptyView).to_owned()
     } else if empty_playlist {
-        "Пустой плейлист. Перетащите треки из таблицы".to_owned()
+        tr(Key::EmptyPlaylist).to_owned()
     } else {
         // Unreachable with a non-empty library, but keep an honest text.
-        "Перетащите аудиофайлы в окно, чтобы добавить".to_owned()
+        tr(Key::EmptyDropFiles).to_owned()
     }
 }
 
@@ -3163,11 +3133,19 @@ struct TrackGroup {
 
 /// The album-as-book key: blank/missing tags collapse into one
 /// fallback group (pinned last by the sort — see `group_books`).
-const NO_ALBUM_GROUP: &str = "Без альбома";
+/// Round 9: consts became functions — the label is translated at
+/// call time (group names are user-visible).
+fn no_album_group() -> &'static str {
+    tr(Key::NoAlbumGroup)
+}
 /// The artist catch-all, pinned last in the «Исполнители» view.
-const NO_ARTIST_GROUP: &str = "Неизвестный исполнитель";
+fn no_artist_group() -> &'static str {
+    tr(Key::NoArtistGroup)
+}
 /// Honest placeholder of the books view (round 5 behavior).
-const UNKNOWN_BOOK_AUTHOR: &str = "Неизвестный автор";
+fn unknown_book_author() -> &'static str {
+    tr(Key::UnknownAuthor)
+}
 
 fn album_group_key(track: &Track) -> String {
     track
@@ -3176,7 +3154,7 @@ fn album_group_key(track: &Track) -> String {
         .map(str::trim)
         .filter(|album| !album.is_empty())
         .map(str::to_owned)
-        .unwrap_or_else(|| NO_ALBUM_GROUP.to_owned())
+        .unwrap_or_else(|| no_album_group().to_owned())
 }
 
 /// Artist of a track for the «Исполнители» view: album_artist →
@@ -3189,7 +3167,7 @@ fn artist_group_key(track: &Track) -> String {
         .map(str::trim)
         .find(|text| !text.is_empty())
         .map(str::to_owned)
-        .unwrap_or_else(|| NO_ARTIST_GROUP.to_owned())
+        .unwrap_or_else(|| no_artist_group().to_owned())
 }
 
 /// Sort key of a file inside its group: numbered discs/tracks first
@@ -3265,13 +3243,13 @@ fn resolved_author(members: &[&Track]) -> Option<String> {
 /// (disc, track, title); the author line always shows — honestly
 /// «Неизвестный автор» when nobody is tagged.
 fn group_books<'a>(tracks: impl IntoIterator<Item = &'a Track>) -> Vec<TrackGroup> {
-    group_tracks_by(tracks, album_group_key, NO_ALBUM_GROUP, |members| {
+    group_tracks_by(tracks, album_group_key, no_album_group(), |members| {
         members.sort_by_key(|track| book_file_sort_key(track));
     })
     .into_iter()
     .map(|(name, members)| TrackGroup {
         author: Some(
-            resolved_author(&members).unwrap_or_else(|| UNKNOWN_BOOK_AUTHOR.to_owned()),
+            resolved_author(&members).unwrap_or_else(|| unknown_book_author().to_owned()),
         ),
         name,
         track_ids: members.iter().map(|track| track.id).collect(),
@@ -3283,7 +3261,7 @@ fn group_books<'a>(tracks: impl IntoIterator<Item = &'a Track>) -> Vec<TrackGrou
 /// books («Без альбома» pinned last, files by disc/track/title), but
 /// the author line stays honest: an untagged album shows no author.
 fn group_by_album<'a>(tracks: impl IntoIterator<Item = &'a Track>) -> Vec<TrackGroup> {
-    group_tracks_by(tracks, album_group_key, NO_ALBUM_GROUP, |members| {
+    group_tracks_by(tracks, album_group_key, no_album_group(), |members| {
         members.sort_by_key(|track| book_file_sort_key(track));
     })
     .into_iter()
@@ -3299,7 +3277,7 @@ fn group_by_album<'a>(tracks: impl IntoIterator<Item = &'a Track>) -> Vec<TrackG
 /// исполнитель» pinned last); the files of one artist are ordered by
 /// album first, then by disc/track/title — a tiny discography.
 fn group_by_artist<'a>(tracks: impl IntoIterator<Item = &'a Track>) -> Vec<TrackGroup> {
-    group_tracks_by(tracks, artist_group_key, NO_ARTIST_GROUP, |members| {
+    group_tracks_by(tracks, artist_group_key, no_artist_group(), |members| {
         members.sort_by(|a, b| {
             album_group_key(a)
                 .to_lowercase()
@@ -3400,36 +3378,37 @@ fn strip_prefix_in(title: &str, prefix: &str) -> String {
 /// Field labels and messages of the tag-review modal, chosen by the
 /// media kind: audiobooks speak «книга/автор», music speaks
 /// «альбом/исполнитель». The check is the semantic audiobook BIT —
-/// combined bits stay book-flavored.
+/// combined bits stay book-flavored. Round 9: the fields are i18n
+/// keys; call sites translate them via `tr` at render time.
 struct TagReviewTexts {
     /// Subject of the heading («Добавление {subject}: …»).
-    subject: &'static str,
+    subject: Key,
     /// Label of the shared title field.
-    title_field: &'static str,
+    title_field: Key,
     /// Label of the shared author field.
-    author_field: &'static str,
+    author_field: Key,
     /// Near-field validation text for an empty title.
-    empty_title: &'static str,
+    empty_title: Key,
     /// The commit button.
-    add_button: &'static str,
+    add_button: Key,
 }
 
 fn tag_review_texts(kind_bits: u32) -> TagReviewTexts {
     if kind_bits & AUDIOBOOK_BIT != 0 {
         TagReviewTexts {
-            subject: "книги",
-            title_field: "Название книги*",
-            author_field: "Автор",
-            empty_title: "Укажите название книги",
-            add_button: "Добавить книгу",
+            subject: Key::SubjectBooks,
+            title_field: Key::BooksTitleField,
+            author_field: Key::AuthorField,
+            empty_title: Key::BooksEmptyTitle,
+            add_button: Key::BooksAddButton,
         }
     } else {
         TagReviewTexts {
-            subject: "музыки",
-            title_field: "Альбом",
-            author_field: "Исполнитель",
-            empty_title: "Укажите название альбома",
-            add_button: "Добавить музыку",
+            subject: Key::SubjectMusic,
+            title_field: Key::ColAlbum,
+            author_field: Key::ColArtist,
+            empty_title: Key::MusicEmptyTitle,
+            add_button: Key::MusicAddButton,
         }
     }
 }
@@ -3618,38 +3597,39 @@ struct ToolbarActions {
 /// together so no call site can pair them inconsistently. The glyphs
 /// come from egui's bundled monochrome emoji fonts — the
 /// `monochrome_emoji_fonts` feature (see workspace Cargo.toml);
-/// coverage is pinned by a test.
+/// coverage is pinned by a test. Round 9: the tooltip is an i18n key,
+/// translated inside [`icon_button`].
 struct ActionIcon {
     glyph: &'static str,
-    tooltip: &'static str,
+    tooltip: Key,
 }
 
 const ICON_REFRESH: ActionIcon = ActionIcon {
     glyph: "🔄",
-    tooltip: "Обновить",
+    tooltip: Key::BtnRefresh,
 };
 const ICON_EDIT: ActionIcon = ActionIcon {
     glyph: "✏",
-    tooltip: "Изменить…",
+    tooltip: Key::TtEdit,
 };
 const ICON_SET_ARTIST: ActionIcon = ActionIcon {
     glyph: "👤",
-    tooltip: "Задать исполнителя…",
+    tooltip: Key::TtSetArtist,
 };
 const ICON_ADD_TO_PLAYLIST: ActionIcon = ActionIcon {
     glyph: "📋",
-    tooltip: "Добавить в плейлист…",
+    tooltip: Key::TtAddToPlaylist,
 };
 const ICON_REMOVE_FROM_PLAYLIST: ActionIcon = ActionIcon {
     // ✖, not 🚫 (owner, 24.11): the ban sign reads ambiguously next to
     // 🗑 (delete track); the cross says "remove from THIS list" and
     // stays distinct from the trash that removes from the device.
     glyph: "✖",
-    tooltip: "Убрать из плейлиста",
+    tooltip: Key::TtRemoveFromPlaylist,
 };
 const ICON_DELETE: ActionIcon = ActionIcon {
     glyph: "🗑",
-    tooltip: "Удалить…",
+    tooltip: Key::TtDelete,
 };
 
 /// One pictogram button (round 7): glyph + hover tooltip with the
@@ -3659,7 +3639,7 @@ const ICON_DELETE: ActionIcon = ActionIcon {
 /// actions — toolbar and context menus alike; tooltips keep the «…».
 fn icon_button(ui: &mut egui::Ui, icon: &ActionIcon, enabled: bool) -> bool {
     ui.add_enabled(enabled, egui::Button::new(icon.glyph))
-        .on_hover_text(icon.tooltip)
+        .on_hover_text(tr(icon.tooltip))
         .clicked()
 }
 
@@ -3703,7 +3683,7 @@ fn search_toolbar(ui: &mut egui::Ui, params: SearchToolbarParams<'_>) -> Toolbar
         let query_before = query.clone();
         let search = ui.add(
             egui::TextEdit::singleline(query)
-                .hint_text("Поиск…")
+                .hint_text(tr(Key::SearchHint))
                 .id(search_box_id)
                 .desired_width(240.0),
         );
@@ -3814,7 +3794,7 @@ fn groups_view(ui: &mut egui::Ui, params: GroupsViewParams<'_>) -> TrackRowActio
     } = params;
     let mut actions = TrackRowActions::default();
     ui.horizontal(|ui| {
-        if !expanded.is_empty() && ui.button("Свернуть все").clicked() {
+        if !expanded.is_empty() && ui.button(tr(Key::CollapseAll)).clicked() {
             expanded.clear();
         }
         // WHY here: the books view renders no table header, so the
@@ -3920,16 +3900,17 @@ fn groups_view(ui: &mut egui::Ui, params: GroupsViewParams<'_>) -> TrackRowActio
                         .corner_radius(ROW_HIGHLIGHT_RADIUS)
                         .inner_margin(egui::Margin::same(6))
                         .show(ui, |ui| {
-                            let files_text = format!(
-                                "{} {}",
-                                group.track_ids.len(),
-                                plural(group.track_ids.len(), "файл", "файла", "файлов")
-                            );
+                            let files_text = n_files(lang(), group.track_ids.len());
                             let total_text = format_total_duration(total_ms);
                             let info = match &group.author {
-                                Some(author) => {
-                                    format!("Автор: {author} · {files_text} · {total_text}")
-                                }
+                                Some(author) => trf(
+                                    Key::GroupAuthorLine,
+                                    &[
+                                        ("author", author),
+                                        ("files", &files_text),
+                                        ("total", &total_text),
+                                    ],
+                                ),
                                 None => format!("{files_text} · {total_text}"),
                             };
                             ui.label(egui::RichText::new(info).weak().size(13.0));
@@ -4227,7 +4208,8 @@ fn track_table(
             });
             header.col(|ui| {
                 paint_header_chrome(ui, header_fill, header_stroke);
-                if let Some(column) = sortable_header(ui, "Название", TrackSortColumn::Title, sort)
+                if let Some(column) =
+                    sortable_header(ui, tr(Key::ColTitle), TrackSortColumn::Title, sort)
                 {
                     actions.sort_toggle = Some(column);
                 }
@@ -4235,14 +4217,16 @@ fn track_table(
             header.col(|ui| {
                 paint_header_chrome(ui, header_fill, header_stroke);
                 if let Some(column) =
-                    sortable_header(ui, "Исполнитель", TrackSortColumn::Artist, sort)
+                    sortable_header(ui, tr(Key::ColArtist), TrackSortColumn::Artist, sort)
                 {
                     actions.sort_toggle = Some(column);
                 }
             });
             header.col(|ui| {
                 paint_header_chrome(ui, header_fill, header_stroke);
-                if let Some(column) = sortable_header(ui, "Альбом", TrackSortColumn::Album, sort) {
+                if let Some(column) =
+                    sortable_header(ui, tr(Key::ColAlbum), TrackSortColumn::Album, sort)
+                {
                     actions.sort_toggle = Some(column);
                 }
             });
@@ -4250,7 +4234,7 @@ fn track_table(
                 paint_header_chrome(ui, header_fill, header_stroke);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(column) =
-                        sortable_header(ui, "Длит.", TrackSortColumn::Duration, sort)
+                        sortable_header(ui, tr(Key::ColDuration), TrackSortColumn::Duration, sort)
                     {
                         actions.sort_toggle = Some(column);
                     }
@@ -4598,7 +4582,7 @@ fn playlist_row(
     let mut actions = PlaylistPanelActions::default();
     let is_view = playlist.distinguished_kind != 0;
     let count_text = if playlist.is_master {
-        "Все треки".to_owned()
+        tr(Key::AllTracks).to_owned()
     } else if is_view {
         let kinds = view_media_kinds(playlist.distinguished_kind);
         let count = snapshot
@@ -4606,10 +4590,10 @@ fn playlist_row(
             .iter()
             .filter(|track| kinds.contains(&track.media_kind))
             .count();
-        format!("{} {}", count, plural(count, "трек", "трека", "треков"))
+        n_tracks(lang(), count)
     } else {
         let count = playlist.unique_track_ids().len();
-        format!("{} {}", count, plural(count, "трек", "трека", "треков"))
+        n_tracks(lang(), count)
     };
     let row_view = if playlist.is_master {
         LibraryView::Master
@@ -4634,7 +4618,7 @@ fn playlist_row(
                 // is refused honestly (no dead menu items).
                 let mut refused_master = None;
                 row.context_menu(|ui| {
-                    if ui.button("Переименовать…").clicked() {
+                    if ui.button(tr(Key::CtxRenamePlaylist)).clicked() {
                         if playlist.is_master {
                             refused_master = Some(playlist.name.clone());
                         } else {
@@ -4642,7 +4626,7 @@ fn playlist_row(
                         }
                         ui.close();
                     }
-                    if ui.button("Удалить плейлист…").clicked() {
+                    if ui.button(tr(Key::CtxDeletePlaylist)).clicked() {
                         if playlist.is_master {
                             refused_master = Some(playlist.name.clone());
                         } else {
@@ -4722,17 +4706,19 @@ fn numeric_fields_row(ui: &mut egui::Ui, track: &mut String, disc: &mut String) 
     // WHY the measured inset: lines the pair's fields up with the
     // grid's field column (the widest label above defines it).
     ui.add_space(
-        label_width(ui, "Альбом-артист:") - label_width(ui, "Трек №:") + FIELD_COLUMN_SPACING,
+        label_width(ui, tr(Key::EditLabelAlbumArtist))
+            - label_width(ui, tr(Key::EditLabelTrackNo))
+            + FIELD_COLUMN_SPACING,
     );
-    ui.label("Трек №:");
+    ui.label(tr(Key::EditLabelTrackNo));
     // WHY measured, not magic: the split depends on the real label
     // widths and the layout's own spacing.
     let gaps = 2.0 * ui.spacing().item_spacing.x;
     let half = even_split(ui.available_width(), label_width(ui, "Диск №:"), gaps);
-    let track_number = ui.add(field_with(track, "Трек №…", half));
+    let track_number = ui.add(field_with(track, tr(Key::HintTrackNo), half));
     text_menu::attach_text_menu(&track_number);
-    ui.label("Диск №:");
-    let disc_number = ui.add(field_with(disc, "Диск №…", half));
+    ui.label(tr(Key::EditLabelDiscNo));
+    let disc_number = ui.add(field_with(disc, tr(Key::HintDiscNo), half));
     text_menu::attach_text_menu(&disc_number);
 }
 
@@ -4744,13 +4730,18 @@ fn edit_track_dialog_fields(ui: &mut egui::Ui, dialog: &mut EditDialogState) -> 
         .num_columns(2)
         .spacing([FIELD_COLUMN_SPACING, FIELD_ROW_SPACING])
         .show(ui, |ui| {
-            dialog_field(ui, "Название:", &mut fields.title, "Название трека…");
+            dialog_field(ui, tr(Key::EditLabelTitle), &mut fields.title, tr(Key::HintTrackTitle));
             ui.end_row();
-            dialog_field(ui, "Исполнитель:", &mut fields.artist, "Исполнитель…");
+            dialog_field(ui, tr(Key::EditLabelArtist), &mut fields.artist, tr(Key::HintArtist));
             ui.end_row();
-            dialog_field(ui, "Альбом:", &mut fields.album, "Альбом…");
+            dialog_field(ui, tr(Key::EditLabelAlbum), &mut fields.album, tr(Key::HintAlbum));
             ui.end_row();
-            dialog_field(ui, "Альбом-артист:", &mut fields.album_artist, "Альбом-артист…");
+            dialog_field(
+                ui,
+                tr(Key::EditLabelAlbumArtist),
+                &mut fields.album_artist,
+                tr(Key::HintAlbumArtist),
+            );
             ui.end_row();
         });
     numeric_fields_row(ui, &mut fields.track_number, &mut fields.disc_number);
@@ -4765,11 +4756,11 @@ fn edit_track_dialog_fields(ui: &mut egui::Ui, dialog: &mut EditDialogState) -> 
     // corner — the standard modal convention; first added = rightmost,
     // so the visual order is «Отмена / Сохранить».
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        if ui.button("Сохранить").clicked() {
+        if ui.button(tr(Key::BtnSave)).clicked() {
             save = true;
             ui.close();
         }
-        if ui.button("Отмена").clicked() {
+        if ui.button(tr(Key::BtnCancel)).clicked() {
             ui.close();
         }
     });
@@ -4857,9 +4848,12 @@ fn draw_drop_overlay(ui: &egui::Ui, names: &[String]) {
     );
     let font = egui::TextStyle::Heading.resolve(&ctx.global_style());
     let text = if names.len() == 1 {
-        format!("Отпустите, чтобы добавить: {}", names[0])
+        trf(Key::DropOne, &[("name", names[0].as_str())])
     } else {
-        format!("Отпустите, чтобы добавить файлы: {} шт.", names.len())
+        trf(
+            Key::DropMany,
+            &[("count", &names.len().to_string())],
+        )
     };
     painter.text(
         rect.center(),
@@ -4957,7 +4951,7 @@ fn password_modal(
         ui.label(body);
         ui.add_space(MODAL_GAP);
         ui.horizontal(|ui| {
-            ui.label("Пароль sudo:");
+            ui.label(tr(Key::SudoPasswordLabel));
             // WHY full width: a narrow 220px field in a wide modal read
             // as «no input here»; the themed hairline stroke needs the
             // box to be visible to do its job. The placeholder is fine
@@ -4996,7 +4990,7 @@ fn password_modal(
         });
         ui.separator();
         ui.horizontal(|ui| {
-            if ui.button("Отмена").clicked() {
+            if ui.button(tr(Key::BtnCancel)).clicked() {
                 outcome = PasswordModal::Cancelled;
                 ui.close();
             }
@@ -5090,9 +5084,15 @@ fn connect_device(
         ConnectPlan::Conflict(other) => {
             drop(password);
             return Err(ConnectError::Mount {
-                stderr: format!(
-                    "{mount_path_display} уже смонтирован с {other} — подключение отменено.",
-                    mount_path_display = mount_path.display()
+                stderr: trf(
+                    Key::ErrAlreadyMountedWith,
+                    &[
+                        (
+                            "mount",
+                            &mount_path.display().to_string(),
+                        ),
+                        ("other", &other),
+                    ],
                 ),
                 error: MountError::AlreadyMounted,
             });
@@ -5207,18 +5207,14 @@ impl eframe::App for PodlibApp {
             if self.connected.is_none() {
                 ui.centered_and_justified(|ui| {
                     ui.label(
-                        egui::RichText::new(
-                            "Подключите устройство, чтобы работать с библиотекой",
-                        )
-                        .weak(),
+                        egui::RichText::new(tr(Key::CentralConnectFirst)).weak(),
                     );
                 });
             } else if self.library.is_none() {
                 ui.centered_and_justified(|ui| {
                     ui.colored_label(
                         ui.visuals().error_fg_color,
-                        "Библиотека недоступна: воркер закрылся. Отключите и подключите \
-                         устройство заново.",
+                        tr(Key::CentralLibUnavailable),
                     );
                 });
             } else {
@@ -6474,19 +6470,21 @@ mod tests {
     #[test]
     fn tag_review_texts_speak_books_for_books_and_music_for_music() {
         // Books: the audiobook BIT decides (combined bits stay book).
+        // Round 9: the texts carry i18n keys; the test pins the key
+        // choice (the translations themselves are pinned by i18n.rs).
         let books = tag_review_texts(8);
-        assert_eq!(books.title_field, "Название книги*");
-        assert_eq!(books.author_field, "Автор");
-        assert_eq!(books.empty_title, "Укажите название книги");
-        assert_eq!(books.add_button, "Добавить книгу");
-        assert_eq!(tag_review_texts(9).title_field, "Название книги*");
+        assert_eq!(books.title_field, Key::BooksTitleField);
+        assert_eq!(books.author_field, Key::AuthorField);
+        assert_eq!(books.empty_title, Key::BooksEmptyTitle);
+        assert_eq!(books.add_button, Key::BooksAddButton);
+        assert_eq!(tag_review_texts(9).title_field, Key::BooksTitleField);
 
         let music = tag_review_texts(1);
-        assert_eq!(music.title_field, "Альбом");
-        assert_eq!(music.author_field, "Исполнитель");
-        assert_eq!(music.empty_title, "Укажите название альбома");
-        assert_eq!(music.add_button, "Добавить музыку");
-        assert!(music.subject.contains("музыки"));
+        assert_eq!(music.title_field, Key::ColAlbum);
+        assert_eq!(music.author_field, Key::ColArtist);
+        assert_eq!(music.empty_title, Key::MusicEmptyTitle);
+        assert_eq!(music.add_button, Key::MusicAddButton);
+        assert_eq!(music.subject, Key::SubjectMusic);
     }
 
     // ---- tail nit-9: the prefix toggle spares manual edits ----

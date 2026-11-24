@@ -5,6 +5,7 @@
 //! See docs/tasks/2026-11-13-gui-connect.md for the round plan.
 
 mod app;
+mod i18n;
 mod device;
 mod library;
 mod system_palette;
@@ -32,6 +33,9 @@ fn select_backend(podlib_wayland: Option<&str>) -> BackendChoice {
 }
 
 fn main() -> eframe::Result {
+    // The UI language is resolved once, before any user-facing text is
+    // built (see the i18n module docs).
+    i18n::init();
     // WHY: winit 0.30 has no native Wayland file drag-and-drop (winit#1881 —
     // hover/drop exist only in the X11 backend) yet silently picks Wayland
     // whenever WAYLAND_DISPLAY/WAYLAND_SOCKET is set, losing every drop on

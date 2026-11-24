@@ -27,4 +27,3 @@ egui = { workspace = true }
 egui_extras = { workspace = true }
 podlib = { path = "../podlib", version = "0.1.0" }
 tempfile = { workspace = true } # transcode batch tempdir (worker, round 5.2)
-thiserror = { workspace = true }
