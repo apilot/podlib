@@ -4017,13 +4017,14 @@ fn book_file_row(
     // with selection.stroke.color (the theme's accent fg) — on a
     // dense light accent fill (selection.bg_fill) the normal light
     // text_color washes out. One color for both tiers, no invented
-    // weak variant.
-    let (text_color, weak_color) = if selected {
-        let stroke = visuals.selection.stroke.color;
-        (stroke, stroke)
+    // weak variant. The duration is a secondary label: it follows
+    // [`row_secondary_color`] (hovered rows wash the weak tier out).
+    let text_color = if selected {
+        visuals.selection.stroke.color
     } else {
-        (visuals.text_color(), visuals.weak_text_color())
+        visuals.text_color()
     };
+    let weak_color = row_secondary_color(visuals, selected, response.hovered());
     painter.text(
         egui::pos2(inner.left(), middle),
         egui::Align2::LEFT_CENTER,
@@ -4461,6 +4462,21 @@ fn cell_text_color(visuals: &egui::Visuals, selected: bool) -> egui::Color32 {
     }
 }
 
+/// Secondary-label color (sidebar counters, book-row durations) by row
+/// state: on the dense accent fill it follows the on-selection color —
+/// the weak secondary is light-on-light there (owner report); on the
+/// subtle hover fill the weak secondary also washes out, so the
+/// primary text color takes over; idle keeps the weak tier.
+fn row_secondary_color(visuals: &egui::Visuals, selected: bool, hovered: bool) -> egui::Color32 {
+    if selected {
+        visuals.selection.stroke.color
+    } else if hovered {
+        visuals.text_color()
+    } else {
+        visuals.weak_text_color()
+    }
+}
+
 /// Sidebar section caption («Устройство» / «Плейлисты»): body-strong
 /// title on the same tinted band + hairline the track-table header
 /// uses, so sections read as titled groups instead of faint floating
@@ -4522,24 +4538,29 @@ fn sidebar_row(ui: &mut egui::Ui, selected: bool, name: &str, count: &str) -> eg
     // WHY selection stroke when selected: the accent fg (egui's own
     // selected-text convention) stays readable on the dense accent
     // fill; the stock light text_color washes out on it. Same color
-    // for name and count — no invented weak variant.
-    let (name_color, count_color) = if selected {
-        let stroke = visuals.selection.stroke.color;
-        (stroke, stroke)
+    // for name and count — no invented weak variant. On hover the
+    // subtle fill washes the weak secondary out, so the counter also
+    // rises to the primary text color (see [`row_secondary_color`]).
+    let name_color = if selected {
+        visuals.selection.stroke.color
     } else {
-        (visuals.text_color(), visuals.weak_text_color())
+        visuals.text_color()
     };
+    let count_color = row_secondary_color(visuals, selected, response.hovered());
     let count_galley = painter.layout_no_wrap(
         count.to_owned(),
         egui::FontId::proportional(12.0),
         count_color,
     );
-    painter.text(
-        egui::pos2(inner.right(), middle),
-        egui::Align2::RIGHT_CENTER,
-        count,
-        egui::FontId::proportional(12.0),
-        visuals.weak_text_color(),
+    // WHY galley, not painter.text: one layout serves both the clip
+    // width below and the paint, so the color lives in exactly one
+    // place (the old painter.text always drew the weak tier — the
+    // light-on-light counter on selected rows).
+    let count_size = count_galley.size();
+    painter.galley(
+        egui::pos2(inner.right() - count_size.x, middle - 0.5 * count_size.y),
+        count_galley,
+        count_color,
     );
     // The name is laid out first and clipped to the room left of the
     // count: a long playlist title must never run under the numbers.
@@ -4548,7 +4569,7 @@ fn sidebar_row(ui: &mut egui::Ui, selected: bool, name: &str, count: &str) -> eg
         egui::FontId::proportional(14.0),
         name_color,
     );
-    let name_width = (inner.width() - count_galley.size().x - SIDEBAR_NAME_COUNT_GAP).max(0.0);
+    let name_width = (inner.width() - count_size.x - SIDEBAR_NAME_COUNT_GAP).max(0.0);
     let name_clipped = name_galley.size().x > name_width;
     let name_clip = egui::Rect::from_min_max(
         egui::pos2(inner.left(), rect.top()),
@@ -4677,12 +4698,8 @@ fn label_width(ui: &egui::Ui, text: &str) -> f32 {
     let color = ui.style().visuals.text_color();
     // WHY fonts_mut: layout_no_wrap mutates the galley cache (egui
     // 0.37 read view is immutable by design).
-    ui.ctx().fonts_mut(|fonts| {
-        fonts
-            .layout_no_wrap(text.to_owned(), font, color)
-            .size()
-            .x
-    })
+    ui.ctx()
+        .fonts_mut(|fonts| fonts.layout_no_wrap(text.to_owned(), font, color).size().x)
 }
 
 /// Width of one field in an evenly split row: what is left of the
@@ -5436,6 +5453,30 @@ mod tests {
                 ..base.clone()
             }
         ));
+    }
+
+    #[test]
+    fn row_secondary_color_follows_row_state() {
+        let mut visuals = egui::Visuals::dark();
+        visuals.selection.bg_fill = egui::Color32::from_rgb(0xB4, 0xBE, 0xFE);
+        visuals.selection.stroke.color = egui::Color32::from_rgb(0x1E, 0x1E, 0x2E);
+        // Selected: the counter rides the same on-selection color as
+        // the row name (the weak secondary is light-on-light there).
+        assert_eq!(
+            row_secondary_color(&visuals, true, false),
+            egui::Color32::from_rgb(0x1E, 0x1E, 0x2E)
+        );
+        // Hovered: the subtle hover fill washes the weak secondary out
+        // — the primary text color keeps the counter readable.
+        assert_eq!(
+            row_secondary_color(&visuals, false, true),
+            visuals.text_color()
+        );
+        // Idle: the weak secondary tier, as everywhere.
+        assert_eq!(
+            row_secondary_color(&visuals, false, false),
+            visuals.weak_text_color()
+        );
     }
 
     #[test]
